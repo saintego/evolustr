@@ -1,13 +1,13 @@
 # Evolustr Specification
 
-**Status:** Draft v0.2
+**Status:** Draft v0.3
 **Scope:** Nostr identity → Evolu (local-first, E2E-encrypted SQLite) data, synced across devices and apps, with **no mandatory backend**.
 
 ---
 
-## 1. Summary
+## 1. Overview
 
-A user signs in with any Nostr signer. Evolustr then opens the right Evolu databases for that user on every device:
+A user signs in to an app with any Nostr signer. Evolustr then opens that user's Evolu databases for the app, on any device:
 
 | Layer | What it holds | Who can read it |
 |---|---|---|
@@ -17,109 +17,237 @@ A user signs in with any Nostr signer. Evolustr then opens the right Evolu datab
 
 Settings resolve as `app ?? shared ?? default`.
 
-How strong each layer is depends on **which signer** the user has and **where the app runs** (own domain, nsite, mobile). Not every combination supports every layer. §6 lists them all.
+Evolustr is two things:
 
-### 1.1 Design principles
+1. **`@evolustr/client`**, a library apps use. It works with **any** Nostr signer.
+2. **The Evolustr Signer API** (§5), an optional protocol that **any signer can implement**: browser extensions, iframe signers, Android signers, NIP-46 bunkers. A signer that implements it is an **Evolustr-capable signer**. It gives stronger separation between apps and enables the personal vault. Apps don't depend on any particular signer.
+
+Where no capable signer is available, the client can protect the app layer with **its own passkey** on the app's domain (§4). How strong each layer is depends on the signer and on where the app runs. §7 lists every combination.
+
+### 1.1 Terms
+
+| Term | Meaning |
+|---|---|
+| **Standard signer** | Any NIP-07, NIP-46 or NIP-55 signer without the Evolustr Signer API (Alby, nos2x, nsec.app, Amber today). |
+| **Evolustr-capable signer** | A signer that implements the Evolustr Signer API (§5). |
+| **Owner secret `S`** | The random secret behind one Evolu database (becomes its 12-word mnemonic). One per layer instance. |
+| **Vault event** | A Kind 30078 event on Nostr relays that stores `S` in encrypted form (§6). |
+| **Wrap** | One encrypted copy of `S` inside a vault event, made with one unlock method (§3). |
+| **Client passkey** | A WebAuthn passkey the **app** registers on **its own domain**. Needs no special signer. |
+| **Signer passkey** | A passkey a **capable signer** registers on **its own origin**. Used for every app. |
+| **Level** | `strong` or `weak`, see §3.2. |
+
+### 1.2 Design principles
 
 1. **No backend is required.** Everything works from static hosting, including nsites (NIP-5A). An optional server (§10) adds hardening only.
-2. **Honest security levels.** Each layer reports how it was unlocked (`strong` / `weak`). The docs never claim more than the level gives.
-3. **Each layer has its own random owner secret.** It is stored in a vault event with several *wraps*. Any one unlock method opens the same data, so changing signer or device never loses data.
-4. **Origin is the app identity.** Only browser-enforced origins (`postMessage` `event.origin`, WebAuthn `rpId`) separate apps. Self-asserted names and URLs do not.
+2. **Any signer works.** Capable signers and passkeys add strength. Without them the library still works, at a lower level.
+3. **Honest security levels.** Each layer reports its level, and the docs never claim more.
+4. **One secret per layer, many ways to unlock it.** Changing signer, device or unlock method never loses data.
+5. **Only browser- or OS-enforced identities separate apps:** web origin (`event.origin`, extension sender origin, WebAuthn `rpId`) or the Android calling package. Self-asserted app names and URLs never do.
 
 ---
 
-## 2. Threat model
+## 2. Layers
 
-### 2.1 What we protect against
+### 2.1 shared
 
-| Attacker | Protected? |
-|---|---|
-| Relays, network observers | ✅ Everything on relays is encrypted. |
-| Evolu sync relay operator | ✅ Evolu is E2E-encrypted. |
-| Another app's **page code** (XSS, malicious dependency) on a different origin | ✅ for the **app** layer and **personal vault** when unlocked `strong`. ❌ for `weak` layers. |
-| **Malicious App B** that the user has given signing and decrypt permission in a **standard** signer | ✅ only for layers unlocked by a **passkey** or by **our signer**. ❌ for NIP-44-only (`weak`) layers. |
-| App B overwriting vault events (any signer can publish kind 30078) | ⚠️ It **cannot plant** a fake secret (AES-GCM wraps). It **can delete** (DoS). §5.4 lists the mitigations. |
-| Web3Auth `clientId` owner (our signer, OAuth mode) | ❌ for shared and app layers derived from the nsec. ✅ for the personal vault, which **requires a passkey** (§4.3). |
-| Compromised signer host or CDN (supply chain) | ❌ Out of scope. The signer is trusted code. |
-| The user's own device fully compromised | ❌ Out of scope. |
+- One per user. It is meant to be readable by every app, so it always keeps a `nip44` wrap (§3).
+- Only harmless preferences go here, never secrets or personal data.
+- Every app can **write** it. Apps should write a shared value only on an explicit user action ("Use for all apps").
+- Schema: §9.
 
-### 2.2 Accepted baseline
+### 2.2 app
 
-Any app the user lets **decrypt** through a standard signer can already read the user's NIP-04/NIP-17 DMs. A `weak` layer is therefore **"as private as your Nostr DMs"**, and the docs say exactly that.
+- One per user per app, keyed by `appId` (§3.3).
+- It is the app's private storage, and its level depends on its wraps (§3.2):
+  - with a capable signer or a client passkey and **no** `nip44` wrap → `strong`
+  - with a `nip44` wrap → `weak`
+
+### 2.3 personal vault
+
+- One per user, kept **inside a capable signer**. Apps never get its owner secret.
+- An app calls `vault.get(name)`. The signer shows a prompt naming the app (verified identity, §5.2) and the item. Approvals can be remembered per app and item, and revoked in the signer UI.
+- Requires a capable signer whose personal-vault key no third party can recover (§5.4).
+- There is no personal vault without a capable signer. Instead, an app can keep its own secrets in its **app** layer, protected by a client passkey.
 
 ---
 
-## 3. Building blocks
+## 3. Unlock methods (wraps)
 
-### 3.1 Owner secrets and wraps
+### 3.1 The four wrap types
 
-Each layer instance has a random 16-byte **owner secret** `S`, which becomes the Evolu mnemonic (BIP-39, 12 words):
+| Wrap | Wrap key | Who can create and open it | Level | Needs |
+|---|---|---|---|---|
+| `signer` | Key from a capable signer, derived for the caller's verified `appId` (§5.3) | Only that app, through that signer | strong | Evolustr-capable signer |
+| `passkey` (client) | PRF output of a client passkey, `rpId` = app's domain (§4) | Only pages on that domain | strong | WebAuthn PRF on the user's platform |
+| `nip44` | NIP-44 self-encryption, user → user, through the user's signer | **Any app** the user lets decrypt | weak | Any signer with NIP-44 |
+| `recovery` | None. The 12-word mnemonic of `S`, written down by the user | Whoever has the words | strong (offline) | The user keeping it safe |
 
-- `S_shared`: one per user
-- `S_app(appId)`: one per user per app
-- `S_personal`: one per user, **never leaves our signer**
-
-`S` is stored on Nostr relays in a **vault event** (§5). It is encrypted several times, once per unlock method. Each encrypted copy is a **wrap**:
-
-| Wrap type | Wrap key | Strength | Available with |
-|---|---|---|---|
-| `signer` | `HKDF(M_signer, "evolustr/v1/<layer>/" + appId)`, from our signer | strong | our signer |
-| `passkey` | PRF output of a WebAuthn passkey (`rpId` = signer origin **or** app domain) | strong | browsers and platforms with WebAuthn PRF |
-| `nip44` | NIP-44 self-encryption (`user → user`) through the user's signer | weak | any signer with NIP-44 |
-
-Wraps of type `signer` and `passkey` use **AES-256-GCM** with a random 12-byte IV and
+`signer` and `passkey` wraps use **AES-256-GCM** with a random 12-byte IV and
 `AAD = "evolustr/v1|" + pubkey + "|" + layer + "|" + appId + "|" + wrapType + "|" + wrapId`.
-All crypto uses `@noble/ciphers` and `@noble/hashes`, so web, workers and React Native give the same results.
+`@noble/ciphers` and `@noble/hashes` are used everywhere, so web, workers and React Native give the same results.
 
-### 3.2 App identity (`appId`)
+### 3.2 Level of a layer
+
+**A layer's level is the level of its weakest wrap.** One `nip44` wrap makes the layer `weak` however the current device unlocked it, because any app with decrypt permission can use that wrap.
+
+Consequences:
+
+- An app that wants a `strong` app layer must **not** keep a `nip44` wrap. Its users then need a capable signer, a client passkey, or the recovery phrase on each new device.
+- The shared layer always keeps `nip44`, so it is always `weak` by design.
+- Apps choose with `minLevel` (§8). The default is `weak`, which always works.
+
+### 3.3 App identity (`appId`)
+
+`appId` names which vault to use. For `passkey` and `signer` wraps, security comes from the `rpId` or from the signer's verified caller identity, not from `appId`.
 
 | Environment | `appId` |
 |---|---|
-| Web app | Browser origin: `https://app.example.com` |
-| nsite on an **allowlisted** gateway | `nsite:<site-npub>`, mapped from `<npub>.gateway.tld`. The same app data then works on every allowlisted gateway. |
-| nsite on an unknown gateway | Its origin (data is not shared with other gateways). |
-| React Native | `rn:<bundle-id>`. It is self-asserted, see §6.5. |
-
-Gateway mapping is only safe for gateways on an allowlist. A malicious gateway can serve its own code under any `<npub>` hostname.
-
-### 3.3 Signer master secret `M_signer` (our signer only)
-
-`M_signer` is a random 32-byte secret kept by our signer, in its own vault event (`layer = "signer"`). Its wraps:
-
-- `sk`: AES-GCM keyed with `HKDF(nsec, "evolustr/v1/signer-wrap")`. Only our signer can create or open it, in OAuth mode.
-- `passkey`: AES-GCM keyed with the PRF output of a passkey whose `rpId` is the **signer's origin**. One passkey therefore serves every app on every domain.
-- `nip44` (optional, weak): for passthrough mode without a passkey.
-
-Our signer derives a **different** wrap key for each app: `K = HKDF(M_signer, "evolustr/v1/app/" + appId)`. HKDF is one-way, so App A's key reveals nothing about App B's key or `M_signer`.
+| Web app on its own domain | The page origin, `https://app.example.com` |
+| nsite on a known gateway | `nsite:<site-npub>`, taken from `<npub>.gateway.tld`. The same vault is then used on every gateway. |
+| nsite on an unknown gateway | The page origin |
+| Android | `android:<package name>` (verified for NIP-55 signers) |
+| iOS / other native | `ios:<bundle id>` (self-asserted) |
 
 ---
 
-## 4. Layers in detail
+## 4. Client passkeys (no capable signer needed)
 
-### 4.1 shared
+This is how an app gets a `strong` app layer with **any** signer, including standard ones.
 
-- Every app gets `S_shared` without a prompt. Keep it to preferences only, never secrets or personal data.
-- Every app can **write** it. Apps should write a shared value only on an explicit user action ("Use for all apps").
-- Schema: §8.
+### 4.1 Enroll
 
-### 4.2 app
+1. Unlock the app layer once by any method (or create it, §6.2).
+2. Call `navigator.credentials.create()` with:
+   - `rp.id` = the app's host. For an nsite, the exact gateway subdomain.
+   - `user.id` = `SHA-256(pubkey)`, `user.name` = the npub.
+   - `residentKey: "required"`, `userVerification: "required"`.
+   - `extensions: { prf: {} }`.
+3. If `getClientExtensionResults().prf.enabled` is not true, stop. This authenticator can't be used, so tell the user.
+4. Pick a random 32-byte `salt`. Call `navigator.credentials.get()` for that credential with `prf: { eval: { first: SHA-256("evolustr/v1/prf|" + salt) } }`.
+5. Wrap key = `HKDF-SHA256(prfOutput, salt, "evolustr/v1/wrap|" + layer + "|" + appId)`.
+6. Add a `passkey` wrap with `rpId`, `credId` and `salt` to the vault (superset rule, §6.2).
+7. Optionally, remove the `nip44` wrap to reach `strong` (§3.2). Before that, require **either** a second passkey **or** a confirmed recovery phrase.
 
-- One vault per `(pubkey, appId)`.
-- Only the app whose `appId` matches can obtain a strong wrap key. The browser enforces this through our signer (`event.origin`) or the app's own passkey (`rpId`).
-- If the app's only wrap is `nip44`, the layer is `weak`.
+### 4.2 Unlock on a device
 
-### 4.3 personal vault
+1. `getPublicKey()` from the signer (no decrypt prompt).
+2. Fetch the vault. Collect the `passkey` wraps whose `rpId` equals the current host.
+3. Call `navigator.credentials.get()` with `allowCredentials` = their `credId`s and the PRF input from each wrap's salt.
+4. This works with **synced** passkeys (iCloud Keychain, Google Password Manager, password managers) and, where the platform supports PRF over it, with a **phone passkey via QR** (hybrid). If none works, try the other wraps, then the recovery phrase.
 
-- `S_personal` is created **only inside our signer**, and only after the user registers a **signer-origin passkey**. It is **never** wrapped with `sk`, because the Web3Auth `clientId` owner could recover `sk`. It is never wrapped with `nip44` either.
-- The signer runs its own Evolu instance for this layer, inside the iframe.
-- Apps never get `S_personal`. They call `vault.get(name)`, and the signer shows a confirmation naming the app (verified origin) and the item. Approvals can be remembered per app and item, and revoked from the signer UI.
-- Not available without our signer (§6).
+### 4.3 Where client passkeys work
+
+| Environment | Notes |
+|---|---|
+| Own domain | ✅ The normal case. |
+| nsite | ✅ The `rpId` is the gateway subdomain. Each gateway needs its **own** enrollment, unlocked first by another method (another wrap or the recovery phrase). WebAuthn Related Origin Requests don't help, because the developer doesn't control the gateway domain. |
+| React Native | ✅ Through a native passkey module. The app needs an associated domain (`apple-app-site-association`, `assetlinks.json`), so a web domain but no backend. |
+| Cross-origin iframe | Not used by the client. |
+
+### 4.4 Limits
+
+- Bound to one domain: other apps can't use it. That is the point for the app layer, but it means no cross-app personal vault.
+- Depends on a passkey provider. Recommend at least two passkeys (for example two ecosystems, or a hardware key) and the recovery phrase.
+- PRF support differs between browsers and authenticators. The client must check and fall back (§8.2).
 
 ---
 
-## 5. Vault events
+## 5. Evolustr Signer API
 
-### 5.1 Format
+An optional protocol for signers. A signer that implements it can:
+
+- give each app a strong `signer` wrap key, with **no passkey on the app's side**
+- link apps through one **signer passkey**, so the user enrolls once for all apps and all domains
+- hold the **personal vault**
+
+### 5.1 Transports
+
+The same methods are offered over each signer transport:
+
+| Transport | How methods are exposed |
+|---|---|
+| NIP-07 (browser extensions, iframe signers that inject `window.nostr`) | `window.nostr.evolustr.<method>(...)`, an optional namespace like `window.nostr.nip44` |
+| NIP-46 (remote bunkers) | Request methods `evolustr_capabilities`, `evolustr_get_wrap_key`, `evolustr_vault_get`, … with JSON params |
+| NIP-55 (Android signers) | Intent / content-provider types with the same names |
+
+Clients detect support with `capabilities()`. A NIP-46 or NIP-55 signer that doesn't know a method returns an error, and the client falls back.
+
+### 5.2 Caller identity: what a signer may trust
+
+The `appId` a signer uses for keys must come from the signer's own view of the caller, **never** from request params.
+
+| Signer kind | Caller identity | Strength |
+|---|---|---|
+| Browser extension | Origin of the calling tab or frame, from the browser | verified |
+| Iframe signer (e.g. nostr-shard-signer) | `postMessage` `event.origin` | verified |
+| Android signer (NIP-55) | Calling package, from the OS (Binder caller UID) | verified |
+| NIP-46 remote bunker | Not verifiable: the client's pubkey and name are self-asserted | **connection-scoped**: `appId = "nip46:" + client pubkey`. The user labels the connection when approving it. Stronger than `nip44`, because each connection gets its own key, but a malicious app can still ask the user to approve a connection that claims to be App A. |
+
+`capabilities()` reports which applies (`identity: "verified" | "connection"`).
+
+### 5.3 Signer master secret and derived keys
+
+- The signer keeps a random 32-byte **master secret** `M`.
+- Wrap key for a caller: `K = HKDF-SHA256(M, "evolustr/v1|" + layer + "|" + appId)`. HKDF is one-way, so one app's key reveals nothing about another's or about `M`.
+- How the signer stores `M` is its own choice. Recommended: its own vault event (`layer = "signer"`) with wraps from:
+  - `sk`: AES-GCM keyed with `HKDF(nsec, "evolustr/v1/signer-wrap")`. Only for signers that hold the nsec.
+  - **Signer passkey**: PRF output of a passkey whose `rpId` is the signer's own origin. Needed by signers that don't hold the nsec (passthrough signers) and by signers where someone else can recover the nsec (§5.4).
+  - Never `nip44` for `M`, because that would hand `M` to any app with decrypt permission. A signer that can't use either option above doesn't offer the API.
+
+### 5.4 Personal vault requirements
+
+- The signer runs the personal vault's Evolu database itself.
+- Its key must come from a secret **only the signer controls**:
+  - a signer passkey, or
+  - the nsec, **only if** the signer is its sole custodian.
+- If a third party can recover the nsec (for example an OAuth/MPC login where the project owner can obtain keys), the personal vault **must** use a signer passkey.
+
+### 5.5 Methods
+
+```ts
+interface EvolustrSignerApi {
+  version: 1;
+  capabilities(): Promise<{
+    identity: "verified" | "connection";
+    appId: string;                 // as the signer sees the caller
+    personalVault: boolean;
+    signerPasskey: boolean;        // M is unlockable by a signer passkey
+  }>;
+  /** Wrap key for the caller's own layer. The signer computes appId itself. */
+  getWrapKey(layer: "shared" | "app"): Promise<Uint8Array>; // 32 bytes
+  /** Register a signer passkey (a signer may open a popup on its own origin). */
+  enrollPasskey(): Promise<void>;
+  vault: {
+    get(name: string): Promise<string | null>;        // prompts per app and item
+    set(name: string, value: string): Promise<void>;  // prompts
+    list(): Promise<string[]>;                        // names this app may see
+  };
+}
+```
+
+### 5.6 Behaviour required of a capable signer
+
+1. Derive `appId` only from the caller identity in §5.2.
+2. **Never auto-approve** signing Kind 30078 events whose `d`-tag starts with `evolustr:`. Show "App X wants to change your Evolustr data keys" (§6.3).
+3. Show the verified caller identity, not app-supplied names, in every Evolustr prompt.
+4. Let the user see and revoke apps with vault access, and manage signer passkeys.
+5. An iframe signer needs `allow="publickey-credentials-get; publickey-credentials-create"` on its iframe, with a popup on the signer origin as the fallback.
+
+### 5.7 Reference implementation
+
+**nostr-shard-signer** (iframe signer, verified origin) is the first target. Notes specific to it:
+
+- **OAuth mode** holds the nsec, so `M` can use the `sk` wrap. The Web3Auth `clientId` owner can recover the nsec, so the shared and app layers are readable by that owner. The personal vault therefore requires a signer passkey (§5.4). If a looser version of the signer uses a shared `clientId`, that owner is whoever controls the shared project.
+- **Passthrough mode** (extension or bunker through the bridge) has no nsec, so the API is available only after the user enrolls a signer passkey.
+- Per-app separation relies on `event.origin`, not on the `clientId` allowlist, so it holds in the looser version too.
+- Its auto-approve list for Kind 30078 must exclude `evolustr:` `d`-tags (§5.6 rule 2).
+
+---
+
+## 6. Vault events
+
+### 6.1 Format
 
 Kind **30078** (NIP-78), replaceable.
 
@@ -127,20 +255,20 @@ Kind **30078** (NIP-78), replaceable.
 {
   "kind": 30078,
   "tags": [["d", "evolustr:v1:<hex(SHA-256('evolustr/v1/vault|' + layer + '|' + appId))>"]],
-  "content": "<JSON, see below>"
+  "content": "<JSON below>"
 }
 ```
 
-The hashed `d`-tag hides which apps a user uses. The `evolustr:` prefix lets signers recognise vault events (§5.3).
+The hashed `d`-tag hides which apps a user uses. The `evolustr:` prefix lets signers recognise vault events.
 
 ```jsonc
 {
   "v": 1,
   "layer": "app",               // "shared" | "app" | "signer"
   "created": 1730000000,        // creation time of S, never changes
-  "sHash": "<hex SHA-256(S) truncated to 8 bytes>", // lets a client detect a different S
+  "sHash": "<hex SHA-256(S), first 8 bytes>",
   "wraps": [
-    { "id": "w1", "type": "signer",  "kid": "v1", "iv": "…", "ct": "…" },
+    { "id": "w1", "type": "signer", "kid": "v1", "iv": "…", "ct": "…" },
     { "id": "w2", "type": "passkey", "rpId": "app.example.com",
       "credId": "<base64url>", "salt": "<base64url 32B>", "iv": "…", "ct": "…" },
     { "id": "w3", "type": "nip44", "ct": "…" }
@@ -148,170 +276,134 @@ The hashed `d`-tag hides which apps a user uses. The `evolustr:` prefix lets sig
 }
 ```
 
-`sHash` leaks nothing useful: `S` has 128 bits of entropy and the hash is truncated.
+`recovery` is never stored. The user writes it down.
 
-### 5.2 Rules for clients
+### 6.2 Client rules
 
 1. **Lookup:** query all configured relays and wait for EOSE from each, or a timeout. Never decide "no vault exists" from a single relay.
-2. **Create** only when every relay answered and none has the vault. After publishing, fetch again. If a vault with a different `sHash` and an earlier `created` appears, keep the earlier one and discard the local one. If the losing device has already written data, migrate it (open question §12).
-3. **Update only as a superset.** Adding a wrap means fetch, add, publish, then fetch again to check. A client never publishes a vault with fewer wraps, unless the user explicitly removes an unlock method.
-4. **Self-healing:** after a successful unlock, a client re-adds its own wrap if a concurrent update dropped it.
-5. **Pin locally:** keep the last good vault and `sHash` in local storage on each device.
+2. **Create** only when every relay answered and none has the vault. After publishing, fetch again. If a vault with a different `sHash` and an earlier `created` appears, keep the earlier one (data migration is open question §12.3).
+3. **Superset rule:** fetch, add a wrap, publish, fetch again to check. Never publish a vault with fewer wraps, unless the user explicitly removes an unlock method.
+4. **Self-healing:** after unlocking, re-add your own wrap if a concurrent update dropped it.
+5. **Pin locally:** keep the last good vault and its `sHash` on each device.
 
-### 5.3 Signer requirement: never auto-approve vault events
+### 6.3 Hostile overwrites
 
-A signer that auto-approves kind 30078 (for example nostr-shard-signer PR #46) **must exclude** events whose `d`-tag starts with `evolustr:`. Signing them always needs explicit user confirmation, worded as "App X wants to change your Evolustr data keys".
-
-**Our signer implements this. We cannot require it of other signers**, so clients must also handle hostile overwrites (§5.4).
-
-### 5.4 Hostile overwrite (any signer)
-
-An app with signing permission can publish a replacement vault event.
+Any app the user lets sign can publish a replacement vault event, through **any** signer. Capable signers refuse to auto-approve it (§5.6), but standard signers may sign it without asking. Clients must handle it:
 
 | Attack | Result | Mitigation |
 |---|---|---|
-| Replace the vault with a vault holding a secret the attacker knows | ❌ Fails against `signer` and `passkey` wraps: AES-GCM with AAD cannot be forged without the key. ⚠️ **Works against a vault whose only wrap is `nip44`**: the attacker can NIP-44-encrypt any secret through the signer. | The `sHash` pin on existing devices detects it. New devices with only `nip44` cannot detect it. Document this as part of `weak`. |
-| Replace with garbage or delete it | Data is unreachable on new devices (DoS). | Clients keep the last good vault and republish it if the newest one fails to decrypt or has a different `sHash`, after telling the user. Optionally, the server's write-once commitment (§10). |
+| Replace with a vault holding a secret the attacker knows | ❌ Fails for `signer` and `passkey` wraps: AES-GCM with AAD can't be forged without the key. ⚠️ **Works for `nip44` wraps**: the attacker can NIP-44-encrypt any secret through the signer. | Existing devices notice the changed `sHash`. A device that never saw the vault cannot tell. This is part of `weak`. The optional server (§10) closes it. |
+| Replace with garbage, or delete | New devices can't open the data (DoS). | Devices keep the last good vault and republish it if the newest one fails or has another `sHash`, after telling the user. |
 
 ---
 
-## 6. Support matrix
+## 7. Support matrix
 
-Rows are **signer setups**, columns are **hosting environments**. Each cell shows the best level available for each layer: **S** = shared, **A** = app, **P** = personal vault.
-Legend: ✅ strong · ⚠️ weak (NIP-44, "as private as your DMs") · ❌ not available
+**S** = shared · **A** = app · **P** = personal vault.
+✅ strong · 🔶 connection-scoped (§5.2) · ⚠️ weak ("as private as your Nostr DMs") · ❌ not available
 
-### 6.1 Overview
+### 7.1 By signer and hosting
 
-| Signer ↓ / Hosting → | Own domain (web) | nsite (gateway subdomain) | React Native |
+| Signer ↓ / Hosting → | Own domain (web) | nsite (gateway subdomain) | Mobile app |
 |---|---|---|---|
-| **① Our signer, OAuth mode** (key inside the iframe) | S ✅ · A ✅ · P ✅¹ | S ✅ · A ✅² · P ✅¹ | ❌ no iframe (§6.5) |
-| **② Our signer, passthrough mode** (extension or bunker via the bridge) | S ✅³ · A ✅³ · P ✅¹ | S ✅³ · A ✅²³ · P ✅¹ | ❌ |
-| **③ Standard signer + app-domain passkey** | S ⚠️ · A ✅ · P ❌ | S ⚠️ · A ✅⁴ · P ❌ | S ⚠️ · A ✅⁵ · P ❌ |
-| **④ Standard signer, no passkey** (NIP-07 / NIP-46 / NIP-55) | S ⚠️ · A ⚠️ · P ❌ | S ⚠️ · A ⚠️ · P ❌ | S ⚠️ · A ⚠️ · P ❌ |
-| **⑤ Optional server (§10)** added to ③/④ | Adds overwrite protection and revocation, not confidentiality | ❌ nsites have no backend (a shared broker cannot verify origins; see §11) | Same as web |
+| **Capable signer, verified identity** (extension, iframe signer, NIP-55) | S ⚠️ · A ✅ · P ✅ | S ⚠️ · A ✅¹ · P ✅ | NIP-55: S ⚠️ · A ✅ · P ✅ (Android) |
+| **Capable signer, NIP-46 bunker** | S ⚠️ · A 🔶 · P 🔶² | S ⚠️ · A 🔶 · P 🔶² | S ⚠️ · A 🔶 · P 🔶² |
+| **Standard signer + client passkey** | S ⚠️ · A ✅ · P ❌ | S ⚠️ · A ✅³ · P ❌ | S ⚠️ · A ✅⁴ · P ❌ |
+| **Standard signer, no passkey** | S ⚠️ · A ⚠️ · P ❌ | S ⚠️ · A ⚠️ · P ❌ | S ⚠️ · A ⚠️ · P ❌ |
+| **+ optional server (§10)** | Blocks hostile `nip44` replacement for new devices; revocation | ❌ (nsites have no backend; see §11) | as web |
 
-1. P needs a **signer-origin passkey** in every mode, including OAuth, because of the `clientId` owner.
-2. With an allowlisted gateway, the same app data appears on every allowlisted gateway (`appId = nsite:<npub>`). Otherwise each gateway origin is a separate app.
-3. In passthrough mode the signer has no nsec, so `M_signer` must be unlocked by a **signer-origin passkey**. Without one the signer falls back to a `nip44` wrap of `M_signer`, and S and A become ⚠️.
-4. The passkey's `rpId` is the gateway subdomain. The user enrolls a passkey separately on each gateway they use. WebAuthn Related Origin Requests can't help, because the developer doesn't control the gateway domain.
-5. Needs an associated domain (iOS `apple-app-site-association`, Android `assetlinks.json`), so a React Native app with passkeys still needs a web domain, but not a backend.
+1. On a known gateway, the same app data on every gateway (`nsite:<npub>`), with no extra enrollment.
+2. The personal vault is available, but each connection's prompt shows a self-asserted name. The user approves per item, so the risk is a misleading prompt, not silent access.
+3. One enrollment per gateway (§4.3).
+4. Needs an associated domain (§4.3).
 
-### 6.2 ① Our signer, OAuth mode
+"A ✅" assumes the app layer has **no** `nip44` wrap (§3.2). An app that keeps `nip44` for convenience is A ⚠️ in every row.
 
-- `M_signer` is unlocked silently via the `sk` wrap, then wrap keys are derived per app.
-- The nsec-derived layers (S, A) are readable by the **Web3Auth `clientId` owner**. This is documented in the signer README. If the signer uses a shared, loosely checked `clientId`, that owner is whoever controls the shared project.
-- The per-app separation does **not** depend on the `clientId` allowlist. It relies only on `event.origin`, so it also holds in a version of the signer with lighter checks.
-- P requires a passkey.
+### 7.2 Recovery per setup
 
-### 6.3 ② Our signer, passthrough mode
+| Setup | New device opens the app layer with |
+|---|---|
+| Capable signer | The same signer on the new device (signer passkey synced, or nsec in the signer) |
+| Client passkey | A synced passkey, a phone via QR, or the recovery phrase |
+| Standard signer, `nip44` kept | The signer alone (that is why it's weak) |
+| All passkeys lost, no phrase | ❌ Data is lost. The client must warn before it removes the `nip44` wrap. |
 
-- The signer forwards signing to the extension or bunker, so it has no nsec.
-- With a signer-origin passkey: same strength as ①, and not exposed to any `clientId` owner.
-- Without a passkey: the signer still separates apps by origin, but `M_signer` is only `nip44`-wrapped, so App B can unwrap it through the extension → ⚠️.
+### 7.3 Who can read what
 
-### 6.4 ③ / ④ Standard signers
-
-- No shared signer links apps together, so there is **no personal vault**.
-- The app layer is strong only with the app's **own-domain passkey**.
-- The shared layer is always ⚠️ (NIP-44).
-- Vault overwrites cannot be blocked at the signer (§5.4).
-
-### 6.5 React Native
-
-- There is no browser origin and no iframe signer. Signers: NIP-46, NIP-55 (Amber).
-- `appId = rn:<bundle-id>` is self-asserted, so a strong app layer relies **only** on the passkey (`rpId` bound to the app's associated domain).
-- The decrypted owner secrets are cached in `expo-secure-store` / Keychain for fast offline start.
-
-### 6.6 Passkey options compared
-
-| | Signer-origin passkey | App-domain passkey |
-|---|---|---|
-| Needs our signer | yes | no |
-| One passkey for all apps | ✅ | ❌ (one per domain, and one per nsite gateway) |
-| Unlocks | `M_signer` → S, A for every app, plus P | that app's `S_app` only |
-| Personal vault | ✅ | ❌ |
-| Provider lock-in | Apple / Google / password manager. Register several passkeys for safety. | Same |
+| Party | shared | app (strong) | app (weak) | personal vault |
+|---|---|---|---|---|
+| Relays, network, Evolu relay | ❌ | ❌ | ❌ | ❌ |
+| Other app, no signer permission | ❌ | ❌ | ❌ | ❌ |
+| Other app with sign + decrypt permission | ✅ | ❌ | ✅ | ❌ (needs user approval per item) |
+| OAuth/MPC project owner (e.g. Web3Auth `clientId` owner) | ✅ if the signer derives `M` from the nsec | same | ✅ | ❌ (passkey required) |
+| Compromised signer code or host | ✅ | ✅ | ✅ | ✅ (out of scope) |
 
 ---
 
-## 7. APIs
+## 8. Client library
 
-### 7.1 Signer extension: `window.nostr.evolustr` (our signer only)
-
-The NIP-07 methods are unchanged. This extra namespace is optional, like `window.nostr.nip44`.
-
-```ts
-interface NostrEvolustr {
-  version: 1;
-  /** What this signer can do in the current session. */
-  capabilities(): Promise<{
-    mode: "oauth" | "passthrough";
-    signerPasskey: boolean;        // M_signer unlockable by passkey
-    level: "strong" | "weak";      // strength of M_signer unlock
-    personalVault: boolean;
-    appId: string;                 // as the signer sees the caller
-  }>;
-  /** Wrap key for the caller's layer, derived from the verified origin. */
-  getWrapKey(layer: "shared" | "app"): Promise<Uint8Array>; // 32 bytes
-  /** Register a signer-origin passkey (popup fallback if iframe WebAuthn is unsupported). */
-  enrollPasskey(): Promise<void>;
-  vault: {
-    get(name: string): Promise<string | null>;  // asks the user, per app and item
-    set(name: string, value: string): Promise<void>; // asks the user
-    list(): Promise<string[]>;                  // item names the app was granted
-  };
-}
-```
-
-The signer derives `appId` itself (§3.2) and **ignores** any `appId` the caller sends.
-
-### 7.2 Client: `@evolustr/client`
+### 8.1 API
 
 ```ts
 interface EvolustrOptions<S> {
-  schema: S;                       // the app's Evolu schema
+  schema: S;                          // the app's Evolu schema
   relays: string[];
-  appId?: string;                  // RN only; web uses the origin
-  passkey?: { rpName: string };    // enables app-domain passkey fallback
-  minLevel?: { shared?: Level; app?: Level }; // refuse to open below this level
+  appId?: string;                     // native apps; web uses §3.3
+  passkey?: { rpName: string };       // enables client passkeys
+  minLevel?: { app?: "weak" | "strong" }; // default "weak"
+  knownNsiteGateways?: string[];      // for appId = nsite:<npub>
 }
-type Level = "strong" | "weak";
 
 interface Evolustr<S> {
   connect(): Promise<{
     pubkey: string;
     shared: EvoluInstance<SharedSchema>;
     app: EvoluInstance<S>;
-    levels: { shared: Level; app: Level; personalVault: boolean };
+    status: {
+      signer: "capable-verified" | "capable-connection" | "standard";
+      levels: { shared: "weak"; app: "strong" | "connection" | "weak" };
+      unlockedWith: "signer" | "passkey" | "nip44" | "recovery";
+      personalVault: boolean;
+      passkeySupported: boolean;      // PRF available here
+    };
   }>;
-  enrollPasskey(): Promise<void>;          // our signer if present, else app-domain
-  setting<K extends keyof SharedSettings>(key: K): SharedSettings[K]; // app ?? shared ?? default
-  vault?: NostrEvolustr["vault"];          // only with our signer
-  logout(): Promise<void>;                 // wipes cached secrets
+  enrollPasskey(): Promise<void>;     // client passkey on this domain
+  makeAppStrong(): Promise<void>;     // remove the nip44 wrap (§4.1 step 7)
+  showRecoveryPhrase(): Promise<string>; // after a user confirmation
+  restoreFromPhrase(words: string): Promise<void>;
+  setting<K extends keyof SharedSettings>(key: K): SharedSettings[K];
+  vault?: EvolustrSignerApi["vault"]; // only with a capable signer
+  logout(): Promise<void>;            // wipes cached secrets
 }
 ```
 
-The order for opening a layer (shared or app):
+### 8.2 Unlock order
 
-1. Fetch the vault (§5.2).
-2. Try to unwrap: `signer` wrap (if `window.nostr.evolustr`) → `passkey` wrap (if the platform supports PRF) → `nip44` wrap.
-3. If the vault doesn't exist, create it (§5.2) with every wrap available now.
-4. After a strong unlock, add any missing strong wraps (superset rule).
-5. If the resulting level is below `minLevel`, return an error that tells the user how to upgrade (enroll a passkey, or use our signer).
+For each layer:
 
-### 7.3 Packages
+1. Fetch the vault (§6.2).
+2. Try wraps in this order:
+   1. `signer`, if the signer is capable
+   2. `passkey`, if a wrap matches this `rpId` and PRF is supported
+   3. `nip44`
+   4. otherwise ask for the recovery phrase
+3. If no vault exists, create it (§6.2) with every wrap available now. Include `nip44` unless `minLevel.app` is `strong`.
+4. After unlocking, add any missing strong wrap the current setup can make (superset rule).
+5. If the layer's level (§3.2) is below `minLevel`, show how to upgrade: enroll a passkey, or use a capable signer.
+
+### 8.3 Packages
 
 | Package | Purpose |
 |---|---|
-| `@evolustr/client` | The client logic above. Framework-agnostic. Web and workers. |
+| `@evolustr/client` | The client logic. Framework-agnostic. Web and workers. |
 | `@evolustr/react` | `<EvolustrProvider>`, `useEvolustr()`, `useSetting()`. |
-| `@evolustr/rn` | React Native: NIP-46/NIP-55, native passkeys, secure-store cache. |
-| nostr-shard-signer module | `M_signer`, signer-origin passkeys, `window.nostr.evolustr`, personal vault, consent UI, the §5.3 rule. |
+| `@evolustr/rn` | React Native: NIP-46 and NIP-55, native passkeys, secure-store cache of unlocked secrets. |
+| `@evolustr/signer-kit` | Helpers for signer developers implementing §5: `M` storage, key derivation, vault rules, personal vault. |
 | `@evolustr/server` (optional) | §10. |
 
 ---
 
-## 8. Shared settings schema v1
+## 9. Shared settings schema v1
 
 Each setting is one Evolu row, so devices merge per field.
 
@@ -319,7 +411,7 @@ Each setting is one Evolu row, so devices merge per field.
 interface SharedSettings {
   theme: "light" | "dark" | "system";       // default "system"
   language: string;                          // BCP 47, default from navigator
-  locale: string;                            // number/date formatting
+  locale: string;                            // number and date formatting
   timeZone: string;                          // IANA
   reducedMotion: boolean;
   fontScale: number;                         // 0.75 – 2.0
@@ -328,30 +420,19 @@ interface SharedSettings {
 ```
 
 - Evolu table `evolustr_setting(key TEXT PRIMARY KEY, value JSON)`, in both the shared and the app databases.
-- `setting(key)` reads the app value first, then shared, then the default.
-- New keys use namespaces (`x-<vendor>-<name>`) until they are standardised in a new schema version. Unknown keys are kept, not deleted.
-
----
-
-## 9. Signer requirements (nostr-shard-signer)
-
-1. Derive `appId` only from `event.origin`, plus the gateway allowlist (§3.2).
-2. Never auto-approve kind 30078 events with `d` starting `evolustr:` (§5.3).
-3. Never wrap `S_personal` with `sk` or `nip44`.
-4. Create the iframe with `allow="publickey-credentials-get; publickey-credentials-create"`. If WebAuthn create or get fails in the iframe, open a popup on the signer origin.
-5. Show the verified origin, not app-supplied names, in every Evolustr prompt.
-6. Provide a UI that lists apps with access to vault items, and lets the user revoke access and remove passkeys.
+- `setting(key)` reads the app value, then shared, then the default.
+- New keys use namespaces (`x-<vendor>-<name>`) until a new schema version standardises them. Unknown keys are kept, never deleted.
 
 ---
 
 ## 10. Optional server: `@evolustr/server`
 
-This is not required, and not possible for nsites. It is useful for apps on their own domain that support standard signers (③/④):
+This is not required, and not possible for nsites. It is useful for apps on their own domain whose users have standard signers:
 
-- **Write-once vault commitment:** stores `(pubkey, layer, appId) → sHash` on the first create. Clients check fetched vaults against it, which also protects new devices against a hostile `nip44`-only replacement. Changing the commitment needs a delay and a notification.
-- **Revocation and rate limiting**, authenticated with NIP-98 (check the signature, `kind 27235`, `created_at` within ±60 s, `method`, `payload` hash, `u` against a **configured** canonical URL, and keep a replay cache).
+- **Write-once vault commitment:** stores `(pubkey, layer, appId) → sHash` on first create. Clients check fetched vaults against it, which also protects new devices against a hostile `nip44` replacement. Changing the commitment needs a delay and a notification.
+- **Revocation and rate limiting**, authenticated with NIP-98: check the signature, `kind 27235`, `created_at` within ±60 s, `method`, the `payload` hash, `u` against a **configured** canonical URL, and keep a replay cache.
 
-The server never receives any wrap key or owner secret.
+The server never receives a wrap key or owner secret.
 
 ---
 
@@ -361,29 +442,29 @@ The server never receives any wrap key or owner secret.
 |---|---|
 | Seed derived from `signEvent(...).sig` | Signatures aren't deterministic (random nonce, `created_at`), and any app can request the same signature. |
 | `userSign(appSign(npub))` | Any app can fake or replay `appSign` and ask the signer to sign it. |
-| Inner AES layer keyed by `HMAC(server_secret, pubkey)` released with NIP-98 | NIP-98 doesn't bind a request to the app that asked for the signature. App B gets a valid header from the user's signer and calls the server from its own backend. It only adds a second prompt. |
-| Shared nsite key broker that checks the `Origin` header | `Origin` can be forged by any non-browser client. |
-| Custom NIP-46 method (`sync_evolu_mnemonic`) as the only path | Only works with our own signer. Kept as a concept in `window.nostr.evolustr`, with fallbacks for other signers. |
-| Evolu syncing over Nostr relays | Evolu has its own sync protocol and relay. Nostr is used only for identity and vaults. |
+| Inner AES layer keyed by `HMAC(server_secret, pubkey)`, released with NIP-98 | NIP-98 doesn't bind a request to the app that asked for the signature. App B gets a valid header from the user's signer and calls the server from its own backend. |
+| Shared nsite key broker checking the `Origin` header | Any non-browser client can forge `Origin`. |
+| Custom NIP-46 method as the only path | Works only with one signer. Generalised into the Evolustr Signer API with fallbacks. |
+| Evolu syncing over Nostr relays | Evolu has its own sync protocol and relay. Nostr is used for identity and vaults only. |
 
 ---
 
 ## 12. Open questions
 
 1. **Evolu with several owners:** can one Evolu instance mount the shared and app owners together, or do we run one instance per layer? Check against the current Evolu release.
-2. **WebAuthn PRF in a cross-origin iframe:** browser support for `create` and `get` with PRF varies. Measure it and define when to use the popup fallback.
-3. **Merging after a create race (§5.2 rule 2):** how to move rows written to the losing owner into the winner.
-4. **Gateway allowlist:** who maintains it, and how it is distributed (signer config or a Nostr list event).
-5. **Shared `clientId` in the looser signer version:** document who the `clientId` owner is and what they can read (S and A in OAuth mode only).
-6. **Key rotation:** the `kid` field on `signer` wraps allows a new `M_signer` version. Define the re-wrap procedure.
+2. **PRF support:** measure which browsers, authenticators and hybrid (QR) flows return PRF output, including inside cross-origin iframes for iframe signers.
+3. **Create race:** how to move rows written to the losing owner (§6.2 rule 2) into the winner.
+4. **Known nsite gateways:** who maintains the list, and how it is distributed (config or a Nostr list event).
+5. **NIP-46 method names:** agree on them with bunker developers, ideally as a NIP.
+6. **Key rotation:** the `kid` field allows a new `M`. Define the re-wrap procedure.
 
 ---
 
 ## 13. Implementation phases
 
-1. `@evolustr/client` with **④** (NIP-44 vaults) and §5.2 relay rules, plus the shared settings schema.
-2. App-domain passkeys (**③**) for web, then nsite.
-3. Signer module: `M_signer`, `window.nostr.evolustr`, signer-origin passkeys, the §5.3 rule (**①/②**).
+1. `@evolustr/client`: `nip44` vaults, §6.2 relay rules, recovery phrase, shared settings.
+2. Client passkeys (§4) for web, then nsite.
+3. Evolustr Signer API (§5) in nostr-shard-signer as the reference, plus `@evolustr/signer-kit`.
 4. Personal vault and consent UI.
-5. `@evolustr/rn`.
-6. Optional `@evolustr/server`.
+5. `@evolustr/rn` (NIP-55, native passkeys).
+6. Propose the Signer API as a NIP. Optional `@evolustr/server`.
