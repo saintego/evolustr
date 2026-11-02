@@ -1,6 +1,6 @@
 # Evolustr Specification
 
-**Status:** Draft v0.4
+**Status:** Draft v0.5
 **Scope:** Nostr identity → one Evolu (local-first, E2E-encrypted SQLite) database per app, synced across devices, with **no mandatory backend**.
 
 ---
@@ -15,7 +15,7 @@ Evolustr has three parts:
 |---|---|
 | **App database** | One Evolu database per user per app: the app's private data and its secrets. This is the core of Evolustr. |
 | **Shared settings** | One small Nostr event with harmless preferences (theme, language, …) that every app can read. **Not** an Evolu database (§9). |
-| **Evolustr Signer API** | An optional protocol any signer can implement, to give each app a strong key without a passkey (§5). |
+| **Evolustr Signer API** | An optional protocol any signer can implement, to give each app a strong key without a passkey (§5). This repo ships it as `@evolustr/signer`, a package signers embed (§5.6). |
 
 Settings resolve as `app ?? shared ?? default`.
 
@@ -210,12 +210,59 @@ Pins are stored in the signer's own synced storage, so a **new device** also see
 4. Let the user see apps with keys, revoke them, and manage signer passkeys.
 5. Passkey operations and popups only on a user gesture. An iframe signer that can't create or use a passkey inside the iframe opens a popup on its own origin **from a click inside the iframe** (e.g. its own **Unlock** button), because a popup opened without a click is blocked. It needs `allow="publickey-credentials-get; publickey-credentials-create"` on the iframe.
 
-### 5.6 Reference implementation
+### 5.6 `@evolustr/signer`: the signer side as a package
 
-**nostr-shard-signer** (iframe signer, verified origin) is the first target:
+The signer side of Evolustr is a package in this repo, so a signer adds the API by embedding it instead of reimplementing §5. It contains everything that doesn't depend on a particular signer:
 
+- the master secret `M`: creating it, its vault event, `sk` and signer-passkey wraps, unlocking
+- key derivation (§5.3) and pins (§5.4)
+- request handling for `window.nostr.evolustr`, `evolustr_*` (NIP-46) and NIP-55
+- the auto-approve filter for vault events (§5.5 rule 2)
+- optionally, cross-app secrets ([SECRETS.md](SECRETS.md))
+
+The host signer supplies what only it knows: who is calling, how to sign, where to store things, and how to ask the user.
+
+```ts
+import { createEvolustrSigner } from "@evolustr/signer";
+
+const evolustr = createEvolustrSigner({
+  relays: ["wss://…"],
+  // Host-provided signing for the signer's own vault event (kind 30078).
+  sign: (event) => hostSignEvent(event),
+  getPublicKey: () => hostPubkey(),
+  // Only signers that hold the nsec. Omit in passthrough mode.
+  getSecretKey: () => hostSecretKeyOrNull(),
+  allowSkWrap: true,           // false when a third party can recover the nsec (§5.6 notes)
+  passkey: { rpId: location.hostname, rpName: "My Signer" },
+  storage: localKeyValueStore, // pins cache, unlocked-state cache
+  ui: {
+    // Show a prompt with the verified caller; resolve true/false.
+    confirm: (req) => hostConfirm(req),
+    // Ask the user to click (needed before passkey calls and popups).
+    requestGesture: (reason) => hostShowUnlockButton(reason),
+  },
+  knownNsiteGateways: ["nsite.lol"],
+  secrets: true,               // enable SECRETS.md
+});
+
+// In the host's message handler. `caller` comes from the host, never from params:
+// iframe → event.origin, extension → sender origin, NIP-55 → calling package,
+// NIP-46 → client pubkey (identity: "connection").
+const result = await evolustr.handle(method, params, { identity: "verified", origin: event.origin });
+
+// In the host's auto-approve logic:
+if (evolustr.isProtectedEvent(event)) requireConfirmation();
+```
+
+Thin adapters cover the common hosts: `adapters/iframe` (postMessage signers), `adapters/nip46` (bunkers), `adapters/extension` (browser extensions). A client-side helper exposes `window.nostr.evolustr` by forwarding calls to the host (for iframe signers, inside the bridge script).
+
+### 5.7 Reference host: nostr-shard-signer
+
+**nostr-shard-signer** (iframe signer, verified origin) embeds `@evolustr/signer` as the first host:
+
+- **Integration:** the iframe's message handler passes `evolustr_*` requests to `evolustr.handle()` with `origin: event.origin`. `nostr-bridge.js` adds `window.nostr.evolustr` and forwards its calls to the iframe, the same way it forwards `signEvent`. The auto-approve list calls `isProtectedEvent()`.
 - **OAuth mode** holds the nsec, so `M` can use the `sk` wrap. The Web3Auth `clientId` owner can recover the nsec, and so `M` and every app key derived from it. For users who don't accept that, the signer offers a signer passkey and drops the `sk` wrap. If a looser version of the signer uses a shared `clientId`, that owner is whoever controls the shared project.
-- **Passthrough mode** (extension or bunker through the bridge) has no nsec, so the API is available only after the user enrolls a signer passkey.
+- **Passthrough mode** (extension or bunker through the bridge) has no nsec, so the API is available only after the user enrolls a signer passkey. The signer's own vault event is then signed by the extension or bunker, through the bridge. The parent page sees only the AES-encrypted vault: it could block the publish, but not read or forge `M`.
 - Per-app separation relies on `event.origin`, not on the `clientId` allowlist, so it holds in the looser version too.
 - Its auto-approve list for Kind 30078 must exclude `evolustr:` `d`-tags (§5.5 rule 2).
 
@@ -369,7 +416,7 @@ interface Status {
 | `@evolustr/client` | Client logic. Framework-agnostic. Web and workers. |
 | `@evolustr/react` | `<EvolustrProvider>`, `useEvolustr()`, `useSetting()`. |
 | `@evolustr/rn` | React Native: NIP-46 and NIP-55, native passkeys, secure-store cache of the unlocked `S`. |
-| `@evolustr/signer-kit` | Helpers for signer developers implementing §5: `M` storage, key derivation, pins. |
+| `@evolustr/signer` | The signer side (§5.6): `M`, key derivation, pins, request handling, vault-event filter, optional cross-app secrets. Adapters for iframe, NIP-46 and extension hosts. Embedded by nostr-shard-signer. |
 | `@evolustr/server` (optional) | §10. |
 
 ---
@@ -459,7 +506,7 @@ The server never receives a wrap key or owner secret.
 
 1. `@evolustr/client` in `compatible` mode: `nip44` vaults, §6.2 relay rules, pins, recovery phrase, shared settings event.
 2. Client passkeys (§4) and `strict` mode with rotation, for web, then nsite.
-3. Evolustr Signer API (§5) in nostr-shard-signer as the reference, plus `@evolustr/signer-kit`.
+3. `@evolustr/signer` (§5.6), embedded in nostr-shard-signer as the first host.
 4. `@evolustr/rn` (NIP-55, native passkeys).
 5. Propose the Signer API as a NIP. Optional `@evolustr/server`.
-6. Cross-app secrets ([SECRETS.md](SECRETS.md)), independently of the above.
+6. Cross-app secrets ([SECRETS.md](SECRETS.md)) as an optional module of `@evolustr/signer`.

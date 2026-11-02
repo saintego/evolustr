@@ -5,7 +5,7 @@
 
 This is **not** part of Evolustr's app databases. An app that only needs its **own** secrets keeps them in its app database (SPEC §2). This store is for secrets the **user** owns and lends to apps one at a time.
 
-It only exists in signers that implement it. There is no fallback for standard signers.
+It only exists in signers that implement it. There is no fallback for standard signers. It ships as an optional module of `@evolustr/signer` (SPEC §5.6), enabled with `secrets: true`.
 
 ---
 
