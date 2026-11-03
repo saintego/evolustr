@@ -8,3 +8,4 @@ export * from "./tags.ts";
 export * from "./appId.ts";
 export * from "./vault.ts";
 export * from "./check.ts";
+export * from "./nostr/index.ts";
