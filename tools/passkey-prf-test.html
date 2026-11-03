@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Passkey PRF Test</title>
+<style>
+  :root { --bg:#fff; --fg:#1d1d1f; --muted:#6e6e73; --card:#f5f5f7; --ok:#1a7f37; --bad:#c62828; --warn:#9a6700; --accent:#0a66c2; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#f5f5f7; --muted:#a1a1a6; --card:#1c1c1e; --ok:#3fb950; --bad:#ff6b6b; --warn:#d29922; --accent:#4c9aff; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:1.5rem; margin:0 0 4px; }
+  p.lead { color:var(--muted); margin:0 0 24px; }
+  section { background:var(--card); border-radius:12px; padding:16px; margin-bottom:16px; }
+  h2 { font-size:1.05rem; margin:0 0 8px; }
+  button { font:inherit; padding:10px 16px; border-radius:8px; border:0; background:var(--accent); color:#fff; cursor:pointer; margin:4px 8px 4px 0; }
+  button:disabled { opacity:.5; cursor:default; }
+  ul { list-style:none; padding:0; margin:8px 0 0; }
+  li { padding:4px 0; border-top:1px solid color-mix(in srgb, var(--muted) 25%, transparent); overflow-wrap:anywhere; }
+  li:first-child { border-top:0; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+  textarea { width:100%; box-sizing:border-box; min-height:180px; font:13px/1.4 ui-monospace, Menlo, monospace; background:var(--bg); color:var(--fg); border:1px solid var(--muted); border-radius:8px; padding:8px; }
+  small { color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Passkey PRF test</h1>
+  <p class="lead">Checks whether this browser's passkeys give Evolustr the secret it needs (WebAuthn PRF) and whether the passkey is synced. Nothing leaves this page. Run steps 1–3 in order, then copy the report.</p>
+
+  <section>
+    <h2>0. This browser</h2>
+    <ul id="env"></ul>
+  </section>
+
+  <section>
+    <h2>1. Create a test passkey</h2>
+    <button id="create">Create test passkey</button>
+    <ul id="createOut"></ul>
+  </section>
+
+  <section>
+    <h2>2. Use it (PRF result)</h2>
+    <button id="get">Use test passkey</button>
+    <ul id="getOut"></ul>
+  </section>
+
+  <section>
+    <h2>3. Use it again (same result?)</h2>
+    <small>Reload the page first if you like; the test passkey is remembered on this page.</small><br>
+    <button id="get2">Use test passkey again</button>
+    <ul id="get2Out"></ul>
+  </section>
+
+  <section>
+    <h2>Report</h2>
+    <button id="copy">Copy report</button>
+    <button id="reset">Forget test passkey</button>
+    <p><small>Afterwards you can delete the passkey named "Evolustr PRF test" in your passwords settings.</small></p>
+    <textarea id="report" readonly></textarea>
+  </section>
+</main>
+<script>
+(() => {
+  const PRF_INPUT_TEXT = "evolustr/prf-test/v1";
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+    del(k) { try { localStorage.removeItem(k); } catch {} },
+  };
+  const report = [];
+  const $ = (id) => document.getElementById(id);
+
+  function line(listId, label, value, cls) {
+    const li = document.createElement("li");
+    li.innerHTML = "<b></b> <span></span>";
+    li.children[0].textContent = label + ":";
+    li.children[1].textContent = String(value);
+    if (cls) li.children[1].className = cls;
+    $(listId).appendChild(li);
+    report.push(`[${listId}] ${label}: ${value}`);
+    $("report").value = report.join("\n");
+  }
+  const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+  const fromB64u = (s) => Uint8Array.from(atob(s.replace(/-/g,"+").replace(/_/g,"/")), c => c.charCodeAt(0));
+  const hex = (buf) => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2,"0")).join("");
+  const sha256 = async (buf) => hex(await crypto.subtle.digest("SHA-256", buf));
+  const prfInput = async () => new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(PRF_INPUT_TEXT)));
+
+  // authenticatorData flags byte is at offset 32: UP=0x01 UV=0x04 BE=0x08 BS=0x10
+  function flags(authData) {
+    const f = new Uint8Array(authData)[32];
+    return { UV: !!(f & 0x04), BE: !!(f & 0x08), BS: !!(f & 0x10) };
+  }
+  function reportFlags(listId, authData) {
+    const f = flags(authData);
+    line(listId, "User verified (UV)", f.UV, f.UV ? "ok" : "warn");
+    line(listId, "Can be synced (BE)", f.BE, f.BE ? "ok" : "warn");
+    line(listId, "Is synced now (BS)", f.BS, f.BS ? "ok" : "warn");
+  }
+
+  async function env() {
+    line("env", "User agent", navigator.userAgent);
+    line("env", "Secure context", window.isSecureContext, window.isSecureContext ? "ok" : "bad");
+    line("env", "In an iframe", window.top !== window.self, window.top !== window.self ? "warn" : "ok");
+    const has = typeof PublicKeyCredential !== "undefined";
+    line("env", "WebAuthn available", has, has ? "ok" : "bad");
+    if (!has) { ["create","get","get2"].forEach(id => $(id).disabled = true); return; }
+    try {
+      const pa = await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+      line("env", "Platform authenticator", pa, pa ? "ok" : "warn");
+    } catch (e) { line("env", "Platform authenticator", "error " + e.name, "warn"); }
+    if (PublicKeyCredential.getClientCapabilities) {
+      try {
+        const caps = await PublicKeyCredential.getClientCapabilities();
+        const prf = caps["extension:prf"];
+        line("env", "Browser reports PRF support", prf === undefined ? "not reported" : prf, prf ? "ok" : "warn");
+      } catch (e) { line("env", "getClientCapabilities", "error " + e.name, "warn"); }
+    } else {
+      line("env", "getClientCapabilities", "not available (older browser)", "warn");
+    }
+    line("env", "Saved test passkey", store.get("prfTestCredId") ? "yes" : "no");
+  }
+
+  $("create").onclick = async () => {
+    $("createOut").innerHTML = "";
+    try {
+      const cred = await navigator.credentials.create({ publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        rp: { name: "Evolustr PRF test" },
+        user: { id: crypto.getRandomValues(new Uint8Array(16)), name: "evolustr-prf-test", displayName: "Evolustr PRF test" },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+        authenticatorSelection: { residentKey: "required", userVerification: "required" },
+        extensions: { prf: { eval: { first: await prfInput() } } },
+      }});
+      store.set("prfTestCredId", b64u(cred.rawId));
+      store.del("prfTestOutHash");
+      line("createOut", "Created", "yes", "ok");
+      line("createOut", "Authenticator attachment", cred.authenticatorAttachment || "unknown");
+      const ext = cred.getClientExtensionResults();
+      const prf = ext.prf;
+      line("createOut", "PRF enabled", prf ? String(prf.enabled) : "no prf result", prf && prf.enabled ? "ok" : "bad");
+      const first = prf && prf.results && prf.results.first;
+      line("createOut", "PRF result already at create (one prompt)", !!first, first ? "ok" : "warn");
+      if (first) {
+        const h = await sha256(first);
+        store.set("prfTestOutHash", h);
+        line("createOut", "PRF output (hash prefix)", h.slice(0, 16));
+      }
+      if (cred.response.getAuthenticatorData) reportFlags("createOut", cred.response.getAuthenticatorData());
+      else line("createOut", "Flags", "getAuthenticatorData not available", "warn");
+    } catch (e) {
+      line("createOut", "Error", e.name + ": " + e.message, "bad");
+    }
+  };
+
+  async function use(listId) {
+    $(listId).innerHTML = "";
+    const id = store.get("prfTestCredId");
+    if (!id) { line(listId, "Error", "Create a test passkey first (step 1)", "bad"); return; }
+    try {
+      const cred = await navigator.credentials.get({ publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(32)),
+        allowCredentials: [{ type: "public-key", id: fromB64u(id) }],
+        userVerification: "required",
+        extensions: { prf: { eval: { first: await prfInput() } } },
+      }});
+      line(listId, "Used", "yes", "ok");
+      const first = cred.getClientExtensionResults().prf?.results?.first;
+      line(listId, "PRF output returned", !!first, first ? "ok" : "bad");
+      if (first) {
+        line(listId, "PRF output length (bytes)", first.byteLength, first.byteLength === 32 ? "ok" : "warn");
+        const h = await sha256(first);
+        line(listId, "PRF output (hash prefix)", h.slice(0, 16));
+        const prev = store.get("prfTestOutHash");
+        if (prev) line(listId, "Same as before", prev === h, prev === h ? "ok" : "bad");
+        else store.set("prfTestOutHash", h);
+      }
+      reportFlags(listId, cred.response.authenticatorData);
+    } catch (e) {
+      line(listId, "Error", e.name + ": " + e.message, "bad");
+    }
+  }
+  $("get").onclick = () => use("getOut");
+  $("get2").onclick = () => use("get2Out");
+
+  $("copy").onclick = async () => {
+    try { await navigator.clipboard.writeText($("report").value); $("copy").textContent = "Copied"; }
+    catch { $("report").select(); document.execCommand && document.execCommand("copy"); $("copy").textContent = "Copied"; }
+    setTimeout(() => $("copy").textContent = "Copy report", 1500);
+  };
+  $("reset").onclick = () => { store.del("prfTestCredId"); store.del("prfTestOutHash"); location.reload(); };
+
+  env();
+})();
+</script>
+</body>
+</html>
