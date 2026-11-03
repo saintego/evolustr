@@ -1,6 +1,6 @@
 # Evolustr Specification
 
-**Status:** Draft v0.11
+**Status:** Draft v0.12
 **Scope:** Nostr identity → one Evolu (local-first, E2E-encrypted SQLite) database per app, synced across devices, with **no backend and no storage other than Nostr relays and Evolu**.
 
 ---
@@ -53,7 +53,8 @@ Evolustr works with **any** Nostr signer. Signers that implement the Signer API,
 - One per user per app, keyed by `appId` (§3.3). It is the app's private storage and can hold the app's own secrets.
 - Its data secret `S` and root key `R` live in a vault event (§6).
 - Its level is set by the **vault**, not by the app's code (§3.2). The app can only require a minimum: `requireStrong: true` means the app only opens strict databases.
-- On the device, each `(pubkey, appId)` has its **own** local Evolu database, named `evolustr-` + the first 16 hex characters of `SHA-256(pubkey + "|" + appId)`. Two Nostr accounts on one browser never share local data or cached vault copies.
+- On the device, each `(pubkey, appId)` has its **own** local Evolu database. Evolu (8.x) identifies a local database by its `appName` plus the AppOwner made from `S`, so a different account (different `S`) automatically gets a different database. Evolustr sets `appName` to `evolustr-` + the first 16 hex characters of `SHA-256(appId)`. Two Nostr accounts on one browser never share local data or cached vault copies.
+- Evolu 8.x does **not** keep the owner secret itself: the app passes `appOwner` (made from `S` with `createAppOwner`) every time it creates the Evolu instance. Evolustr supplies it after unlocking.
 
 ---
 
@@ -136,21 +137,25 @@ The BS flag is what the authenticator reports at that moment; a user can still l
 
 ### 3.4 Replacing `S` (making a vault strict)
 
-Evolu stores CRDT messages tied to the owner, so a database can't be copied as a SQLite file.
+Evolu stores CRDT messages tied to the owner, so a database can't be copied as a SQLite file. Evolu 8.x can open two local databases at once (same `appName`, different AppOwner), which the migration uses.
 
 **On the device that runs `makeStrict()`:**
 
 1. Unlock `R` (any strong method or the recovery phrase).
 2. Create `S'`. If the database has no rows in any app table, skip to step 4.
-3. For every table in the app's schema (not Evolu's internal tables), read the rows from `S` and insert them into `S'` **through Evolu's mutation API**, so `S'` gets valid timestamps of its own.
+3. For every table in the app's schema (not Evolu's internal tables), read the rows from `S` and write them into `S'` with Evolu's **`upsert`, keeping each row's `id`**, so references between rows stay valid. Copy `isDeleted` too.
+
+**Known limit:** Evolu sets the system columns `createdAt` and `updatedAt` itself and they can't be written, so in `S'` every copied row gets the migration time. An app that shows when something was created must keep that in its own column (for example `created`). Evolustr's docs say so up front.
 4. Publish the vault with `mode: "strict"`, a new `root` wrap for `S'`, no `nip44` wrap, `sHash` of `S'`, `created` = now, and the old `{ sHash, created }` appended to **`history`** (the last 10 data secrets, oldest first).
 
 **On other devices** (online or back from offline), when the fetched vault's `sHash` differs from the local database's and its `root` wrap opens with `R` (§6.3):
 
 1. Unlock `R`, then the current secret from the `root` wrap. If the device can't (it only used `nip44`, or has no strong method here), it has no access yet (§3.2 rule 8). Its local database stays untouched until the user unlocks `R` on this device; the migration then runs.
 2. Find the local `sHash` in the vault's `history`. The **cut-off** is the `created` time of the secret that replaced it: the next entry in `history`, or the vault's own `created` if the local one is the last entry. This also works after several rotations while the device was offline.
-3. Copy into the current database only the local rows that are **missing** there or were **changed after the cut-off** (Evolu's per-row update timestamp). Copying every row would overwrite newer edits with older local values. If the local `sHash` isn't in `history` (more than 10 rotations ago, or a restore), ask the user before copying anything.
-4. Switch to the current database and delete the local old one.
+3. Copy into the current database only the local rows that are **missing** there or were **changed after the cut-off** (Evolu's `updatedAt ?? createdAt`, which comes from the change's hybrid logical clock; allow a few minutes of margin for devices whose clocks are off). Copying every row would overwrite newer edits with older local values. If the local `sHash` isn't in `history` (more than 10 rotations ago, or a restore), ask the user before copying anything.
+4. Switch to the current database and delete the local old one (`deleteDatabase()` on the old instance).
+
+Evolu doesn't delete an owner's data on its relays yet, so the old `S` data stays on Evolu relays after a rotation. That data was already readable by anyone who had the `nip44` wrap; everything written after the rotation is under `S'`.
 
 The relay vault carries all the information, so no device waits for Evolu sync to learn about a rotation.
 
@@ -396,7 +401,7 @@ A `compatible` vault that has no `R` yet has empty `rootWraps` and only the `nip
 3. **Adding a wrap:** fetch, add the wrap (wraps are keyed by `signerId` / `credId`, so concurrent additions merge), publish, fetch again to check. Never drop a wrap without an explicit user action. `makeStrict()` and `downgrade()` are such actions.
 4. **Self-healing:** after unlocking, re-add your own wrap if a concurrent update dropped it. Never re-add `nip44` to a `strict` vault (§3.2 rule 5).
 5. **Keep a copy in Evolu:** after a successful unlock, store the vault event in the app database itself (table `evolustr_meta`, key `vault`). It lives in that `(pubkey, appId)` database only (§2), and Evolu syncs it, so every device that has the database also has the last good vault (§6.3).
-6. **Device cache:** a device may cache the unlocked `S` (Evolu does this itself) and `R` for its `(pubkey, appId)`. `logout()` removes both; `logout({ deleteLocalData: true })` also deletes the local database.
+6. **Device cache:** Evolu needs `S` every time the app starts (§2), so a device caches the unlocked `S`, and may cache `R`, for its `(pubkey, appId)`: in device-local storage on the web, in secure storage on mobile. `logout()` removes both; `logout({ deleteLocalData: true })` also deletes the local database.
 
 ### 6.3 Checking a fetched vault
 
@@ -606,12 +611,13 @@ interface SharedSettings {
 | Signer vault `d`-tag based on `signerId` (v0.6–v0.7) | `signerId` comes from `M`, so a new device couldn't find the vault that holds `M`. Now based on `signerKey` (§5.3). |
 | A random PRF salt per passkey wrap (v0.3–v0.7) | Several salts need `evalByCredential`, which fewer browsers support. One `prfInput` per vault (§4.1). |
 | One local Evolu database name per app (v0.2–v0.7) | Two Nostr accounts on one browser mixed their data and vault copies. Now one per `(pubkey, appId)` (§2). |
+| Our own hashed database name with the pubkey (v0.8–v0.11) | Not needed: Evolu already separates local databases by AppOwner (§2). |
 
 ---
 
 ## 11. Open questions
 
-1. **Evolu API:** confirm the current release's API for restoring an owner from a mnemonic, reading every app table, and reading each row's update timestamp (§3.4).
+1. ~~**Evolu API**~~ **Checked against Evolu 8.26 (`@evolu/common`):** owner from a 16-byte secret (12 words) with `createAppOwner`, mnemonic round trip, `upsert` with a fixed `id`, system columns `createdAt` / `updatedAt` / `isDeleted`, two databases open at once: all present. Corrections taken into the spec: the app must supply the owner on every start (§2, §6.2 rule 6), and copied rows lose their original `createdAt` (§3.4).
 2. **PRF support:** measure which browsers, operating systems, authenticators and hybrid (QR) flows return PRF output, which return it already at `create()`, and where passkey creation and use work inside a cross-origin iframe (for iframe signers).
 3. **Create race:** how to move rows written to the losing data secret (§6.2 rule 2) into the winner.
 4. **Compatible vault replaced, new device:** the new device may write into an attacker's empty database until another device restores the real vault. Define how those rows are moved back.
