@@ -109,13 +109,13 @@ Rules:
 3. **`strict` is the user's choice.** The client may *offer* it when the user has a strong method (`status.canMakeStrict`), but only `makeStrict()`, called after the user confirms, changes the mode. A user who refuses passkeys and capable signers simply stays `compatible`. How much backup is asked for first depends on whether the user's strong method can be recovered on its own (rule 3a).
 3a. **Backup check before `strict`, scaled to the risk:**
 
-    | The user's only strong method | Recoverable on its own? | Before `makeStrict()` |
-    |---|---|---|
-    | Synced passkey: the WebAuthn authenticator data has the **backup state** flag (BS) set, e.g. iCloud Keychain, Google Password Manager, a password manager | Yes, through the provider account | Nothing required. Show a skippable reminder: "Your data is protected by your passkey. Save your recovery phrase or add a second passkey in case you lose access to your passkey provider." |
-    | Capable signer whose `M` can be recovered from the nsec (`sk` wrap), or by a synced signer passkey | Yes, through the signer | Nothing required. Same skippable reminder. |
-    | Device-bound passkey (BS flag not set: a hardware key, a local-only platform authenticator) or a signer passkey that isn't synced | **No**: losing that one device loses the data | Confirm the recovery phrase, add a second strong method, **or** explicitly accept "I will lose this data if I lose this device". |
+| The user's only strong method | Recoverable on its own? | Before `makeStrict()` |
+|---|---|---|
+| Synced passkey: the WebAuthn authenticator data has the **backup state** flag (BS) set, e.g. iCloud Keychain, Google Password Manager, a password manager | Yes, through the provider account | Nothing required. Show a skippable reminder: "Your data is protected by your passkey. Save your recovery phrase or add a second passkey in case you lose access to your passkey provider." |
+| Capable signer whose `M` can be recovered from the nsec (`sk` wrap), or by a synced signer passkey | Yes, through the signer | Nothing required. Same skippable reminder. |
+| Device-bound passkey (BS flag not set: a hardware key, a local-only platform authenticator) or a signer passkey that isn't synced | **No**: losing that one device loses the data | Confirm the recovery phrase, add a second strong method, **or** explicitly accept "I will lose this data if I lose this device". |
 
-    The BS flag is what the authenticator reports at that moment; a user can still lose the provider account or turn sync off later. So the reminder stays visible (`status.backupRecommended`) until the user has a second strong method or has confirmed the phrase. The recovery phrase can be shown at any time later (`showRecoveryPhrase()`).
+The BS flag is what the authenticator reports at that moment; a user can still lose the provider account or turn sync off later. So the reminder stays visible (`status.backupRecommended`) until the user has a second strong method or has confirmed the phrase. The recovery phrase can be shown at any time later (`showRecoveryPhrase()`).
 4. **Making a vault strict replaces `S`.** Dropping the `nip44` wrap doesn't make the old `S` secret again, because relays and other apps may have kept copies. The client creates a new `S'` (§3.4). `R` and all strong wraps stay as they are, so the recovery phrase doesn't change either.
 5. **Clients never add a `nip44` wrap to a `strict` vault**, whatever the app's code or configuration says.
 6. **A `strict` vault ignores `nip44`.** A client reading a `strict` vault never tries a `nip44` wrap, even if one appears on a relay.
