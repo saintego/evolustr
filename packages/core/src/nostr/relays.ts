@@ -22,14 +22,30 @@ export const poolRelays = (pool: SimplePool = new SimplePool()): Relays => ({
       try {
         const relay = await withTimeout(pool.ensureRelay(url, { connectionTimeout: timeoutMs }), timeoutMs);
         return await new Promise<boolean>((resolve) => {
+          // Settle once: closing the subscription fires onclose, which must not
+          // turn an answered relay into a failed one.
+          let settled = false;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const settle = (answered: boolean) => {
+            if (settled) return;
+            settled = true;
+            if (timer !== undefined) clearTimeout(timer);
+            resolve(answered);
+          };
           const sub = relay.subscribe([toNtFilter(filter)], {
             onevent: (e) => {
               if (isValidEvent(e as NostrEvent)) events.set(e.id, e as NostrEvent);
             },
-            oneose: () => (clearTimeout(timer), sub.close(), resolve(true)),
-            onclose: () => (clearTimeout(timer), resolve(false)),
+            oneose: () => {
+              settle(true);
+              sub.close();
+            },
+            onclose: () => settle(false),
           });
-          const timer = setTimeout(() => (sub.close(), resolve(false)), timeoutMs);
+          timer = setTimeout(() => {
+            settle(false);
+            sub.close();
+          }, timeoutMs);
         });
       } catch {
         return false;

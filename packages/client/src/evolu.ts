@@ -4,6 +4,9 @@
  * The app keeps control of Evolu's platform setup (web workers, React Native):
  * it passes `createEvolu`, which Evolustr calls with the schema, the AppOwner
  * made from S, and the app name.
+ *
+ * Pass `onDatabaseDeleted: () => {}` in the Evolu config: Evolustr deletes the
+ * old local database after a migration, and Evolu otherwise reloads the page.
  */
 import {
   type AppOwner,
