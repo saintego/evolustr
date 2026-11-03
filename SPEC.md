@@ -152,7 +152,7 @@ Evolu stores CRDT messages tied to the owner, so a database can't be copied as a
 
 1. Unlock `R`, then the current secret from the `root` wrap. If the device can't (it only used `nip44`, or has no strong method here), it has no access yet (§3.2 rule 8). Its local database stays untouched until the user unlocks `R` on this device; the migration then runs.
 2. Find the local `sHash` in the vault's `history`. The **cut-off** is the `created` time of the secret that replaced it: the next entry in `history`, or the vault's own `created` if the local one is the last entry. This also works after several rotations while the device was offline.
-3. Copy into the current database only the local rows that are **missing** there or were **changed after the cut-off** (Evolu's `updatedAt ?? createdAt`, which comes from the change's hybrid logical clock; allow a few minutes of margin for devices whose clocks are off). Copying every row would overwrite newer edits with older local values. If the local `sHash` isn't in `history` (more than 10 rotations ago, or a restore), ask the user before copying anything.
+3. Copy into the current database only the local rows that are **missing** there or were **changed after the cut-off** (Evolu's `updatedAt ?? createdAt`, which comes from the change's hybrid logical clock; allow a few minutes of margin for devices whose clocks are off). Copying every row would overwrite newer edits with older local values. If the local `sHash` isn't in `history` (more than 10 rotations ago, or a restore), copy only rows **missing** in the current database, never overwriting existing ones.
 4. Switch to the current database and delete the local old one (`deleteDatabase()` on the old instance).
 
 Evolu doesn't delete an owner's data on its relays yet, so the old `S` data stays on Evolu relays after a rotation. That data was already readable by anyone who had the `nip44` wrap; everything written after the rotation is under `S'`.
@@ -463,6 +463,8 @@ Shared settings are always ⚠️ by design (§9). The level shown is the **high
 ## 8. Client library
 
 ### 8.1 API
+
+The signatures below show the success values. In the implementation every method returns a `Result` (`{ ok: true, value }` or `{ ok: false, error: { type, message } }`) instead of throwing.
 
 ```ts
 interface EvolustrOptions<S> {
