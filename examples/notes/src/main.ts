@@ -153,9 +153,7 @@ $("connect").onclick = async () => {
       openDatabase: databases.open,
       cache: keyValueCache(localStorage),
       passkeys: webauthnPasskeys({ rpName: "Evolustr Notes" }),
-      ...(detectCapableSigner((window as unknown as { nostr?: unknown }).nostr) === undefined
-        ? {}
-        : { capableSigner: detectCapableSigner((window as unknown as { nostr?: unknown }).nostr)! }),
+      capableSigner: detectCapableSigner((window as unknown as { nostr?: unknown }).nostr),
     },
     { appId, relayUrls },
   );

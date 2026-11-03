@@ -87,9 +87,9 @@ export interface ClientDeps {
   readonly openDatabase: OpenDatabase;
   readonly cache: SecretCache;
   /** Client passkeys on this app's domain (SPEC §4); omit to disable. */
-  readonly passkeys?: Passkeys;
+  readonly passkeys?: Passkeys | undefined;
   /** An Evolustr-capable signer (SPEC §5), e.g. from `detectCapableSigner(window.nostr)`. */
-  readonly capableSigner?: CapableSigner;
+  readonly capableSigner?: CapableSigner | undefined;
   /** Unix seconds. */
   readonly now?: () => number;
   readonly randomBytes?: (length: number) => Bytes;
