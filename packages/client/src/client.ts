@@ -17,12 +17,24 @@ import {
   type VaultChoice,
   type VaultContext,
   type SettingKey,
+  type StrongMethod,
   type SettingsDoc,
   type SharedSettings,
   DATA_SECRET_LENGTH,
   ROOT_KEY_LENGTH,
   VAULT_KIND,
   addRootKey,
+  addRootWrap,
+  backupRequirement,
+  clientPrfInput,
+  createStrictVault,
+  makeStrict as makeStrictVault,
+  openRootWrap,
+  passkeyRootWrap,
+  passkeyWrapKey,
+  passkeyWrapsFor,
+  sha256,
+  utf8,
   appVaultDTag,
   createCompatibleVault,
   decideVault,
@@ -53,6 +65,7 @@ import {
   vaultEvent,
 } from "@evolustr/core";
 import type { SecretCache } from "./cache.ts";
+import type { CreatedPasskey, Passkeys } from "./passkeys.ts";
 import { fetchSharedSettings, publishSharedSettings } from "./settings.ts";
 import {
   type AppDatabase,
@@ -70,6 +83,8 @@ export interface ClientDeps {
   readonly relays: Relays;
   readonly openDatabase: OpenDatabase;
   readonly cache: SecretCache;
+  /** Client passkeys on this app's domain (SPEC §4); omit to disable. */
+  readonly passkeys?: Passkeys;
   /** Unix seconds. */
   readonly now?: () => number;
   readonly randomBytes?: (length: number) => Bytes;
@@ -103,6 +118,11 @@ export interface Status {
   readonly backupRecommended: boolean;
 }
 
+export interface UnlockInput {
+  readonly recoveryPhrase?: string;
+  readonly acceptDeviceLoss?: boolean;
+}
+
 export interface Ready {
   readonly pubkey: string;
   readonly db: AppDatabase;
@@ -123,14 +143,23 @@ export type ConnectResult =
 export interface Evolustr {
   /** Never prompts for a passkey; safe on page load. */
   readonly connect: () => Promise<Result<ConnectResult>>;
-  /** Completes `needsUserAction`, from a click. Pass the phrase for "recoveryPhrase". */
-  readonly unlock: (input?: { readonly recoveryPhrase?: string }) => Promise<Result<Ready>>;
+  /**
+   * Completes `needsUserAction`, from a click. Pass the phrase for "recoveryPhrase";
+   * for "setupStrong" with a device-bound passkey, pass `acceptDeviceLoss`.
+   */
+  readonly unlock: (input?: UnlockInput) => Promise<Result<Ready>>;
   readonly resolveVaultChange: (
     choice: VaultChoice,
     input?: { readonly recoveryPhrase?: string },
   ) => Promise<Result<Ready>>;
-  /** Makes R available on this device while ready (SPEC §8.1). */
-  readonly unlockRoot: (input: { readonly recoveryPhrase: string }) => Promise<Result<Status>>;
+  /** Makes R available on this device while ready: phrase, or a passkey from a click (SPEC §8.1). */
+  readonly unlockRoot: (input?: { readonly recoveryPhrase?: string }) => Promise<Result<Status>>;
+  /** Adds a passkey on this domain, from a click. May need `finishPasskeySetup` (SPEC §4.2). */
+  readonly enrollPasskey: () => Promise<Result<{ readonly done: boolean }>>;
+  /** Second click when the authenticator returned no PRF output at creation. */
+  readonly finishPasskeySetup: () => Promise<Result<Status>>;
+  /** User's choice: replaces S and drops the NIP-44 wrap (SPEC §3.2 rules 3–4, §3.4). */
+  readonly makeStrict: (opts?: { readonly acceptDeviceLoss?: boolean }) => Promise<Result<Status>>;
   /** R as 12 words; creates R if the vault has none yet. */
   readonly showRecoveryPhrase: () => Promise<Result<string>>;
   /** The user typed the phrase back correctly; remembered for the backup check. */
@@ -176,6 +205,13 @@ type Session = { readonly kind: "none" } | Unlocked | Pending;
 
 export const META_PHRASE_CONFIRMED = "phraseConfirmed";
 export const META_APP_SETTINGS = "appSettings";
+/** Strong methods known for this database, for the backup check (SPEC §3.2 rule 3a). */
+export const META_STRONG_METHODS = "strongMethods";
+
+interface KnownMethod {
+  readonly id: string;
+  readonly method: StrongMethod;
+}
 
 // ── Implementation ──────────────────────────────────────────────────────────
 
@@ -189,6 +225,24 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   let settingsState: { readonly app: SettingsDoc; readonly shared: SettingsDoc } = { app: emptySettings, shared: emptySettings };
   const settingsDefaults = options.settingsDefaults ?? defaultSettings();
   const settingsIo = { signer: deps.signer, relays: deps.relays, relayUrls: options.relayUrls, timeoutMs };
+  let passkeySupported = false;
+  let backupState: { readonly methods: ReadonlyArray<KnownMethod>; readonly phraseConfirmed: boolean } = {
+    methods: [],
+    phraseConfirmed: false,
+  };
+  let pendingPasskey: CreatedPasskey | null = null;
+  const passkeys = deps.passkeys;
+
+  const readMethods = async (db: AppDatabase): Promise<ReadonlyArray<KnownMethod>> => {
+    const text = await db.getMeta(META_STRONG_METHODS);
+    if (text === null) return [];
+    try {
+      const list = JSON.parse(text) as unknown;
+      return Array.isArray(list) ? (list as KnownMethod[]) : [];
+    } catch {
+      return [];
+    }
+  };
 
   const readDoc = async (db: AppDatabase, key: string): Promise<SettingsDoc> => {
     const text = await db.getMeta(key);
@@ -240,10 +294,12 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     mode: s.vault.mode,
     level: level(s.vault),
     unlockedWith: s.unlockedWith,
-    canMakeStrict: s.r !== undefined,
+    canMakeStrict: s.r !== undefined && s.vault.mode === "compatible",
     canAddStrongMethod: s.r !== undefined || !hasRootKey(s.vault),
-    passkeySupported: false,
-    backupRecommended: false,
+    passkeySupported,
+    backupRecommended:
+      s.vault.mode === "strict" &&
+      backupRequirement(backupState.methods.map((m) => m.method), backupState.phraseConfirmed) !== "none",
   });
 
   /** Opens the database for S, keeps the vault copy and the cache, and becomes ready. */
@@ -261,6 +317,10 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const next: Unlocked = { kind: "ready", ctx, vault, s, db: database, unlockedWith, ...(r === undefined ? {} : { r }) };
     session = next;
     settingsState = { app: await readDoc(database, META_APP_SETTINGS), shared: await readDoc(database, META_SHARED_SETTINGS) };
+    backupState = {
+      methods: await readMethods(database),
+      phraseConfirmed: (await database.getMeta(META_PHRASE_CONFIRMED)) === "1",
+    };
     return ok({ pubkey: ctx.pubkey, db: database, status: statusOf(next) });
   };
 
@@ -335,8 +395,33 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       }
       if (s.error.type === "signerRefused") return s;
     }
-    session = { kind: "pending", ctx, action: "recoveryPhrase", vault, ...(local === undefined ? {} : { local }) };
-    return ok({ state: "needsUserAction", action: "recoveryPhrase" });
+    return askStrongUnlock(ctx, vault, local);
+  };
+
+  /** A strong method is needed: a passkey (from a click) if one matches, else the phrase. */
+  const askStrongUnlock = (ctx: VaultContext, vault: Vault, local: Pending["local"]): Result<ConnectResult> => {
+    const action: UserAction =
+      passkeys !== undefined && passkeySupported && passkeyWrapsFor(vault, passkeys.rpId).length > 0
+        ? "passkey"
+        : "recoveryPhrase";
+    session = { kind: "pending", ctx, action, vault, ...(local === undefined ? {} : { local }) };
+    return ok({ state: "needsUserAction", action });
+  };
+
+  /** Opens R with one of this domain's passkeys (SPEC §4.3). Call from a click. */
+  const rootFromPasskey = async (ctx: VaultContext, vault: Vault): Promise<Result<Bytes>> => {
+    if (passkeys === undefined) return error("noPasskeys", "Passkeys aren't enabled");
+    const wraps = passkeyWrapsFor(vault, passkeys.rpId);
+    if (wraps.length === 0) return error("noPasskeyWrap", "No passkey for this site is registered in the vault");
+    let result;
+    try {
+      result = await passkeys.get({ allowCredIds: wraps.map((w) => w.credId), prfInput: clientPrfInput(ctx.pubkey, ctx.appId) });
+    } catch (e) {
+      return error("passkeyFailed", e instanceof Error ? e.message : String(e));
+    }
+    const wrap = wraps.find((w) => w.credId === result.credId);
+    if (wrap === undefined || result.prfOutput === null) return error("passkeyFailed", "The passkey gave no usable result");
+    return openRootWrap(ctx, wrap, passkeyWrapKey(result.prfOutput, ctx.appId));
   };
 
   // ── API ──
@@ -349,6 +434,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       return error("signerRefused", e instanceof Error ? e.message : String(e));
     }
     const ctx: VaultContext = { pubkey, appId: options.appId };
+    passkeySupported = passkeys === undefined ? false : await passkeys.supported().catch(() => false);
     const cached = await deps.cache.get(pubkey, options.appId);
     const fetched = await fetchVault(ctx);
 
@@ -388,8 +474,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         return withReady(becomeReady(ctx, decision.vault, decision.s, local!.r, "cache", db));
       }
       case "needsStrongUnlock":
-        session = { kind: "pending", ctx, action: "recoveryPhrase", vault: decision.vault, ...(local === undefined ? {} : { local }) };
-        return ok({ state: "needsUserAction", action: "recoveryPhrase" });
+        return askStrongUnlock(ctx, decision.vault, local);
       case "choose":
         session = {
           kind: "pending",
@@ -406,6 +491,12 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   const openWithPhrase = async (p: Pending, words: string): Promise<Result<Ready>> => {
     const r = phraseToRootKey(words);
     if (!r.ok) return r;
+    return openWithRoot(p, r.value, "recovery");
+  };
+
+  /** Opens the pending vault with R, migrating local rows. */
+  const openWithRoot = async (p: Pending, root: Bytes, how: UnlockMethod): Promise<Result<Ready>> => {
+    const r = { value: root };
     let vault = p.vault;
     if (vault === undefined) {
       const f = await fetchVault(p.ctx);
@@ -416,16 +507,20 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!s.ok) return error("wrongPhrase", "This recovery phrase doesn't open this app's data");
     const db = await deps.openDatabase(s.value);
     if (p.local !== undefined) await switchDatabase(p.local.db, db, migrationModeFor(vault, p.local.db.sHash));
-    return becomeReady(p.ctx, vault, s.value, r.value, "recovery", db);
+    return becomeReady(p.ctx, vault, s.value, r.value, how, db);
   };
 
   const unlock: Evolustr["unlock"] = async (input) => {
     if (session.kind !== "pending") return error("nothingToUnlock", "connect() didn't ask for a user action");
     const p = session;
-    if (p.action === "recoveryPhrase") {
-      if (input?.recoveryPhrase === undefined) return error("phraseRequired", "Pass the recovery phrase");
-      return openWithPhrase(p, input.recoveryPhrase);
+    if (input?.recoveryPhrase !== undefined && p.action !== "setupStrong") return openWithPhrase(p, input.recoveryPhrase);
+    if (p.action === "recoveryPhrase") return error("phraseRequired", "Pass the recovery phrase");
+    if (p.action === "passkey") {
+      if (p.vault === undefined) return error("noVault", "No vault to unlock");
+      const root = await rootFromPasskey(p.ctx, p.vault);
+      return root.ok ? openWithRoot(p, root.value, "passkey") : root;
     }
+    if (p.action === "setupStrong") return setupStrong(p.ctx, input?.acceptDeviceLoss === true);
     return error("unsupported", `Unlocking with "${p.action}" isn't available in this build`);
   };
 
@@ -469,10 +564,10 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   const requireReady = (): Result<Unlocked> =>
     session.kind === "ready" ? ok(session) : error("notReady", "Connect first");
 
-  const unlockRoot: Evolustr["unlockRoot"] = async ({ recoveryPhrase }) => {
+  const unlockRoot: Evolustr["unlockRoot"] = async (input) => {
     const s = requireReady();
     if (!s.ok) return s;
-    const r = phraseToRootKey(recoveryPhrase);
+    const r = input?.recoveryPhrase === undefined ? await rootFromPasskey(s.value.ctx, s.value.vault) : phraseToRootKey(input.recoveryPhrase);
     if (!r.ok) return r;
     const check = openRootData(s.value.ctx, s.value.vault, r.value);
     if (!check.ok) return error("wrongPhrase", "This recovery phrase doesn't belong to this app's data");
@@ -506,6 +601,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       return error("wrongPhrase", "The words don't match the recovery phrase");
     }
     await s.value.db.setMeta(META_PHRASE_CONFIRMED, "1");
+    backupState = { ...backupState, phraseConfirmed: true };
     return ok(undefined);
   };
 
@@ -535,6 +631,137 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!published.ok) return published;
     const ready = await becomeReady(s.value.ctx, published.value, s.value.s, s.value.r, s.value.unlockedWith, s.value.db);
     return ready.ok ? ok(ready.value.status) : ready;
+  };
+
+  const createPasskey = async (ctx: VaultContext, vault: Vault | undefined): Promise<Result<CreatedPasskey>> => {
+    if (passkeys === undefined) return error("noPasskeys", "Passkeys aren't enabled");
+    try {
+      const created = await passkeys.create({
+        userId: sha256(utf8(ctx.pubkey)),
+        userName: ctx.pubkey.slice(0, 16),
+        excludeCredIds: vault === undefined ? [] : passkeyWrapsFor(vault, passkeys.rpId).map((w) => w.credId),
+        prfInput: clientPrfInput(ctx.pubkey, ctx.appId),
+      });
+      return created.prfEnabled ? ok(created) : error("prfUnsupported", "This authenticator can't be used: no PRF support");
+    } catch (e) {
+      return error("passkeyFailed", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const rememberMethod = async (db: AppDatabase, known: KnownMethod) => {
+    const methods = [...backupState.methods.filter((m) => m.id !== known.id), known];
+    await db.setMeta(META_STRONG_METHODS, JSON.stringify(methods));
+    backupState = { ...backupState, methods };
+  };
+
+  /** Adds a passkey wrap of R once the PRF output is known. */
+  const completeEnrollment = async (s: Unlocked, created: CreatedPasskey, prfOutput: Bytes): Promise<Result<Status>> => {
+    if (passkeys === undefined) return error("noPasskeys", "Passkeys aren't enabled");
+    let vault = s.vault;
+    let r = s.r;
+    if (r === undefined) {
+      if (hasRootKey(vault)) return error("rootLocked", "Unlock the root key on this device first (unlockRoot)");
+      r = random(ROOT_KEY_LENGTH);
+      const withRoot = addRootKey(s.ctx, vault, r, s.s);
+      if (!withRoot.ok) return withRoot;
+      vault = withRoot.value;
+    }
+    const wrap = passkeyRootWrap(s.ctx, passkeyWrapKey(prfOutput, s.ctx.appId), passkeys.rpId, created.credId, r);
+    const added = addRootWrap(vault, wrap);
+    if (!added.ok) return added;
+    const published = await publishVault(s.ctx, added.value);
+    if (!published.ok) return published;
+    await rememberMethod(s.db, { id: `passkey:${created.credId}`, method: { kind: "passkey", synced: created.synced } });
+    const ready = await becomeReady(s.ctx, published.value, s.s, r, s.unlockedWith, s.db);
+    return ready.ok ? ok(ready.value.status) : ready;
+  };
+
+  const enrollPasskey: Evolustr["enrollPasskey"] = async () => {
+    const s = requireReady();
+    if (!s.ok) return s;
+    if (s.value.r === undefined && hasRootKey(s.value.vault)) {
+      return error("rootLocked", "Unlock the root key on this device first (unlockRoot)");
+    }
+    const created = await createPasskey(s.value.ctx, s.value.vault);
+    if (!created.ok) return created;
+    if (created.value.prfOutput === null) {
+      pendingPasskey = created.value;
+      return ok({ done: false });
+    }
+    const done = await completeEnrollment(s.value, created.value, created.value.prfOutput);
+    return done.ok ? ok({ done: true }) : done;
+  };
+
+  const finishPasskeySetup: Evolustr["finishPasskeySetup"] = async () => {
+    const s = requireReady();
+    if (!s.ok) return s;
+    const created = pendingPasskey;
+    if (created === null || passkeys === undefined) return error("nothingToFinish", "No passkey setup is waiting");
+    let result;
+    try {
+      result = await passkeys.get({ allowCredIds: [created.credId], prfInput: clientPrfInput(s.value.ctx.pubkey, s.value.ctx.appId) });
+    } catch (e) {
+      return error("passkeyFailed", e instanceof Error ? e.message : String(e));
+    }
+    if (result.prfOutput === null) return error("prfUnsupported", "The passkey gave no PRF output");
+    pendingPasskey = null;
+    return completeEnrollment(s.value, created, result.prfOutput);
+  };
+
+  const makeStrict: Evolustr["makeStrict"] = async (opts) => {
+    const s = requireReady();
+    if (!s.ok) return s;
+    if (s.value.r === undefined) return error("rootLocked", "Unlock the root key on this device first");
+    const need = backupRequirement(backupState.methods.map((m) => m.method), backupState.phraseConfirmed);
+    if (need === "required" && opts?.acceptDeviceLoss !== true) {
+      return error("backupRequired", "Save the recovery phrase or add a second passkey first, or accept losing the data with this device");
+    }
+    const newS = random(DATA_SECRET_LENGTH);
+    const next = makeStrictVault(s.value.ctx, s.value.vault, { r: s.value.r, newS, now: now() });
+    if (!next.ok) return next;
+    const db = await deps.openDatabase(newS);
+    await migrateRows(s.value.db, db, { kind: "all" });
+    for (const key of [META_APP_SETTINGS, META_SHARED_SETTINGS, META_STRONG_METHODS, META_PHRASE_CONFIRMED]) {
+      const v = await s.value.db.getMeta(key);
+      if (v !== null) await db.setMeta(key, v);
+    }
+    const published = await publishVault(s.value.ctx, next.value);
+    if (!published.ok) {
+      await db.deleteLocal();
+      return published;
+    }
+    await s.value.db.deleteLocal();
+    const ready = await becomeReady(s.value.ctx, published.value, newS, s.value.r, s.value.unlockedWith, db);
+    return ready.ok ? ok(ready.value.status) : ready;
+  };
+
+  /** First vault created strict for `requireStrong` (SPEC §8.2 step 4). */
+  const setupStrong = async (ctx: VaultContext, acceptDeviceLoss: boolean): Promise<Result<Ready>> => {
+    const created = await createPasskey(ctx, undefined);
+    if (!created.ok) return created;
+    let prfOutput = created.value.prfOutput;
+    if (prfOutput === null && passkeys !== undefined) {
+      try {
+        prfOutput = (await passkeys.get({ allowCredIds: [created.value.credId], prfInput: clientPrfInput(ctx.pubkey, ctx.appId) })).prfOutput;
+      } catch (e) {
+        return error("passkeyFailed", e instanceof Error ? e.message : String(e));
+      }
+    }
+    if (prfOutput === null || passkeys === undefined) return error("prfUnsupported", "The passkey gave no PRF output");
+    const method: StrongMethod = { kind: "passkey", synced: created.value.synced };
+    if (backupRequirement([method], false) === "required" && !acceptDeviceLoss) {
+      return error("backupRequired", "This passkey isn't synced: accept losing the data with this device, or use a synced passkey");
+    }
+    const r = random(ROOT_KEY_LENGTH);
+    const s = random(DATA_SECRET_LENGTH);
+    const wrap = passkeyRootWrap(ctx, passkeyWrapKey(prfOutput, ctx.appId), passkeys.rpId, created.value.credId, r);
+    const vault = createStrictVault(ctx, { s, r, now: now(), rootWraps: [wrap] });
+    if (!vault.ok) return vault;
+    const published = await publishVault(ctx, vault.value);
+    if (!published.ok) return published;
+    const db = await deps.openDatabase(s);
+    await db.setMeta(META_STRONG_METHODS, JSON.stringify([{ id: `passkey:${created.value.credId}`, method }]));
+    return becomeReady(ctx, published.value, s, r, "passkey", db);
   };
 
   const status: Evolustr["status"] = () => (session.kind === "ready" ? statusOf(session) : null);
@@ -593,6 +820,9 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     unlock,
     resolveVaultChange,
     unlockRoot,
+    enrollPasskey,
+    finishPasskeySetup,
+    makeStrict,
     showRecoveryPhrase,
     confirmRecoveryPhrase,
     restoreFromPhrase,
