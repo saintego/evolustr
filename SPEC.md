@@ -1,6 +1,6 @@
 # Evolustr Specification
 
-**Status:** Draft v0.8
+**Status:** Draft v0.9
 **Scope:** Nostr identity → one Evolu (local-first, E2E-encrypted SQLite) database per app, synced across devices, with **no backend and no storage other than Nostr relays and Evolu**.
 
 ---
@@ -83,6 +83,8 @@ Why two levels: the strong methods protect `R`, and `R` protects `S`. When `S` i
 
 `R` is created with the vault's **first strong method**: the first passkey, signer wrap or confirmed recovery phrase. A `compatible` vault used only through NIP-44 may have no `R` yet.
 
+**`R` is never reachable through NIP-44, even in `compatible` mode.** If it were, anyone who read the `nip44` wrap while the vault was weak would still know `R` after `makeStrict()`. The cost: a device that opened a `compatible` vault through `nip44` has `S` but not `R`. Once `R` exists, that device can read and write the data, but it **can't add a strong method** (passkey or signer wrap) until the user unlocks `R` there once, with a synced passkey, a capable signer that already has a wrap, or the recovery phrase. The client says so plainly instead of failing (`status.canAddStrongMethod`).
+
 `signer`, `passkey` and `root` wraps use **AES-256-GCM** with a random 12-byte IV and
 `AAD = "evolustr/v1|" + pubkey + "|" + appId + "|" + wrapType + "|" + (signerId | credId | sHash)`.
 Binding each wrap to its own key identifier (and the `root` wrap to the `sHash` of the `S` it holds) means concurrent additions never collide and a wrap can't be moved to another vault or swapped for an older one.
@@ -132,13 +134,14 @@ Evolu stores CRDT messages tied to the owner, so a database can't be copied as a
 1. Unlock `R` (any strong method or the recovery phrase).
 2. Create `S'`. If the database has no rows in any app table, skip to step 4.
 3. For every table in the app's schema (not Evolu's internal tables), read the rows from `S` and insert them into `S'` **through Evolu's mutation API**, so `S'` gets valid timestamps of its own.
-4. Publish the vault with `mode: "strict"`, a new `root` wrap for `S'`, no `nip44` wrap, `sHash` of `S'`, `created` = now, and **`previousSHash` = `sHash` of `S`**.
+4. Publish the vault with `mode: "strict"`, a new `root` wrap for `S'`, no `nip44` wrap, `sHash` of `S'`, `created` = now, and the old `{ sHash, created }` appended to **`history`** (the last 10 data secrets, oldest first).
 
-**On other devices** (online or back from offline), when the fetched vault's `previousSHash` equals the `sHash` of the local database:
+**On other devices** (online or back from offline), when the fetched vault's `sHash` differs from the local database's and its `root` wrap opens with `R` (§6.3):
 
-1. This is a rotation. Unlock `R`, then `S'` from the `root` wrap. If the device can't (no strong method here), it has no access (§3.2 rule 8); its local `S` database stays as it is until the user unlocks.
-2. Copy into `S'` only the local rows that are **missing** in `S'` or were **changed after the vault's `created` time** (Evolu's per-row update timestamp). Copying every row would overwrite edits made in `S'` after the rotation with older local values.
-3. Switch to `S'` and delete the local `S` database.
+1. Unlock `R`, then the current secret from the `root` wrap. If the device can't (it only used `nip44`, or has no strong method here), it has no access yet (§3.2 rule 8). Its local database stays untouched until the user unlocks `R` on this device; the migration then runs.
+2. Find the local `sHash` in the vault's `history`. The **cut-off** is the `created` time of the secret that replaced it: the next entry in `history`, or the vault's own `created` if the local one is the last entry. This also works after several rotations while the device was offline.
+3. Copy into the current database only the local rows that are **missing** there or were **changed after the cut-off** (Evolu's per-row update timestamp). Copying every row would overwrite newer edits with older local values. If the local `sHash` isn't in `history` (more than 10 rotations ago, or a restore), ask the user before copying anything.
+4. Switch to the current database and delete the local old one.
 
 The relay vault carries all the information, so no device waits for Evolu sync to learn about a rotation.
 
@@ -157,7 +160,7 @@ This is how a user can make an app database strong with **any** signer, includin
 
 ### 4.2 Enroll
 
-1. Unlock `R` by any strong method or the recovery phrase. If the vault has no `R` yet, create it now (§3.1). A device that only has the `nip44` wrap can't add a passkey to a vault that already has `R`: it must unlock `R` first, for example with the recovery phrase.
+1. Unlock `R` by any strong method or the recovery phrase. If the vault has no `R` yet, create it now (§3.1). A device that unlocked only through `nip44` can't add a passkey to a vault that already has `R` until the user unlocks `R` there once (§3.1).
 2. From a click, call `navigator.credentials.create()` with:
    - `rp.id` = the page's host. For an nsite, the exact gateway subdomain.
    - `user.id` = `SHA-256(pubkey)`, `user.name` = the npub.
@@ -247,12 +250,16 @@ interface EvolustrSignerApi {
     ready: boolean;                // M is unlocked
     signerPasskey: boolean;        // M can be unlocked by a signer passkey
   }>;
-  /** Wrap key for the caller's app vault. The signer computes appId itself. */
+  /** Wrap key for the caller's app vault. The signer computes appId itself.
+   *  If M is locked (ready === false), the signer first shows its own Unlock UI
+   *  and resolves after the user clicks there; it may take a while. */
   getWrapKey(): Promise<Uint8Array>;            // 32 bytes
-  /** Register a signer passkey. Must be called from a user gesture. */
+  /** Register a signer passkey. The signer always shows its own UI for the click. */
   enrollPasskey(): Promise<void>;
 }
 ```
+
+A click in the app's page does **not** count as a click inside a cross-origin signer: browsers don't pass user activation through `postMessage`, so the signer can't start a passkey ceremony or a popup on the app's behalf. Whenever a method needs a passkey or a popup, the signer asks for its own click through its `requestGesture` UI (§5.6) and only then resolves. Apps must not apply short timeouts to these calls.
 
 ### 5.5 Behaviour required of a capable signer
 
@@ -342,7 +349,9 @@ The pubkey is part of the hash, so two users of the same app have **different** 
   "mode": "strict",               // "strict" | "compatible": the source of truth (§3.2)
   "created": 1730000000,          // when the current S was created
   "sHash": "<hex SHA-256(S), first 8 bytes>",
-  "previousSHash": "<hex 8B>",    // only after a rotation (§3.4)
+  "history": [                    // earlier data secrets, oldest first, last 10 (§3.4)
+    { "sHash": "<hex 8B>", "created": 1720000000 }
+  ],
   "rootWraps": [                  // wraps of R
     { "type": "signer", "signerId": "<hex 8B>", "iv": "…", "ct": "…" },
     { "type": "signer", "signerId": "<another signer>", "iv": "…", "ct": "…" },
@@ -374,10 +383,9 @@ Any app the user lets sign can publish a replacement vault event. Capable signer
 |---|---|
 | No local database for this `(pubkey, appId)` | First use on this device: unlock normally. If the vault is `compatible`, show its weak level before first use. |
 | Same `sHash` as the local database | Normal. |
-| Different `sHash`, `previousSHash` equals the local `sHash`, and its `root` wrap opens with `R` | A rotation (§3.4). Migrate and switch. |
-| Different `sHash`, and its `root` wrap opens with the `R` this device has | A legitimate change made by the user (rotation, restore or a resolved create race). Follow it, and copy local rows as in §3.4. |
+| Different `sHash`, and its `root` wrap opens with the `R` this device has | A legitimate change made by the user: a rotation (local `sHash` in `history`), a restore or a resolved create race. Follow it and migrate local rows as in §3.4. |
 | Different `sHash`, the device has `R`, but the vault has no `root` wrap that opens with it | **Replaced.** Nobody without `R` can make a valid `root` wrap. Offer to republish the copy from Evolu (§6.2 rule 5). |
-| Different `sHash`, the device has no `R` (it only used `nip44`), fetched vault is `strict` | Can't verify and can't unlock (§3.2 rule 8). Ask for a strong method or the recovery phrase. **Never** republish the local copy: it could undo a legitimate `makeStrict()`. |
+| Different `sHash`, the device has no `R` (it only used `nip44`), fetched vault is `strict` | Can't verify and can't unlock (§3.2 rule 8). Ask for a strong method or the recovery phrase. **Never** republish the local copy: it could undo a legitimate `makeStrict()`. Keep the local database; once the user unlocks `R` here, migrate its rows into the current one (§3.4) before deleting it. |
 | Different `sHash`, the device has no `R`, fetched vault is `compatible` | Can't tell a user change from an attack. Keep the local database, show both options to the user, and republish only on the user's choice. An attacker who can do this can already read the `nip44` wrap, so this is about availability, not secrecy. |
 | Vault missing or unreadable | Offer to republish the copy from Evolu, if this device has one. |
 
@@ -444,15 +452,18 @@ interface Evolustr<S> {
     | { state: "ready"; pubkey: string; db: EvoluInstance<S>; status: Status }
     | { state: "needsUserAction";
         action: "passkey" | "signerUnlock" | "recoveryPhrase" | "setupStrong" }
-    | { state: "vaultChanged"; options: ("republishCopy" | "restorePhrase" | "followRelay" | "startNew")[] }
+    | { state: "vaultChanged"; options: VaultChoice[] }
   >;
-  /** Call from a click. Completes whatever connect() asked for. */
-  unlock(): Promise<{ pubkey: string; db: EvoluInstance<S>; status: Status }>;
+  /** Call from a click. Completes whatever connect() asked for.
+   *  For action "recoveryPhrase", pass the words. */
+  unlock(input?: { recoveryPhrase?: string }): Promise<Ready<S>>;
+  /** Completes a "vaultChanged" state with one of the offered options. */
+  resolveVaultChange(choice: VaultChoice, input?: { recoveryPhrase?: string }): Promise<Ready<S>>;
   enrollPasskey(): Promise<void>;     // from a click; doesn't change the level
   makeStrict(): Promise<void>;        // user's choice; checks the safety net, replaces S (§3.4)
   downgrade(): Promise<void>;         // user's choice (§3.2 rule 7)
   showRecoveryPhrase(): Promise<string>; // R as 12 words; creates R if the vault has none
-  restoreFromPhrase(words: string): Promise<void>;
+  restoreFromPhrase(words: string): Promise<Ready<S>>; // same as unlock({ recoveryPhrase })
   settings: {
     get<K extends keyof SharedSettings>(key: K): SharedSettings[K]; // app ?? shared ?? default
     setShared<K extends keyof SharedSettings>(key: K, value: SharedSettings[K]): Promise<void>;
@@ -460,11 +471,15 @@ interface Evolustr<S> {
   logout(opts?: { deleteLocalData?: boolean }): Promise<void>; // removes cached S and R (§6.2 rule 6)
 }
 
+type Ready<S> = { pubkey: string; db: EvoluInstance<S>; status: Status };
+type VaultChoice = "republishCopy" | "followRelay" | "restorePhrase" | "startNew";
+
 interface Status {
   signer: "capable-verified" | "capable-connection" | "standard";
   mode: "strict" | "compatible";      // from the vault
   level: "strong" | "connection" | "weak";
-  canMakeStrict: boolean;             // the user has a strong method, so strict is possible
+  canMakeStrict: boolean;             // R is unlocked here, so strict is possible
+  canAddStrongMethod: boolean;        // false after a nip44-only unlock of a vault that has R (§3.1)
   unlockedWith: "signer" | "passkey" | "nip44" | "recovery";
   passkeySupported: boolean;          // PRF available on this device
 }
@@ -478,7 +493,7 @@ interface Status {
 4. If no vault exists:
    - without `requireStrong`: create it `compatible`, with any strong wraps this device can also make;
    - with `requireStrong`: return `needsUserAction: "setupStrong"`. `unlock()` then creates `R`, adds a strong method (passkey or signer), confirms the safety net, and publishes the **first** vault already `strict`.
-5. After unlocking, add any missing strong wrap this device can make (the level stays as it is).
+5. After unlocking, add any missing strong wrap this device can make (the level stays as it is). This needs `R`: it runs after an unlock through a strong method or the phrase, or when this device creates `R`. After a `nip44`-only unlock of a vault that already has `R`, nothing is added and `status.canAddStrongMethod` is false (§3.1).
 6. If `requireStrong` is set and an existing vault is `compatible`, the app tells the user it needs a strict database and offers `makeStrict()`. A user who declines can't use that app.
 
 ### 8.3 Packages
@@ -555,7 +570,9 @@ interface SharedSettings {
 | Wrap ids (`w1`, `w2`) in the AAD (v0.3–v0.5) | Concurrent additions collided. Wraps are identified by `signerId` / `credId`. |
 | Strong methods wrapping `S` directly (v0.2–v0.7) | Replacing `S` meant re-creating every wrap, which needs every passkey and every signer present at once. Strong methods now wrap `R` (§3.1). |
 | Recovery phrase = Evolu mnemonic of `S` (v0.3–v0.7) | Changed with every rotation. The phrase is now `R`, which never changes. |
-| `rotatedTo` marker synced through Evolu (v0.6–v0.7) | Devices had to wait for Evolu sync to learn about a rotation. Replaced by `previousSHash` in the vault (§3.4). |
+| `rotatedTo` marker synced through Evolu (v0.6–v0.7) | Devices had to wait for Evolu sync to learn about a rotation. Replaced by the vault's `history` (§3.4). |
+| A single `previousSHash` (v0.8) | After two rotations while a device was offline, the migration cut-off was wrong and could drop edits. Replaced by `history` (§3.4). |
+| `R` reachable through `nip44` in `compatible` mode (considered for v0.9) | Would let any app that read the weak vault keep `R` after `makeStrict()`. Instead, nip44-only devices unlock `R` once before adding strong methods (§3.1). |
 | Signer vault `d`-tag based on `signerId` (v0.6–v0.7) | `signerId` comes from `M`, so a new device couldn't find the vault that holds `M`. Now based on `signerKey` (§5.3). |
 | A random PRF salt per passkey wrap (v0.3–v0.7) | Several salts need `evalByCredential`, which fewer browsers support. One `prfInput` per vault (§4.1). |
 | One local Evolu database name per app (v0.2–v0.7) | Two Nostr accounts on one browser mixed their data and vault copies. Now one per `(pubkey, appId)` (§2). |
@@ -570,7 +587,8 @@ interface SharedSettings {
 4. **Compatible vault replaced, new device:** the new device may write into an attacker's empty database until another device restores the real vault. Define how those rows are moved back.
 5. **Known nsite gateways:** who maintains the list, and how it is distributed (config or a Nostr list event).
 6. **NIP-46 method names:** agree on them with bunker developers, ideally as a NIP.
-7. **Rotating `M`:** a signer that replaces `M` gets a new `signerId`. Define how it re-adds its wraps to every app vault it knows, or whether old wraps are left to the recovery phrase.
+7. **Adding a device without the phrase:** a way for a device that has `R` to hand it to a new device the user is holding (for example a QR code shown on one and scanned by the other), so users in `compatible` mode don't need the recovery phrase to add a strong method on a second device.
+8. **Rotating `M`:** a signer that replaces `M` gets a new `signerId`. Define how it re-adds its wraps to every app vault it knows, or whether old wraps are left to the recovery phrase.
 
 ---
 
