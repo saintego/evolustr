@@ -13,5 +13,8 @@
     "@evolustr/core": "0.0.0",
     "nostr-tools": "2.25.5",
     "@evolu/common": "8.26.0"
+  },
+  "devDependencies": {
+    "@evolustr/signer": "0.0.0"
   }
 }

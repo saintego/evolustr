@@ -33,6 +33,8 @@ import {
   passkeyRootWrap,
   passkeyWrapKey,
   passkeyWrapsFor,
+  signerRootWrap,
+  signerWrapFor,
   sha256,
   utf8,
   appVaultDTag,
@@ -65,6 +67,7 @@ import {
   vaultEvent,
 } from "@evolustr/core";
 import type { SecretCache } from "./cache.ts";
+import type { CapableSigner, SignerCapabilities } from "./capable.ts";
 import type { CreatedPasskey, Passkeys } from "@evolustr/core";
 import { fetchSharedSettings, publishSharedSettings } from "./settings.ts";
 import {
@@ -85,6 +88,8 @@ export interface ClientDeps {
   readonly cache: SecretCache;
   /** Client passkeys on this app's domain (SPEC §4); omit to disable. */
   readonly passkeys?: Passkeys;
+  /** An Evolustr-capable signer (SPEC §5), e.g. from `detectCapableSigner(window.nostr)`. */
+  readonly capableSigner?: CapableSigner;
   /** Unix seconds. */
   readonly now?: () => number;
   readonly randomBytes?: (length: number) => Bytes;
@@ -232,6 +237,56 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   };
   let pendingPasskey: CreatedPasskey | null = null;
   const passkeys = deps.passkeys;
+  const capable = deps.capableSigner;
+  let caps: SignerCapabilities | null = null;
+
+  const refreshCaps = async (): Promise<SignerCapabilities | null> => {
+    caps = capable === undefined ? null : await capable.capabilities().catch(() => null);
+    return caps;
+  };
+
+  /** R through the capable signer's wrap (SPEC §8.2 step 2). May wait for a click in the signer. */
+  const rootFromSigner = async (ctx: VaultContext, vault: Vault): Promise<Result<Bytes>> => {
+    if (capable === undefined) return error("noCapableSigner", "No Evolustr-capable signer");
+    let key: Bytes;
+    try {
+      key = await capable.getWrapKey();
+    } catch (e) {
+      return error("signerRefused", e instanceof Error ? e.message : String(e));
+    }
+    const c = await refreshCaps();
+    const wrap = c?.signerId == null ? undefined : signerWrapFor(vault, c.signerId);
+    if (wrap === undefined) return error("noSignerWrap", "This signer has no wrap in the vault yet");
+    return openRootWrap(ctx, wrap, key);
+  };
+
+  /** After an unlock: add this signer's wrap, creating R if the vault has none (SPEC §8.2 step 5). */
+  const ensureSignerWrap = async (): Promise<void> => {
+    if (session.kind !== "ready" || capable === undefined) return;
+    const s = session;
+    const c = caps;
+    if (c === null || !c.ready || c.signerId === null || signerWrapFor(s.vault, c.signerId) !== undefined) return;
+    if (s.r === undefined && hasRootKey(s.vault)) return; // nip44-only device: can't add (SPEC §3.1)
+    let key: Bytes;
+    try {
+      key = await capable.getWrapKey();
+    } catch {
+      return;
+    }
+    let vault = s.vault;
+    const r = s.r ?? random(ROOT_KEY_LENGTH);
+    if (s.r === undefined) {
+      const withRoot = addRootKey(s.ctx, vault, r, s.s);
+      if (!withRoot.ok) return;
+      vault = withRoot.value;
+    }
+    const added = addRootWrap(vault, signerRootWrap(s.ctx, key, c.signerId, r));
+    if (!added.ok) return;
+    const published = await publishVault(s.ctx, added.value);
+    if (!published.ok) return;
+    await rememberMethod(s.db, { id: `signer:${c.signerId}`, method: { kind: "signer", recoverable: true } });
+    await becomeReady(s.ctx, published.value, s.s, r, s.unlockedWith, s.db);
+  };
 
   const readMethods = async (db: AppDatabase): Promise<ReadonlyArray<KnownMethod>> => {
     const text = await db.getMeta(META_STRONG_METHODS);
@@ -290,7 +345,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
 
   const statusOf = (s: Unlocked): Status => ({
     pubkey: s.ctx.pubkey,
-    signer: "standard",
+    signer: caps === null ? "standard" : caps.identity === "verified" ? "capable-verified" : "capable-connection",
     mode: s.vault.mode,
     level: level(s.vault),
     unlockedWith: s.unlockedWith,
@@ -378,6 +433,17 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     vault: Vault,
     local: Pending["local"],
   ): Promise<Result<ConnectResult>> => {
+    if (caps?.ready === true && caps.signerId !== null && signerWrapFor(vault, caps.signerId) !== undefined) {
+      const root = await rootFromSigner(ctx, vault);
+      if (root.ok) {
+        const s = openRootData(ctx, vault, root.value);
+        if (s.ok) {
+          const db = await deps.openDatabase(s.value);
+          if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
+          return withReady(becomeReady(ctx, vault, s.value, root.value, "signer", db));
+        }
+      }
+    }
     if (local?.r !== undefined) {
       const s = openRootData(ctx, vault, local.r);
       if (s.ok) {
@@ -400,8 +466,10 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
 
   /** A strong method is needed: a passkey (from a click) if one matches, else the phrase. */
   const askStrongUnlock = (ctx: VaultContext, vault: Vault, local: Pending["local"]): Result<ConnectResult> => {
-    const action: UserAction =
-      passkeys !== undefined && passkeySupported && passkeyWrapsFor(vault, passkeys.rpId).length > 0
+    const signerCanOpen = caps !== null && vault.rootWraps.some((w) => w.type === "signer");
+    const action: UserAction = signerCanOpen
+      ? "signerUnlock"
+      : passkeys !== undefined && passkeySupported && passkeyWrapsFor(vault, passkeys.rpId).length > 0
         ? "passkey"
         : "recoveryPhrase";
     session = { kind: "pending", ctx, action, vault, ...(local === undefined ? {} : { local }) };
@@ -427,6 +495,16 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   // ── API ──
 
   const connect: Evolustr["connect"] = async () => {
+    const result = await connectInner();
+    if (result.ok && result.value.state === "ready" && capable !== undefined) {
+      await ensureSignerWrap();
+      const st = status();
+      if (st !== null) return ok({ ...result.value, status: st });
+    }
+    return result;
+  };
+
+  const connectInner = async (): Promise<Result<ConnectResult>> => {
     let pubkey: string;
     try {
       pubkey = await deps.signer.getPublicKey();
@@ -435,6 +513,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     }
     const ctx: VaultContext = { pubkey, appId: options.appId };
     passkeySupported = passkeys === undefined ? false : await passkeys.supported().catch(() => false);
+    await refreshCaps();
     const cached = await deps.cache.get(pubkey, options.appId);
     const fetched = await fetchVault(ctx);
 
@@ -511,6 +590,16 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   };
 
   const unlock: Evolustr["unlock"] = async (input) => {
+    const result = await unlockInner(input);
+    if (result.ok && capable !== undefined) {
+      await ensureSignerWrap();
+      const st = status();
+      if (st !== null) return ok({ ...result.value, status: st });
+    }
+    return result;
+  };
+
+  const unlockInner = async (input: UnlockInput | undefined): Promise<Result<Ready>> => {
     if (session.kind !== "pending") return error("nothingToUnlock", "connect() didn't ask for a user action");
     const p = session;
     if (input?.recoveryPhrase !== undefined && p.action !== "setupStrong") return openWithPhrase(p, input.recoveryPhrase);
@@ -519,6 +608,11 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       if (p.vault === undefined) return error("noVault", "No vault to unlock");
       const root = await rootFromPasskey(p.ctx, p.vault);
       return root.ok ? openWithRoot(p, root.value, "passkey") : root;
+    }
+    if (p.action === "signerUnlock") {
+      if (p.vault === undefined) return error("noVault", "No vault to unlock");
+      const root = await rootFromSigner(p.ctx, p.vault);
+      return root.ok ? openWithRoot(p, root.value, "signer") : root;
     }
     if (p.action === "setupStrong") return setupStrong(p.ctx, input?.acceptDeviceLoss === true);
     return error("unsupported", `Unlocking with "${p.action}" isn't available in this build`);
@@ -737,6 +831,26 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
 
   /** First vault created strict for `requireStrong` (SPEC §8.2 step 4). */
   const setupStrong = async (ctx: VaultContext, acceptDeviceLoss: boolean): Promise<Result<Ready>> => {
+    if (capable !== undefined) {
+      let key: Bytes;
+      try {
+        key = await capable.getWrapKey();
+      } catch (e) {
+        return error("signerRefused", e instanceof Error ? e.message : String(e));
+      }
+      const c = await refreshCaps();
+      if (c?.signerId != null) {
+        const r = random(ROOT_KEY_LENGTH);
+        const s = random(DATA_SECRET_LENGTH);
+        const vault = createStrictVault(ctx, { s, r, now: now(), rootWraps: [signerRootWrap(ctx, key, c.signerId, r)] });
+        if (!vault.ok) return vault;
+        const published = await publishVault(ctx, vault.value);
+        if (!published.ok) return published;
+        const db = await deps.openDatabase(s);
+        await db.setMeta(META_STRONG_METHODS, JSON.stringify([{ id: `signer:${c.signerId}`, method: { kind: "signer", recoverable: true } }]));
+        return becomeReady(ctx, published.value, s, r, "signer", db);
+      }
+    }
     const created = await createPasskey(ctx, undefined);
     if (!created.ok) return created;
     let prfOutput = created.value.prfOutput;
