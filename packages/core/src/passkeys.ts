@@ -4,7 +4,7 @@
  */
 import { hmac } from "@noble/hashes/hmac.js";
 import { sha256 } from "@noble/hashes/sha2.js";
-import { type Bytes, fromBase64Url, randomBytes, toBase64Url } from "@evolustr/core";
+import { type Bytes, fromBase64Url, randomBytes, toBase64Url } from "./bytes.ts";
 
 export interface PasskeyResult {
   readonly credId: string;

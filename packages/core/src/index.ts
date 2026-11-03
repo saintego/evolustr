@@ -10,3 +10,4 @@ export * from "./vault.ts";
 export * from "./check.ts";
 export * from "./nostr/index.ts";
 export * from "./settings.ts";
+export * from "./passkeys.ts";

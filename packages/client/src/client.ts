@@ -65,7 +65,7 @@ import {
   vaultEvent,
 } from "@evolustr/core";
 import type { SecretCache } from "./cache.ts";
-import type { CreatedPasskey, Passkeys } from "./passkeys.ts";
+import type { CreatedPasskey, Passkeys } from "@evolustr/core";
 import { fetchSharedSettings, publishSharedSettings } from "./settings.ts";
 import {
   type AppDatabase,

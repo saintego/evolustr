@@ -1,7 +1,8 @@
 import { type Bytes, memoryRelays, secretKeySigner, unwrap } from "@evolustr/core";
 import { generateSecretKey } from "nostr-tools/pure";
 import { describe, expect, it } from "vitest";
-import { type ClientOptions, createEvolustr, memoryCache, memoryDatabases, memoryPasskeys } from "../src/index.ts";
+import { memoryPasskeys } from "@evolustr/core";
+import { type ClientOptions, createEvolustr, memoryCache, memoryDatabases } from "../src/index.ts";
 
 const URLS = ["wss://r1"];
 const APP = "https://notes.example";
