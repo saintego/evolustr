@@ -11,6 +11,8 @@ afterAll(async () => {
   await relay.close();
 });
 
+// Unreachable relays are covered with memoryRelays: in Node, nostr-tools closes a
+// still-connecting WebSocket on error, which Node reports as an uncaught error.
 describe("poolRelays against a real WebSocket relay", () => {
   it("counts a relay that sent EOSE as answered (regression: closing used to mark it failed)", async () => {
     const relays = poolRelays(pool);
@@ -25,10 +27,5 @@ describe("poolRelays against a real WebSocket relay", () => {
     await publishReplaceable(relays, ["ws://localhost:7790"], secretKeySigner(sk), event, 3000);
     const f = await fetchReplaceable(relays, ["ws://localhost:7790"], { author: getPublicKey(sk), kind: VAULT_KIND, d: "evolustr:test" }, 3000);
     expect(f.kind === "found" && f.event.content).toBe("hello");
-  });
-
-  it("reports an unreachable relay as failed", async () => {
-    const r = await poolRelays(pool).query(["ws://localhost:7799"], { kinds: [1] }, 1000);
-    expect(r.failed).toEqual(["ws://localhost:7799"]);
   });
 });
