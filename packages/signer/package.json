@@ -1,0 +1,16 @@
+{
+  "name": "@evolustr/signer",
+  "version": "0.0.0",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "dependencies": {
+    "@evolustr/core": "0.0.0",
+    "nostr-tools": "2.25.5"
+  }
+}
