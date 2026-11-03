@@ -1,6 +1,6 @@
 # Evolustr Specification
 
-**Status:** Draft v0.10
+**Status:** Draft v0.11
 **Scope:** Nostr identity → one Evolu (local-first, E2E-encrypted SQLite) database per app, synced across devices, with **no backend and no storage other than Nostr relays and Evolu**.
 
 ---
@@ -106,7 +106,16 @@ Rules:
 
 1. **A new vault starts `compatible`**, unless the app sets `requireStrong`. Then the first vault is created `strict` directly (§8.2 step 4), so no throwaway weak vault is ever published.
 2. **Strong methods don't change the level.** A user may add a passkey or use a capable signer just for convenience (unlocking without a decrypt prompt). The vault stays `compatible`.
-3. **`strict` is the user's choice.** The client may *offer* it when the user has a strong method (`status.canMakeStrict`), but only `makeStrict()`, called after the user confirms, changes the mode. A user who refuses passkeys and capable signers simply stays `compatible`. Before a vault becomes `strict`, the user confirms the recovery phrase **or** has a second strong method, because losing the only one would lose the data.
+3. **`strict` is the user's choice.** The client may *offer* it when the user has a strong method (`status.canMakeStrict`), but only `makeStrict()`, called after the user confirms, changes the mode. A user who refuses passkeys and capable signers simply stays `compatible`. How much backup is asked for first depends on whether the user's strong method can be recovered on its own (rule 3a).
+3a. **Backup check before `strict`, scaled to the risk:**
+
+    | The user's only strong method | Recoverable on its own? | Before `makeStrict()` |
+    |---|---|---|
+    | Synced passkey: the WebAuthn authenticator data has the **backup state** flag (BS) set, e.g. iCloud Keychain, Google Password Manager, a password manager | Yes, through the provider account | Nothing required. Show a skippable reminder: "Your data is protected by your passkey. Save your recovery phrase or add a second passkey in case you lose access to your passkey provider." |
+    | Capable signer whose `M` can be recovered from the nsec (`sk` wrap), or by a synced signer passkey | Yes, through the signer | Nothing required. Same skippable reminder. |
+    | Device-bound passkey (BS flag not set: a hardware key, a local-only platform authenticator) or a signer passkey that isn't synced | **No**: losing that one device loses the data | Confirm the recovery phrase, add a second strong method, **or** explicitly accept "I will lose this data if I lose this device". |
+
+    The BS flag is what the authenticator reports at that moment; a user can still lose the provider account or turn sync off later. So the reminder stays visible (`status.backupRecommended`) until the user has a second strong method or has confirmed the phrase. The recovery phrase can be shown at any time later (`showRecoveryPhrase()`).
 4. **Making a vault strict replaces `S`.** Dropping the `nip44` wrap doesn't make the old `S` secret again, because relays and other apps may have kept copies. The client creates a new `S'` (§3.4). `R` and all strong wraps stay as they are, so the recovery phrase doesn't change either.
 5. **Clients never add a `nip44` wrap to a `strict` vault**, whatever the app's code or configuration says.
 6. **A `strict` vault ignores `nip44`.** A client reading a `strict` vault never tries a `nip44` wrap, even if one appears on a relay.
@@ -432,7 +441,7 @@ Shared settings are always ⚠️ by design (§9). The level shown is the **high
 | `strict` | Standard signer + synced passkey | The passkey |
 | `strict` | Standard signer, no passkey | ❌ No access, by design (§3.2 rule 8): recovery phrase, a capable signer, or a downgrade from another device |
 | `compatible` | Any signer | The signer alone (that is why it's weak) |
-| `strict` | Everything lost, no phrase | ❌ Data is lost. The safety net (§3.2 rule 3) exists to prevent this. |
+| `strict` | Everything lost, no phrase | ❌ Data is lost. The backup check and reminder (§3.2 rule 3a) exist to prevent this. |
 
 ### 7.3 Who can read what
 
@@ -479,7 +488,7 @@ interface Evolustr<S> {
   unlockRoot(input?: { recoveryPhrase?: string }): Promise<Status>;
   enrollPasskey(): Promise<void>;     // from a click; doesn't change the level. Needs R:
                                       // call unlockRoot() first if canAddStrongMethod is false
-  makeStrict(): Promise<void>;        // user's choice; checks the safety net, replaces S (§3.4)
+  makeStrict(opts?: { acceptDeviceLoss?: boolean }): Promise<void>; // user's choice; backup check (§3.2 rule 3a), replaces S (§3.4)
   downgrade(): Promise<void>;         // user's choice (§3.2 rule 7)
   showRecoveryPhrase(): Promise<string>; // R as 12 words; creates R if the vault has none
   restoreFromPhrase(words: string): Promise<Ready<S>>; // same as unlock({ recoveryPhrase })
@@ -498,6 +507,7 @@ interface Status {
   mode: "strict" | "compatible";      // from the vault
   level: "strong" | "connection" | "weak";
   canMakeStrict: boolean;             // R is unlocked here, so strict is possible
+  backupRecommended: boolean;         // strict (or about to be) with one strong method and no confirmed phrase
   canAddStrongMethod: boolean;        // false after a nip44-only unlock of a vault that has R (§3.1)
   unlockedWith: "signer" | "passkey" | "nip44" | "recovery";
   passkeySupported: boolean;          // PRF available on this device
@@ -511,7 +521,7 @@ interface Status {
 3. If only a `passkey` wrap matches, or the signer needs unlocking, return `needsUserAction`. `unlock()` does the rest from a click. If nothing matches, ask for the recovery phrase.
 4. If no vault exists:
    - without `requireStrong`: create it `compatible`, with any strong wraps this device can also make;
-   - with `requireStrong`: return `needsUserAction: "setupStrong"`. `unlock()` then creates `R`, adds a strong method (passkey or signer), confirms the safety net, and publishes the **first** vault already `strict`.
+   - with `requireStrong`: return `needsUserAction: "setupStrong"`. `unlock()` then creates `R`, adds a strong method (passkey or signer), runs the backup check (§3.2 rule 3a), and publishes the **first** vault already `strict`.
 5. After unlocking, add any missing strong wrap this device can make (the level stays as it is). This needs `R`: it runs after an unlock through a strong method or the phrase, or when this device creates `R`. After a `nip44`-only unlock of a vault that already has `R`, nothing is added and `status.canAddStrongMethod` is false (§3.1). The app can then offer **"Use this device for passkeys"**, which calls `unlockRoot()` (passkey or signer) or `unlockRoot({ recoveryPhrase })`. The database stays open throughout; afterwards `canAddStrongMethod` is true and `enrollPasskey()` works.
 6. If `requireStrong` is set and an existing vault is `compatible`, the app tells the user it needs a strict database and offers `makeStrict()`. A user who declines can't use that app.
 
@@ -582,6 +592,7 @@ interface SharedSettings {
 | Passkey and `nip44` wraps in the same vault (v0.2) | The database is only as strong as its weakest way to `S` (§3.2). |
 | `d`-tag hashed without the pubkey (v0.2–v0.3) | Same tag for every user of an app, so one query listed all its users (§6.1). |
 | Personal vault inside Evolustr (v0.2–v0.3) | A signer feature unrelated to app databases. Moved to [SECRETS.md](SECRETS.md). |
+| Always requiring a second strong method or the phrase before `strict` (v0.6–v0.10) | Too much friction when the passkey is already synced by the user's provider. Now scaled to the risk (§3.2 rule 3a). |
 | Automatic upgrade to the strongest level (v0.6) | Took the choice from the user. Strict is opt-in (§3.2). |
 | App-chosen `mode` option (v0.4–v0.5) | Let an app's configuration downgrade a vault the user had made strict. The vault records its own mode; apps can only require strong. |
 | Signer-held vault pins (v0.4–v0.5) | Needed storage outside Nostr and Evolu, and tied to one signer. |
