@@ -21,6 +21,6 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
-      - run: npm publish --provenance -w @evolustr/core -w @evolustr/client -w @evolustr/signer -w @evolustr/react
+      - run: npm publish --provenance -w @evolustr/core -w @evolustr/client -w @evolustr/signer -w @evolustr/react -w @evolustr/rn
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

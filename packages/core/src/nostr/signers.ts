@@ -44,3 +44,20 @@ export const secretKeySigner = (secretKey: Uint8Array): Signer => {
       Promise.resolve(nip44.v2.decrypt(ciphertext, nip44.v2.utils.getConversationKey(secretKey, peer))),
   };
 };
+
+/** The parts of a NIP-46 client (e.g. nostr-tools `BunkerSigner`) that Evolustr uses. */
+export interface Nip46Client {
+  readonly getPublicKey: () => Promise<string>;
+  readonly signEvent: (event: { kind: number; created_at: number; tags: string[][]; content: string }) => Promise<NostrEvent>;
+  readonly nip44Encrypt: (pubkey: string, plaintext: string) => Promise<string>;
+  readonly nip44Decrypt: (pubkey: string, ciphertext: string) => Promise<string>;
+}
+
+/** A remote bunker (NIP-46) as a {@link Signer}; works on web and in React Native. */
+export const nip46Signer = (bunker: Nip46Client): Signer => ({
+  getPublicKey: () => bunker.getPublicKey(),
+  signEvent: (event) =>
+    bunker.signEvent({ kind: event.kind, created_at: event.created_at, content: event.content, tags: event.tags.map((t) => [...t]) }),
+  nip44Encrypt: (peer, plaintext) => bunker.nip44Encrypt(peer, plaintext),
+  nip44Decrypt: (peer, ciphertext) => bunker.nip44Decrypt(peer, ciphertext),
+});

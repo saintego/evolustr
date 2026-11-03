@@ -72,3 +72,41 @@ export const memoryCache = (): SecretCache => {
     removeItem: (k) => void map.delete(k),
   });
 };
+
+/** An async key-value store, e.g. `expo-secure-store` (getItemAsync / setItemAsync / deleteItemAsync). */
+export interface AsyncKeyValue {
+  readonly getItemAsync: (key: string) => Promise<string | null>;
+  readonly setItemAsync: (key: string, value: string) => Promise<void>;
+  readonly deleteItemAsync: (key: string) => Promise<void>;
+}
+
+/**
+ * A cache over an async store. Keys use only letters, digits, "." "-" "_",
+ * which secure stores such as `expo-secure-store` require.
+ */
+export const asyncKeyValueCache = (store: AsyncKeyValue): SecretCache => {
+  const key = (pubkey: string, appId: string) => `evolustr_secrets_${sha256Hex(`${pubkey}|${appId}`)}`;
+  return {
+    get: async (pubkey, appId) => {
+      try {
+        return decode(await store.getItemAsync(key(pubkey, appId)));
+      } catch {
+        return null;
+      }
+    },
+    set: async (pubkey, appId, secrets) => {
+      try {
+        await store.setItemAsync(key(pubkey, appId), encode(secrets));
+      } catch {
+        /* unavailable: unlock again next time */
+      }
+    },
+    remove: async (pubkey, appId) => {
+      try {
+        await store.deleteItemAsync(key(pubkey, appId));
+      } catch {
+        /* ignore */
+      }
+    },
+  };
+};

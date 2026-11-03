@@ -24,6 +24,7 @@ Making a database strict is a single action (`makeStrict()`); the data moves to 
 | [`@evolustr/client`](packages/client) | For apps: connect, unlock, passkeys, strict mode, recovery phrase, shared settings. |
 | [`@evolustr/react`](packages/react) | `<EvolustrProvider>`, `useEvolustr()`, `useSetting()`. |
 | [`@evolustr/signer`](packages/signer) | For signer developers: adds the Evolustr Signer API to a signer (per-app keys, one passkey for all apps). |
+| [`@evolustr/rn`](packages/rn) | React Native: native passkeys, NIP-55 (Amber) and NIP-46 signers, secure storage. |
 | [`@evolustr/core`](packages/core) | Shared crypto, vault format, Nostr I/O. |
 
 ## Quick start (app)
@@ -78,7 +79,39 @@ Every method returns a `Result` (`{ ok: true, value }` or `{ ok: false, error }`
 - **Migration resets `createdAt`:** when a database becomes strict, rows are copied to a new Evolu owner and get new `createdAt` / `updatedAt` values. Keep your own `created` column if you show creation dates.
 - **Evolu reloads the page** when a local database is deleted unless you pass `onDatabaseDeleted`.
 
+## Mobile (React Native)
+
+There is no iframe signer on mobile; the app talks to the user's signer directly:
+
+| Signer | Adapter | Level |
+|---|---|---|
+| Android signer app, NIP-55 (Amber) | `nip55Signer(bridge)`; `nip55CapableSigner(bridge)` if it supports the Evolustr API. Android tells the signer the calling package, so app separation is verified. | Compatible; strict with a capable signer. |
+| Remote bunker, NIP-46 | `nip46Signer(bunkerSigner)`; `nip46CapableSigner` if supported (connection-scoped). | Compatible; strict with a capable bunker. |
+| Any signer + native passkeys | `nativePasskeys(Passkey, { rpId, rpName })` over `react-native-passkey`; needs an associated domain. | Strict. |
+
+```ts
+import "react-native-get-random-values"; // first: crypto needs getRandomValues
+import * as SecureStore from "expo-secure-store";
+import { Passkey } from "react-native-passkey";
+import { nativeAppId, nativePasskeys, nip46Signer, secureStoreCache } from "@evolustr/rn";
+
+const evolustr = createEvolustr(
+  {
+    signer: nip46Signer(bunker),                        // or nip55Signer(bridge)
+    relays: poolRelays(),
+    openDatabase: databases.open,                       // evoluDatabases with Evolu's React Native package
+    cache: secureStoreCache(SecureStore),
+    passkeys: nativePasskeys(Passkey, { rpId: "notes.example", rpName: "Notes" }),
+  },
+  { appId: nativeAppId("android", "com.example.notes"), relayUrls },
+);
+```
+
+`nip55Signer` needs a small bridge over your native module (NIP-55 has no standard React Native package); see `Nip55Bridge`. The adapters are tested with simulated native modules; testing on real phones is tracked in the issues.
+
 ## Demo
+
+Live: https://saintego.github.io/evolustr/ (deployed from `main` by the Pages workflow).
 
 ```sh
 npm install

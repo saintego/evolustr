@@ -86,3 +86,19 @@ export const exposeOnWindowNostr = (nostr: Record<string, unknown>, signer: Capa
     ...(signer.enrollPasskey === undefined ? {} : { enrollPasskey: () => signer.enrollPasskey!() }),
   };
 };
+
+/** A NIP-46 client that can send custom requests (nostr-tools `BunkerSigner.sendRequest`). */
+export interface Nip46RequestClient {
+  readonly sendRequest: (method: string, params: string[]) => Promise<string>;
+}
+
+/**
+ * An Evolustr-capable NIP-46 bunker (SPEC §5.1). The bunker identifies the app
+ * only by its connection (SPEC §5.2). Check `capabilities()` first: a bunker
+ * without the API returns an error, and the client falls back.
+ */
+export const nip46CapableSigner = (bunker: Nip46RequestClient): CapableSigner => ({
+  capabilities: async () => JSON.parse(await bunker.sendRequest("evolustr_capabilities", [])) as SignerCapabilities,
+  getWrapKey: async () => toKey(await bunker.sendRequest("evolustr_get_wrap_key", [])),
+  enrollPasskey: async () => void (await bunker.sendRequest("evolustr_enroll_passkey", [])),
+});
