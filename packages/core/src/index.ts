@@ -6,3 +6,4 @@ export * from "./aad.ts";
 export * from "./phrase.ts";
 export * from "./tags.ts";
 export * from "./appId.ts";
+export * from "./vault.ts";
