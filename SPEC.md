@@ -579,7 +579,7 @@ interface SharedSettings {
 }
 ```
 
-- App-specific overrides live in the app's Evolu database, table `evolustr_setting(key TEXT PRIMARY KEY, value JSON)`.
+- App-specific overrides live in the app's Evolu database, in Evolustr's own table (`evolustrMeta`, key `appSettings`, the same document format as the shared event).
 - `settings.get(key)` reads the app value, then shared, then the default.
 - New keys use namespaces (`x-<vendor>-<name>`) until a new schema version standardises them. Unknown keys are kept, never deleted.
 

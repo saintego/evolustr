@@ -16,6 +16,9 @@ import {
   type Vault,
   type VaultChoice,
   type VaultContext,
+  type SettingKey,
+  type SettingsDoc,
+  type SharedSettings,
   DATA_SECRET_LENGTH,
   ROOT_KEY_LENGTH,
   VAULT_KIND,
@@ -23,6 +26,12 @@ import {
   appVaultDTag,
   createCompatibleVault,
   decideVault,
+  defaultSettings,
+  emptySettings,
+  mergeSettings,
+  parseSettings,
+  resolveSetting,
+  setSetting,
   downgrade as downgradeVault,
   error,
   fetchReplaceable,
@@ -44,10 +53,12 @@ import {
   vaultEvent,
 } from "@evolustr/core";
 import type { SecretCache } from "./cache.ts";
+import { fetchSharedSettings, publishSharedSettings } from "./settings.ts";
 import {
   type AppDatabase,
   type MigrationMode,
   type OpenDatabase,
+  META_SHARED_SETTINGS,
   META_VAULT,
   migrateRows,
 } from "./database.ts";
@@ -72,6 +83,8 @@ export interface ClientOptions {
   readonly timeoutMs?: number;
   /** Margin for devices whose clocks are off, used in migrations (SPEC §3.4). */
   readonly clockMarginMs?: number;
+  /** Defaults for shared settings; language and time zone usually come from the browser. */
+  readonly settingsDefaults?: SharedSettings;
 }
 
 export type UnlockMethod = "signer" | "passkey" | "nip44" | "recovery" | "cache" | "created";
@@ -125,6 +138,16 @@ export interface Evolustr {
   readonly restoreFromPhrase: (words: string) => Promise<Result<Ready>>;
   readonly downgrade: () => Promise<Result<Status>>;
   readonly status: () => Status | null;
+  readonly settings: {
+    /** `app ?? shared ?? default` (SPEC §9.2). Reads cached values; no prompt. */
+    readonly get: <K extends SettingKey>(key: K) => SharedSettings[K];
+    /** Fetches the shared settings from relays (may show a decrypt prompt). */
+    readonly refresh: () => Promise<Result<void>>;
+    /** "Use for all apps": writes to the shared event (signature + encryption). */
+    readonly setShared: (key: string, value: unknown) => Promise<Result<void>>;
+    /** This app only, stored in the app database. */
+    readonly setApp: (key: string, value: unknown) => Promise<Result<void>>;
+  };
   readonly logout: (opts?: { readonly deleteLocalData?: boolean }) => Promise<void>;
 }
 
@@ -152,6 +175,7 @@ interface Pending {
 type Session = { readonly kind: "none" } | Unlocked | Pending;
 
 export const META_PHRASE_CONFIRMED = "phraseConfirmed";
+export const META_APP_SETTINGS = "appSettings";
 
 // ── Implementation ──────────────────────────────────────────────────────────
 
@@ -162,6 +186,15 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   const clockMarginMs = options.clockMarginMs ?? 5 * 60_000;
   let session: Session = { kind: "none" };
   let lastEventAt = 0;
+  let settingsState: { readonly app: SettingsDoc; readonly shared: SettingsDoc } = { app: emptySettings, shared: emptySettings };
+  const settingsDefaults = options.settingsDefaults ?? defaultSettings();
+  const settingsIo = { signer: deps.signer, relays: deps.relays, relayUrls: options.relayUrls, timeoutMs };
+
+  const readDoc = async (db: AppDatabase, key: string): Promise<SettingsDoc> => {
+    const text = await db.getMeta(key);
+    const doc = text === null ? null : parseSettings(text);
+    return doc?.ok ? doc.value : emptySettings;
+  };
 
   // ── Relay helpers ──
 
@@ -227,6 +260,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     await deps.cache.set(ctx.pubkey, ctx.appId, r === undefined ? { s } : { s, r });
     const next: Unlocked = { kind: "ready", ctx, vault, s, db: database, unlockedWith, ...(r === undefined ? {} : { r }) };
     session = next;
+    settingsState = { app: await readDoc(database, META_APP_SETTINGS), shared: await readDoc(database, META_SHARED_SETTINGS) };
     return ok({ pubkey: ctx.pubkey, db: database, status: statusOf(next) });
   };
 
@@ -505,6 +539,44 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
 
   const status: Evolustr["status"] = () => (session.kind === "ready" ? statusOf(session) : null);
 
+  const settings: Evolustr["settings"] = {
+    get: (key) => resolveSetting(key, settingsState.app, settingsState.shared, settingsDefaults),
+    refresh: async () => {
+      const s = requireReady();
+      if (!s.ok) return s;
+      const fetched = await fetchSharedSettings(settingsIo, s.value.ctx.pubkey);
+      if (!fetched.ok) return fetched;
+      const shared = mergeSettings(settingsState.shared, fetched.value);
+      await s.value.db.setMeta(META_SHARED_SETTINGS, JSON.stringify(shared));
+      settingsState = { ...settingsState, shared };
+      return ok(undefined);
+    },
+    setShared: async (key, value) => {
+      const s = requireReady();
+      if (!s.ok) return s;
+      const fetched = await fetchSharedSettings(settingsIo, s.value.ctx.pubkey);
+      if (!fetched.ok) return fetched;
+      const at = Math.max(now(), lastEventAt + 1);
+      const next = setSetting(mergeSettings(settingsState.shared, fetched.value), key, value, at);
+      if (!next.ok) return next;
+      const published = await publishSharedSettings(settingsIo, s.value.ctx.pubkey, next.value, at);
+      if (!published.ok) return published;
+      lastEventAt = at;
+      await s.value.db.setMeta(META_SHARED_SETTINGS, JSON.stringify(next.value));
+      settingsState = { ...settingsState, shared: next.value };
+      return ok(undefined);
+    },
+    setApp: async (key, value) => {
+      const s = requireReady();
+      if (!s.ok) return s;
+      const next = setSetting(settingsState.app, key, value, now());
+      if (!next.ok) return next;
+      await s.value.db.setMeta(META_APP_SETTINGS, JSON.stringify(next.value));
+      settingsState = { ...settingsState, app: next.value };
+      return ok(undefined);
+    },
+  };
+
   const logout: Evolustr["logout"] = async (opts) => {
     const s = session;
     session = { kind: "none" };
@@ -526,6 +598,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     restoreFromPhrase,
     downgrade,
     status,
+    settings,
     logout,
   };
 };
