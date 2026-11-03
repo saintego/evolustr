@@ -1,6 +1,6 @@
 # Evolustr Specification
 
-**Status:** Draft v0.6
+**Status:** Draft v0.7
 **Scope:** Nostr identity → one Evolu (local-first, E2E-encrypted SQLite) database per app, synced across devices, with **no backend and no storage other than Nostr relays and Evolu**.
 
 ---
@@ -40,7 +40,7 @@ Evolustr works with **any** Nostr signer. Signers that implement the Signer API,
 
 1. **No backend, no third-party storage.** Data lives only on Nostr relays (vault events, settings) and in Evolu (the app database and its sync). Signers and clients keep nothing elsewhere except their normal device-local caches.
 2. **Any signer works.** Capable signers and passkeys add strength. Without them the library still works, at a lower level.
-3. **Maximum available security.** A database is as strong as the user's setup allows. It only becomes weaker when the user explicitly chooses so (§3.2).
+3. **The user chooses the level.** Every database starts `compatible`, which works everywhere. The user can make it `strict` (§3.2) and can turn that back. Neither the app's code nor the client changes the level on its own.
 4. **Honest security levels.** The database reports its level, and the docs never claim more.
 5. **Only browser- or OS-enforced identities separate apps:** web origin (`event.origin`, extension sender origin, WebAuthn `rpId`) or the Android calling package. Self-asserted app names and URLs never do.
 6. **One Evolu instance per page.**
@@ -85,13 +85,13 @@ A vault may hold **several** wraps of the same type: one `signer` wrap per capab
 
 Rules:
 
-1. **A new vault starts at the strongest state the device can create.** With a strong wrap available and a safety net confirmed (rule 3), it's created `strict`. Otherwise `compatible`.
-2. **Upgrade is automatic.** As soon as a device that opened a `compatible` vault can create a strong wrap (the user has a capable signer, or enrolls a passkey), the client upgrades to `strict` after the safety net is in place.
-3. **Safety net first.** Before a vault becomes `strict`, the user confirms the recovery phrase **or** has a second strong unlock method. This is the only user step in an upgrade. Without it, losing one passkey would lose the data.
-4. **Upgrading rotates `S`.** Dropping the `nip44` wrap doesn't make the old `S` secret again, because relays and other apps may have kept copies. The client creates a new `S'`, moves the data (§3.4) and publishes a `strict` vault for `S'`.
+1. **A new vault starts `compatible`.** It works with every signer and needs no passkey.
+2. **Strong wraps don't change the level.** A user may add a passkey or use a capable signer just for convenience (unlocking without a decrypt prompt). Those wraps are added to the `compatible` vault, and it stays `compatible`.
+3. **`strict` is the user's choice.** The client may *offer* it when a strong wrap exists (`status.canMakeStrict`), but only `makeStrict()`, called after the user confirms, changes the mode. A user who refuses passkeys and capable signers simply stays `compatible`. Before a vault becomes `strict`, the user confirms the recovery phrase **or** has a second strong unlock method, because losing one passkey would otherwise lose the data.
+4. **Making a vault strict rotates `S`.** Dropping the `nip44` wrap doesn't make the old `S` secret again, because relays and other apps may have kept copies. The client creates a new `S'`, moves the data (§3.4) and publishes a `strict` vault for `S'`.
 5. **Clients never add a `nip44` wrap to a `strict` vault**, whatever the app's code or configuration says.
 6. **A `strict` vault ignores `nip44`.** A client reading a `strict` vault never tries a `nip44` wrap, even if one appears on a relay. A vault with no strong wrap the client can use is treated as **attacked or unavailable** (§6.3), never as a fallback.
-7. **Downgrade only by the user, on a device that can unlock.** `downgrade()` adds a `nip44` wrap and sets `mode: "compatible"`, after an explicit confirmation that names the risk.
+7. **Turning strict off is also the user's choice, on a device that can unlock.** `downgrade()` adds a `nip44` wrap and sets `mode: "compatible"`, after an explicit confirmation that names the risk.
 8. **A device that can't unlock a strict vault has no access.** For example a new device with a standard signer and no synced passkey. The user then uses the recovery phrase, a capable signer, or downgrades from a device that can unlock.
 
 ### 3.3 App identity (`appId`)
@@ -139,7 +139,7 @@ This is how an app gets a strong database with **any** signer, including standar
 4. If `getClientExtensionResults().prf` has `results.first`, use it. One prompt, done.
 5. If it only reports `prf.enabled: true` without results, show **"Finish passkey setup"** and, **from that new click**, call `navigator.credentials.get()` for the new credential with the same `prfInput`. A second call chained right after `create()` can fail, because the first one used up the click.
 6. If PRF is not enabled, stop and tell the user this authenticator can't be used.
-7. Wrap key = `HKDF-SHA256(prfOutput, salt, "evolustr/v1/wrap|" + appId)`. Add a `passkey` wrap with `rpId`, `credId` and `salt` (§6.2). If the vault is `compatible`, this starts the upgrade (§3.2 rules 2–4).
+7. Wrap key = `HKDF-SHA256(prfOutput, salt, "evolustr/v1/wrap|" + appId)`. Add a `passkey` wrap with `rpId`, `credId` and `salt` (§6.2). The level doesn't change (§3.2 rule 2). If the user wants, the app then offers `makeStrict()`.
 
 ### 4.3 Unlock on a device
 
@@ -326,7 +326,7 @@ The pubkey is part of the hash, so two users of the same app have **different** 
 
 1. **Lookup:** query all configured relays and wait for EOSE from each, or a timeout. Never decide "no vault exists" from a single relay.
 2. **Create** only when every relay answered and none has the vault. After publishing, fetch again. If a vault with a different `sHash` and an earlier `created` appears, keep the earlier one (moving any rows already written is open question §11.3).
-3. **Adding a wrap:** fetch, add the wrap (wraps are keyed by `signerId` / `credId`, so concurrent additions merge), publish, fetch again to check. Never drop a wrap without an explicit user action, except the `nip44` wrap during an upgrade (§3.2 rule 4).
+3. **Adding a wrap:** fetch, add the wrap (wraps are keyed by `signerId` / `credId`, so concurrent additions merge), publish, fetch again to check. Never drop a wrap without an explicit user action, which itself is one: `makeStrict()` drops the `nip44` wrap (§3.2 rule 4).
 4. **Self-healing:** after unlocking, re-add your own wrap if a concurrent update dropped it. Never re-add `nip44` to a `strict` vault (§3.2 rule 5).
 5. **Keep a copy in Evolu:** after a successful unlock, store the vault event in the app database itself (`evolustr_meta`, key `vault`). Evolu syncs it, so every device that has the database also has the last good vault (§6.3).
 
@@ -349,7 +349,7 @@ When a vault fails these checks, the client never silently creates a new databas
 ## 7. Support matrix
 
 **App database level:** ✅ strong · 🔶 connection-scoped (§5.2) · ⚠️ weak ("as private as your Nostr DMs").
-Shared settings are always ⚠️ by design (§9). The level shown is the **maximum** for that setup; the vault reaches it automatically once the safety net is confirmed (§3.2).
+Shared settings are always ⚠️ by design (§9). The level shown is the **highest the user can choose** with that setup. Every vault starts ⚠️ and becomes ✅ only when the user makes it strict (§3.2).
 
 ### 7.1 By signer and hosting
 
@@ -402,13 +402,14 @@ interface Evolustr<S> {
   connect(): Promise<
     | { state: "ready"; pubkey: string; db: EvoluInstance<S>; status: Status }
     | { state: "needsUserAction";
-        action: "passkey" | "signerUnlock" | "recoveryPhrase" | "confirmSafetyNet" }
+        action: "passkey" | "signerUnlock" | "recoveryPhrase" }
     | { state: "vaultReplaced"; options: ("republishCopy" | "restorePhrase" | "startNew")[] }
   >;
-  /** Call from a click. Completes whatever connect() asked for, including an upgrade. */
+  /** Call from a click. Completes whatever connect() asked for. */
   unlock(): Promise<{ pubkey: string; db: EvoluInstance<S>; status: Status }>;
-  enrollPasskey(): Promise<void>;     // from a click; may start an upgrade (§3.2)
-  downgrade(): Promise<void>;         // explicit user choice (§3.2 rule 7)
+  enrollPasskey(): Promise<void>;     // from a click; doesn't change the level
+  makeStrict(): Promise<void>;        // user's choice; checks the safety net, rotates S (§3.2)
+  downgrade(): Promise<void>;         // user's choice (§3.2 rule 7)
   showRecoveryPhrase(): Promise<string>;
   restoreFromPhrase(words: string): Promise<void>;
   settings: {
@@ -422,7 +423,7 @@ interface Status {
   signer: "capable-verified" | "capable-connection" | "standard";
   mode: "strict" | "compatible";      // from the vault
   level: "strong" | "connection" | "weak";
-  canUpgrade: boolean;                // a strong wrap could be added on this device
+  canMakeStrict: boolean;             // a strong wrap exists, so strict is possible
   unlockedWith: "signer" | "passkey" | "nip44" | "recovery";
   passkeySupported: boolean;          // PRF available on this device
 }
@@ -433,9 +434,9 @@ interface Status {
 1. Fetch the vault (§6.2) and compare it with the copy in Evolu, if this device has the database (§6.3).
 2. Try wraps that need no click: the `signer` wrap whose `signerId` matches `capabilities().signerId` (if the signer is ready), then `nip44` (**only** if the vault is `compatible`).
 3. If only a `passkey` wrap matches, or the signer needs unlocking, return `needsUserAction`. `unlock()` does the rest from a click. If nothing matches, ask for the recovery phrase.
-4. If no vault exists, create it at the strongest state available (§3.2 rule 1).
-5. After unlocking, add any missing strong wrap this device can make. If the vault is `compatible` and a strong wrap now exists, start the upgrade (§3.2 rules 2–4), asking for the safety net if it isn't confirmed yet.
-6. If `requireStrong` is set and the result is weak, return `needsUserAction` with the steps to make it strong.
+4. If no vault exists, create it `compatible` (§3.2 rule 1), with any strong wraps this device can also make.
+5. After unlocking, add any missing strong wrap this device can make (the level stays as it is).
+6. If `requireStrong` is set and the vault is `compatible`, the app tells the user it needs a strict database and offers `makeStrict()`. A user who declines can't use that app.
 
 ### 8.3 Packages
 
@@ -504,6 +505,7 @@ interface SharedSettings {
 | Passkey and `nip44` wraps in the same vault (v0.2) | The database is only as strong as its weakest wrap (§3.2). |
 | `d`-tag hashed without the pubkey (v0.2–v0.3) | Same tag for every user of an app, so one query listed all its users (§6.1). |
 | Personal vault inside Evolustr (v0.2–v0.3) | A signer feature unrelated to app databases. Moved to [SECRETS.md](SECRETS.md). |
+| Automatic upgrade to the strongest level (v0.6) | Took the choice from the user. A user may not want passkeys or the lock-out risk of `strict`. Strict is now opt-in (§3.2). |
 | App-chosen `mode` option (v0.4–v0.5) | Let an app's configuration downgrade a vault the user had made strict. The vault now records its own mode; apps can only require strong (§3.2). |
 | Signer-held vault pins (v0.4–v0.5) | Needed storage outside Nostr and Evolu, and tied to one signer. Strict vaults can't be forged anyway, and the copy in Evolu covers deletion (§6.3). |
 | Optional server with a write-once vault commitment (v0.2–v0.5) | Only protected `compatible` vaults, where an attacker gains nothing by replacing the vault. Not worth a backend. |
@@ -526,7 +528,7 @@ interface SharedSettings {
 ## 12. Implementation phases
 
 1. `@evolustr/client` with `compatible` vaults: §6.2 relay rules, copy in Evolu, recovery phrase, shared settings event.
-2. Client passkeys (§4), `strict` vaults and the automatic upgrade with rotation (§3.2, §3.4), for web, then nsite.
+2. Client passkeys (§4), opt-in `strict` vaults with rotation (§3.2, §3.4), for web, then nsite.
 3. `@evolustr/signer` (§5.6), embedded in nostr-shard-signer as the first host.
 4. `@evolustr/rn` (NIP-55, native passkeys).
 5. Propose the Signer API as a NIP.
