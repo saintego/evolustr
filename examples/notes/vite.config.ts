@@ -3,6 +3,8 @@ import { defineConfig } from "vite";
 export default defineConfig({
   // Relative paths, so the build works on GitHub Pages and as an nsite.
   base: "./",
+  // Use the TypeScript sources of workspace packages.
+  resolve: { conditions: ["source"] },
   optimizeDeps: { exclude: ["@evolu/sqlite-wasm"] },
   worker: { format: "es" },
   build: { target: "es2022" },

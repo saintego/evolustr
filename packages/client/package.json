@@ -4,10 +4,16 @@
   "type": "module",
   "license": "MIT",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
   "files": [
-    "src"
+    "dist",
+    "src",
+    "README.md"
   ],
   "dependencies": {
     "@evolustr/core": "0.0.0",
@@ -16,5 +22,26 @@
   },
   "devDependencies": {
     "@evolustr/signer": "0.0.0"
-  }
+  },
+  "description": "Open an app's Evolu database with a Nostr login, on any device.",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saintego/evolustr.git",
+    "directory": "packages/client"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "nostr",
+    "evolu",
+    "local-first",
+    "e2ee",
+    "passkeys"
+  ]
 }

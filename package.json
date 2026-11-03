@@ -9,7 +9,8 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "build": "npm run build -w @evolustr/core -w @evolustr/client -w @evolustr/signer -w @evolustr/react"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
