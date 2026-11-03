@@ -1,6 +1,6 @@
 # Evolustr Specification
 
-**Status:** Draft v0.9
+**Status:** Draft v0.10
 **Scope:** Nostr identity → one Evolu (local-first, E2E-encrypted SQLite) database per app, synced across devices, with **no backend and no storage other than Nostr relays and Evolu**.
 
 ---
@@ -234,6 +234,20 @@ For nsites, a signer with verified identity maps known gateways to `nsite:<npub>
   - `sk`: AES-GCM keyed with `HKDF(nsec, "evolustr/v1/signer-wrap")`. Only for signers that hold the nsec.
   - **Signer passkey**: PRF output of a passkey whose `rpId` is the signer's own origin, with `prfInput = SHA-256("evolustr/v1/signer-prf|" + pubkey)`. Needed by signers that don't hold the nsec (passthrough signers).
   - **Never `nip44`.** That would give `M`, and so every app's key, to any app with decrypt permission. A signer that can't use either option above doesn't offer the API.
+- Signer vault format and AAD (AES-256-GCM, random 12-byte IV, like §3.1):
+
+  ```jsonc
+  {
+    "v": 1,
+    "wraps": [
+      { "type": "sk", "iv": "…", "ct": "…" },
+      { "type": "passkey", "rpId": "signer.example.com", "credId": "<base64url>", "iv": "…", "ct": "…" }
+    ]
+  }
+  ```
+
+  `AAD = "evolustr/v1|signer|" + pubkey + "|" + signerKey + "|" + wrapType + "|" + (credId | "sk")`.
+  The `signer` marker keeps signer-vault wraps and app-vault wraps (§3.1) from ever being valid in each other's place.
 - `signerId = hex(SHA-256("evolustr/v1/signer-id|" + M))`, first 8 bytes. It is computed **after** unlocking `M`, and only labels this signer's wraps inside **app** vaults, so clients know which `signer` wrap the current signer can open. Two capable signers have different `M` and different `signerId`.
 - Wrap key for a caller: `K = HKDF-SHA256(M, "evolustr/v1|app|" + appId)`. HKDF is one-way, so one app's key reveals nothing about another's or about `M`.
 - A signer may cache the unlocked `M` on the device, as it caches its keys. It stores nothing else for Evolustr.
@@ -459,7 +473,12 @@ interface Evolustr<S> {
   unlock(input?: { recoveryPhrase?: string }): Promise<Ready<S>>;
   /** Completes a "vaultChanged" state with one of the offered options. */
   resolveVaultChange(choice: VaultChoice, input?: { recoveryPhrase?: string }): Promise<Ready<S>>;
-  enrollPasskey(): Promise<void>;     // from a click; doesn't change the level
+  /** Unlock R on this device while already "ready" (e.g. after a nip44-only unlock),
+   *  so strong methods can be added. With no input: tries a synced passkey (from a
+   *  click) or a capable signer's wrap. With the phrase: checks it against the vault. */
+  unlockRoot(input?: { recoveryPhrase?: string }): Promise<Status>;
+  enrollPasskey(): Promise<void>;     // from a click; doesn't change the level. Needs R:
+                                      // call unlockRoot() first if canAddStrongMethod is false
   makeStrict(): Promise<void>;        // user's choice; checks the safety net, replaces S (§3.4)
   downgrade(): Promise<void>;         // user's choice (§3.2 rule 7)
   showRecoveryPhrase(): Promise<string>; // R as 12 words; creates R if the vault has none
@@ -493,7 +512,7 @@ interface Status {
 4. If no vault exists:
    - without `requireStrong`: create it `compatible`, with any strong wraps this device can also make;
    - with `requireStrong`: return `needsUserAction: "setupStrong"`. `unlock()` then creates `R`, adds a strong method (passkey or signer), confirms the safety net, and publishes the **first** vault already `strict`.
-5. After unlocking, add any missing strong wrap this device can make (the level stays as it is). This needs `R`: it runs after an unlock through a strong method or the phrase, or when this device creates `R`. After a `nip44`-only unlock of a vault that already has `R`, nothing is added and `status.canAddStrongMethod` is false (§3.1).
+5. After unlocking, add any missing strong wrap this device can make (the level stays as it is). This needs `R`: it runs after an unlock through a strong method or the phrase, or when this device creates `R`. After a `nip44`-only unlock of a vault that already has `R`, nothing is added and `status.canAddStrongMethod` is false (§3.1). The app can then offer **"Use this device for passkeys"**, which calls `unlockRoot()` (passkey or signer) or `unlockRoot({ recoveryPhrase })`. The database stays open throughout; afterwards `canAddStrongMethod` is true and `enrollPasskey()` works.
 6. If `requireStrong` is set and an existing vault is `compatible`, the app tells the user it needs a strict database and offers `makeStrict()`. A user who declines can't use that app.
 
 ### 8.3 Packages
