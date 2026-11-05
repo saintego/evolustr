@@ -1,0 +1,52 @@
+{
+  "name": "@evolustr/react",
+  "version": "0.0.0",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "dependencies": {
+    "@evolustr/client": "0.0.0",
+    "@evolustr/core": "0.0.0"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "react": "19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "description": "React bindings for @evolustr/client.",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saintego/evolustr.git",
+    "directory": "packages/react"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "nostr",
+    "evolu",
+    "local-first",
+    "e2ee",
+    "passkeys"
+  ]
+}

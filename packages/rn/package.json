@@ -1,0 +1,61 @@
+{
+  "name": "@evolustr/rn",
+  "version": "0.0.0",
+  "description": "React Native adapters for Evolustr: native passkeys, NIP-55 and NIP-46 signers, secure storage.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saintego/evolustr.git",
+    "directory": "packages/rn"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "nostr",
+    "evolu",
+    "react-native",
+    "passkeys",
+    "nip-55",
+    "nip-46"
+  ],
+  "dependencies": {
+    "@evolustr/client": "0.0.0",
+    "@evolustr/core": "0.0.0"
+  },
+  "peerDependencies": {
+    "expo-secure-store": "*",
+    "react-native-get-random-values": "*",
+    "react-native-passkey": ">=3.6"
+  },
+  "peerDependenciesMeta": {
+    "react-native-passkey": {
+      "optional": true
+    },
+    "expo-secure-store": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@evolustr/signer": "^0.0.0",
+    "@noble/hashes": "^2.4.0"
+  }
+}

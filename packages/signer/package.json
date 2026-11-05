@@ -1,0 +1,43 @@
+{
+  "name": "@evolustr/signer",
+  "version": "0.0.0",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "dependencies": {
+    "@evolustr/core": "0.0.0",
+    "nostr-tools": "2.25.5"
+  },
+  "description": "The Evolustr Signer API for Nostr signers: per-app keys and one passkey for all apps.",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saintego/evolustr.git",
+    "directory": "packages/signer"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "nostr",
+    "evolu",
+    "local-first",
+    "e2ee",
+    "passkeys"
+  ]
+}
