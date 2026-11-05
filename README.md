@@ -4,7 +4,15 @@ Log in with Nostr, get your app's private [Evolu](https://www.evolu.dev) databas
 
 Evolustr connects a Nostr identity (any NIP-07 extension, NIP-46 bunker or NIP-55 signer) to a local-first, end-to-end encrypted Evolu database. The secret that opens the database is kept in an encrypted Nostr event, so a user who logs in on a new device gets their data without copying 12 words around. There is no backend.
 
-> **Status: alpha.** The design is in [SPEC.md](SPEC.md). Not audited.
+> [!WARNING]
+> **EARLY ALPHA: DON'T USE IT FOR DATA YOU CAN'T AFFORD TO LOSE**
+> Evolustr has not had a security audit. Its vault format and APIs may still change without a migration path. It has been tested mainly with simulated signers, relays and passkeys; testing on real devices and public relays has only started (see the open issues).
+>
+> - Keep your own backup of anything important, and save your recovery phrase.
+> - Don't use it to protect high-value secrets (keys to funds, bank credentials).
+> - Security reviews, test reports and pull requests are very welcome.
+>
+> The design is in [SPEC.md](SPEC.md).
 
 ## How private is it?
 
