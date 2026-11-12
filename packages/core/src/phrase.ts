@@ -18,3 +18,9 @@ export const phraseToRootKey = (phrase: string): Result<Bytes, EvolustrError> =>
     ? ok(r)
     : error("invalidPhrase", "The recovery phrase must have 12 words");
 };
+
+/**
+ * The data secret S as Evolu's own 12-word mnemonic: Evolu opens the same
+ * database from it, without Nostr or Evolustr. It is the database key itself.
+ */
+export const dataSecretToEvoluMnemonic = (s: Bytes): string => entropyToMnemonic(s, wordlist);

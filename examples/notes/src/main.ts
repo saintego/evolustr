@@ -237,6 +237,15 @@ action("showPhrase", async (c) => {
   }
   return r;
 });
+action("exportEvolu", async (c) => {
+  if (!confirm("This phrase opens these notes in any Evolu app, without Nostr. Anyone who has it can read and change them. It changes if you make the notes strict. Show it?")) return { ok: true };
+  const r = c.exportEvoluMnemonic();
+  if (r.ok) {
+    $("phrase").textContent = `Evolu phrase: ${r.value}`;
+    show("phrase", true);
+  }
+  return r;
+});
 action("theme", (c) => c.settings.setShared("theme", c.settings.get("theme") === "dark" ? "light" : "dark"));
 $("logout").onclick = async () => {
   unsubscribe?.();

@@ -24,6 +24,7 @@ import {
   ROOT_KEY_LENGTH,
   VAULT_KIND,
   addRootKey,
+  dataSecretToEvoluMnemonic,
   addRootWrap,
   backupRequirement,
   clientPrfInput,
@@ -176,6 +177,13 @@ export interface Evolustr {
   readonly finishPasskeySetup: () => Promise<Result<Status>>;
   /** User's choice: replaces S and drops the NIP-44 wrap (SPEC §3.2 rules 3–4, §3.4). */
   readonly makeStrict: (opts?: { readonly acceptDeviceLoss?: boolean }) => Promise<Result<Status>>;
+  /**
+   * This database's Evolu mnemonic (12 words), to use the data with Evolu
+   * directly, without Nostr. Anyone with it can read and write all of this
+   * database. It is not the recovery phrase: it changes when the database is
+   * made strict, and the old one keeps opening the data from before that.
+   */
+  readonly exportEvoluMnemonic: () => Result<string>;
   /** R as 12 words; creates R if the vault has none yet. */
   readonly showRecoveryPhrase: () => Promise<Result<string>>;
   /** The user typed the phrase back correctly; remembered for the backup check. */
@@ -907,6 +915,11 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     return becomeReady(ctx, published.value, s, r, "passkey", db);
   };
 
+  const exportEvoluMnemonic: Evolustr["exportEvoluMnemonic"] = () => {
+    const s = requireReady();
+    return s.ok ? ok(dataSecretToEvoluMnemonic(s.value.s)) : s;
+  };
+
   const status: Evolustr["status"] = () => (session.kind === "ready" ? statusOf(session) : null);
 
   const settings: Evolustr["settings"] = {
@@ -967,6 +980,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     finishPasskeySetup,
     makeStrict,
     showRecoveryPhrase,
+    exportEvoluMnemonic,
     confirmRecoveryPhrase,
     restoreFromPhrase,
     downgrade,

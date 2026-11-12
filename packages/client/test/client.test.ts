@@ -1,5 +1,6 @@
 import { VAULT_KIND, appVaultDTag, createCompatibleVault, memoryRelays, nip44SealSecret, publishReplaceable, randomBytes, secretKeySigner, unwrap, vaultEvent, type Signer } from "@evolustr/core";
 import { generateSecretKey } from "nostr-tools/pure";
+import { OwnerSecret, createAppOwner, ownerSecretToMnemonic } from "@evolu/common";
 import { describe, expect, it } from "vitest";
 import { type ClientOptions, createEvolustr, memoryCache, memoryDatabases } from "../src/index.ts";
 
@@ -173,5 +174,17 @@ describe("client, compatible mode", () => {
     const a = w.device().make();
     await ready(a);
     expect((await a.downgrade()).ok).toBe(false);
+  });
+
+  it("exports the Evolu mnemonic that Evolu itself derives from S", async () => {
+    const w = world();
+    const d = w.device();
+    const c = d.make();
+    const r = await ready(c);
+    const s = (await d.cache.get(r.pubkey, APP))!.s;
+    const words = unwrap(c.exportEvoluMnemonic());
+    expect(words).toBe(ownerSecretToMnemonic(OwnerSecret.orThrow(s)));
+    expect(words).not.toBe(unwrap(await c.showRecoveryPhrase()));
+    expect(createAppOwner(OwnerSecret.orThrow(s)).mnemonic).toBe(words);
   });
 });

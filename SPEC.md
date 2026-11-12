@@ -503,6 +503,8 @@ interface Evolustr<S> {
   makeStrict(opts?: { acceptDeviceLoss?: boolean }): Promise<void>; // user's choice; backup check (§3.2 rule 3a), replaces S (§3.4)
   downgrade(): Promise<void>;         // user's choice (§3.2 rule 7)
   showRecoveryPhrase(): Promise<string>; // R as 12 words; creates R if the vault has none
+  exportEvoluMnemonic(): string;       // S as Evolu's own 12 words: the data without Nostr. Anyone
+                                       // with it can read and write this database; it changes on makeStrict
   restoreFromPhrase(words: string): Promise<Ready<S>>; // same as unlock({ recoveryPhrase })
   settings: {
     get<K extends keyof SharedSettings>(key: K): SharedSettings[K]; // app ?? shared ?? default
