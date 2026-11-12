@@ -135,7 +135,11 @@ const handle = async (result: ConnectResult) => {
   show("actions", true);
   if (result.state === "needsUserAction") {
     $("state").textContent =
-      result.action === "recoveryPhrase" ? "Enter your recovery phrase to open your notes on this device" : `Click Unlock (${result.action})`;
+      result.action === "recoveryPhrase"
+        ? "Enter your recovery phrase to open your notes on this device"
+        : result.action === "confirmWeak"
+          ? "First time on this device: your notes will open through your Nostr signer (weak level, as private as your Nostr DMs). If you made them strict on another device, don't continue: use your passkey or recovery phrase instead. Click Unlock to continue."
+          : `Click Unlock (${result.action})`;
     show("unlock", result.action !== "recoveryPhrase");
     show("usePhrase", true);
     return;

@@ -116,19 +116,47 @@ describe("strict (rules 4–7)", () => {
   });
   it("downgrade adds nip44 back and becomes compatible", () => {
     const { r, v } = setup();
-    const strict = unwrap(makeStrict(ctx, v, { r, newS: randomBytes(16), now: 2 }));
-    const back = unwrap(downgrade(strict, "ct2"));
+    const strictS = randomBytes(16);
+    const strict = unwrap(makeStrict(ctx, v, { r, newS: strictS, now: 2 }));
+    const back = unwrap(downgrade(ctx, strict, { r, s: strictS, nip44Ct: "ct2" }));
     expect(back.mode).toBe("compatible");
     expect(nip44Wrap(back)?.ct).toBe("ct2");
-    expect(downgrade(back, "ct3").ok).toBe(false);
+    expect(unwrap(openRootData(ctx, back, r))).toEqual(strictS);
+    expect(downgrade(ctx, back, { r, s: strictS, nip44Ct: "ct3" }).ok).toBe(false);
+    expect(downgrade(ctx, strict, { r: randomBytes(16), s: strictS, nip44Ct: "x" }).ok).toBe(false);
   });
   it("keeps at most 10 history entries", () => {
     let { r, v } = setup();
     for (let i = 0; i < 12; i++) {
-      v = unwrap(makeStrict(ctx, v, { r, newS: randomBytes(16), now: 300 + i }));
-      v = unwrap(downgrade(v, "ct"));
+      const newS = randomBytes(16);
+      v = unwrap(makeStrict(ctx, v, { r, newS, now: 300 + i }));
+      v = unwrap(downgrade(ctx, v, { r, s: newS, nip44Ct: "ct" }));
     }
     expect(v.history).toHaveLength(10);
+  });
+});
+
+describe("authenticated header (#25)", () => {
+  const setup = () => {
+    const { s, r, key } = fresh();
+    let v = unwrap(addRootKey(ctx, compatible(s), r, s));
+    v = unwrap(addRootWrap(v, passkeyRootWrap(ctx, key, "app.example", "cred", r)));
+    return { s, r, v };
+  };
+  it("an edited mode, created time or history no longer opens with R", () => {
+    const { r, v } = setup();
+    const strict = unwrap(makeStrict(ctx, v, { r, newS: randomBytes(16), now: 200 }));
+    expect(openRootData(ctx, strict, r).ok).toBe(true);
+    expect(openRootData(ctx, { ...strict, mode: "compatible" }, r).ok).toBe(false);
+    expect(openRootData(ctx, { ...strict, created: 999 }, r).ok).toBe(false);
+    expect(openRootData(ctx, { ...strict, history: [] }, r).ok).toBe(false);
+  });
+  it("an old vault replayed with a forged history doesn't open with R", () => {
+    const { r, v } = setup();
+    const strict = unwrap(makeStrict(ctx, v, { r, newS: randomBytes(16), now: 200 }));
+    // The pre-strict vault opens; claiming it comes after the strict one doesn't.
+    expect(openRootData(ctx, v, r).ok).toBe(true);
+    expect(openRootData(ctx, { ...v, history: [{ sHash: strict.sHash, created: 200 }] }, r).ok).toBe(false);
   });
 });
 

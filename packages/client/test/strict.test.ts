@@ -1,4 +1,4 @@
-import { type Bytes, memoryRelays, secretKeySigner, unwrap } from "@evolustr/core";
+import { type Bytes, VAULT_KIND, appVaultDTag, memoryRelays, secretKeySigner, unwrap } from "@evolustr/core";
 import { generateSecretKey } from "nostr-tools/pure";
 import { describe, expect, it } from "vitest";
 import { memoryPasskeys } from "@evolustr/core";
@@ -9,7 +9,8 @@ const APP = "https://notes.example";
 const RP = "notes.example";
 
 const world = () => {
-  const signer = secretKeySigner(generateSecretKey());
+  const sk = generateSecretKey();
+  const signer = secretKeySigner(sk);
   const mem = memoryRelays();
   let clock = 1000;
   const synced = new Map<string, Bytes>(); // one passkey provider account shared by devices
@@ -28,11 +29,13 @@ const world = () => {
       );
     return { dbs, cache, make };
   };
-  return { device, tick: (n: number) => (clock += n) };
+  return { device, tick: (n: number) => (clock += n), signer, mem, now: () => clock };
 };
 
+/** Connects; confirms the weak-vault prompt on a new device, as a user would. */
 const connectReady = async (c: ReturnType<ReturnType<ReturnType<typeof world>["device"]>["make"]>) => {
   const r = unwrap(await c.connect());
+  if (r.state === "needsUserAction" && r.action === "confirmWeak") return { state: "ready" as const, ...unwrap(await c.unlock()) };
   if (r.state !== "ready") throw new Error(`not ready: ${JSON.stringify(r)}`);
   return r;
 };
@@ -154,5 +157,39 @@ describe("client passkeys and strict mode", () => {
     const b = w.device({ options: { requireStrong: true } }).make();
     expect(unwrap(await b.connect())).toEqual({ state: "needsUserAction", action: "passkey" });
     expect(unwrap(await b.unlock()).db.sHash).toBe(ra.db.sHash);
+  });
+
+  it("a replayed pre-strict vault doesn't undo strict mode on a device with R (#25)", async () => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    // An app with signing permission keeps a copy of the vault from before strict…
+    const before = (await w.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [appVaultDTag(ra.pubkey, APP)] }, 100)).events[0]!;
+    await a.makeStrict();
+    const strictSHash = (await connectReady(d.make())).db.sHash;
+    // …and re-signs it later.
+    w.tick(1000);
+    const replay = await w.signer.signEvent({ kind: VAULT_KIND, created_at: w.now(), tags: before.tags, content: before.content });
+    await w.mem.relays.publish(URLS, replay, 100);
+
+    const again = d.make();
+    const r = unwrap(await again.connect());
+    expect(r).toMatchObject({ state: "vaultChanged", reason: "replaced" });
+    const fixed = unwrap(await again.resolveVaultChange("republishCopy"));
+    expect(fixed.status.mode).toBe("strict");
+    expect(fixed.db.sHash).toBe(strictSHash);
+  });
+
+  it("a new device asks before using a compatible vault it can't verify (#26)", async () => {
+    const w = world();
+    await connectReady(w.device().make());
+    const b = w.device().make();
+    expect(unwrap(await b.connect())).toEqual({ state: "needsUserAction", action: "confirmWeak" });
+    expect(unwrap(await b.unlock()).status).toMatchObject({ mode: "compatible", unlockedWith: "nip44" });
+    // Apps that never offer strict mode can turn the prompt off.
+    const c = w.device({ options: { confirmWeakOnNewDevice: false } }).make();
+    expect(unwrap(await c.connect()).state).toBe("ready");
   });
 });

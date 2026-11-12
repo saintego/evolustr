@@ -6,7 +6,7 @@
  */
 import { appWrapAad } from "./aad.ts";
 import { type Bytes } from "./bytes.ts";
-import { type Sealed, open, seal } from "./crypto.ts";
+import { type Sealed, open, seal, sha256Hex } from "./crypto.ts";
 import { DATA_SECRET_LENGTH, ROOT_KEY_LENGTH, rootDataKey, sHash } from "./keys.ts";
 import { type EvolustrError, type Result, error, flatMap, ok } from "./result.ts";
 
@@ -183,10 +183,27 @@ export const serializeVault = (vault: Vault): string => JSON.stringify(vault);
 
 // ── Wrapping ────────────────────────────────────────────────────────────────
 
-const sealRootData = (ctx: VaultContext, r: Bytes, s: Bytes): DataWrap => ({
+/** The vault fields the `root` data wrap authenticates (SPEC §3.1, §6.3). */
+export interface VaultHeader {
+  readonly mode: Mode;
+  readonly created: number;
+  readonly sHash: string;
+  readonly history: ReadonlyArray<HistoryEntry>;
+}
+
+/**
+ * Binds the header into the root data wrap's AAD: a header that was edited, or
+ * replayed from an older vault with a newer history, no longer opens with R.
+ */
+export const headerBinding = (h: VaultHeader): string =>
+  `${h.sHash}|${h.mode}|${h.created}|${sha256Hex(JSON.stringify(h.history.map((e) => [e.sHash, e.created]))).slice(0, 16)}`;
+
+const sealRootData = (ctx: VaultContext, r: Bytes, s: Bytes, header: VaultHeader): DataWrap => ({
   type: "root",
-  ...seal(rootDataKey(r, ctx.appId), s, appWrapAad(ctx.pubkey, ctx.appId, "root", sHash(s))),
+  ...seal(rootDataKey(r, ctx.appId), s, appWrapAad(ctx.pubkey, ctx.appId, "root", headerBinding(header))),
 });
+
+const headerOf = (v: VaultHeader): VaultHeader => ({ mode: v.mode, created: v.created, sHash: v.sHash, history: v.history });
 
 /** Wraps R for a capable signer, keyed by the signer's app key (SPEC §3.1). */
 export const signerRootWrap = (
@@ -233,7 +250,7 @@ export const openRootData = (
   const wrap = rootDataWrap(vault);
   if (wrap === undefined) return error("noRootKey", "This vault has no root key yet");
   return flatMap(
-    open(rootDataKey(r, ctx.appId), wrap, appWrapAad(ctx.pubkey, ctx.appId, "root", vault.sHash)),
+    open(rootDataKey(r, ctx.appId), wrap, appWrapAad(ctx.pubkey, ctx.appId, "root", headerBinding(headerOf(vault)))),
     (s) =>
       s.length === DATA_SECRET_LENGTH && sHash(s) === vault.sHash
         ? ok(s)
@@ -263,19 +280,18 @@ export interface CreateCompatibleInput {
 export const createCompatibleVault = (
   ctx: VaultContext,
   input: CreateCompatibleInput,
-): Result<Vault, EvolustrError> =>
-  validateVault({
+): Result<Vault, EvolustrError> => {
+  const header: VaultHeader = { mode: "compatible", created: input.now, sHash: sHash(input.s), history: [] };
+  return validateVault({
     v: 1,
-    mode: "compatible",
-    created: input.now,
-    sHash: sHash(input.s),
-    history: [],
+    ...header,
     rootWraps: input.rootWraps ?? [],
     dataWraps: [
-      ...(input.r === undefined ? [] : [sealRootData(ctx, input.r, input.s)]),
+      ...(input.r === undefined ? [] : [sealRootData(ctx, input.r, input.s, header)]),
       { type: "nip44", ct: input.nip44Ct },
     ],
   });
+};
 
 export interface CreateStrictInput {
   readonly s: Bytes;
@@ -288,16 +304,10 @@ export interface CreateStrictInput {
 export const createStrictVault = (
   ctx: VaultContext,
   input: CreateStrictInput,
-): Result<Vault, EvolustrError> =>
-  validateVault({
-    v: 1,
-    mode: "strict",
-    created: input.now,
-    sHash: sHash(input.s),
-    history: [],
-    rootWraps: input.rootWraps,
-    dataWraps: [sealRootData(ctx, input.r, input.s)],
-  });
+): Result<Vault, EvolustrError> => {
+  const header: VaultHeader = { mode: "strict", created: input.now, sHash: sHash(input.s), history: [] };
+  return validateVault({ v: 1, ...header, rootWraps: input.rootWraps, dataWraps: [sealRootData(ctx, input.r, input.s, header)] });
+};
 
 /** Adds R to a vault that has none yet (first strong method or confirmed phrase). */
 export const addRootKey = (
@@ -308,7 +318,7 @@ export const addRootKey = (
 ): Result<Vault, EvolustrError> => {
   if (hasRootKey(vault)) return error("rootKeyExists", "This vault already has a root key");
   if (sHash(s) !== vault.sHash) return error("invalidVault", "Data secret doesn't match the vault");
-  return validateVault({ ...vault, dataWraps: [sealRootData(ctx, r, s), ...vault.dataWraps] });
+  return validateVault({ ...vault, dataWraps: [sealRootData(ctx, r, s, headerOf(vault)), ...vault.dataWraps] });
 };
 
 /** Adds or replaces a root wrap, keyed by `signerId` / `credId` (SPEC §6.2 rule 3). */
@@ -346,33 +356,40 @@ export const makeStrict = (
     const check = open(
       rootDataKey(input.r, ctx.appId),
       current,
-      appWrapAad(ctx.pubkey, ctx.appId, "root", vault.sHash),
+      appWrapAad(ctx.pubkey, ctx.appId, "root", headerBinding(headerOf(vault))),
     );
     if (!check.ok) return error("wrongRootKey", "The root key doesn't belong to this vault");
   }
   const history = [...vault.history, { sHash: vault.sHash, created: vault.created }].slice(
     -HISTORY_LIMIT,
   );
-  return validateVault({
-    v: 1,
-    mode: "strict",
-    created: input.now,
-    sHash: sHash(input.newS),
-    history,
-    rootWraps: vault.rootWraps,
-    dataWraps: [sealRootData(ctx, input.r, input.newS)],
-  });
+  const header: VaultHeader = { mode: "strict", created: input.now, sHash: sHash(input.newS), history };
+  return validateVault({ v: 1, ...header, rootWraps: vault.rootWraps, dataWraps: [sealRootData(ctx, input.r, input.newS, header)] });
 };
 
-/** Turns strict off by adding a nip44 wrap of the current S (SPEC §3.2 rule 7). */
-export const downgrade = (vault: Vault, nip44Ct: string): Result<Vault, EvolustrError> =>
-  vault.mode === "compatible"
-    ? error("alreadyCompatible", "The vault is already compatible")
-    : validateVault({
-        ...vault,
-        mode: "compatible",
-        dataWraps: [...vault.dataWraps, { type: "nip44", ct: nip44Ct }],
-      });
+export interface DowngradeInput {
+  readonly r: Bytes;
+  readonly s: Bytes;
+  /** NIP-44 self-encryption of the current S. */
+  readonly nip44Ct: string;
+}
+
+/**
+ * Turns strict off by adding a nip44 wrap of the current S (SPEC §3.2 rule 7).
+ * The root data wrap is sealed again, because the mode is part of its AAD.
+ */
+export const downgrade = (ctx: VaultContext, vault: Vault, input: DowngradeInput): Result<Vault, EvolustrError> => {
+  if (vault.mode === "compatible") return error("alreadyCompatible", "The vault is already compatible");
+  const current = openRootData(ctx, vault, input.r);
+  if (!current.ok) return error("wrongRootKey", "The root key doesn't belong to this vault");
+  if (sHash(input.s) !== vault.sHash) return error("invalidVault", "Data secret doesn't match the vault");
+  const header: VaultHeader = { ...headerOf(vault), mode: "compatible" };
+  return validateVault({
+    ...vault,
+    mode: "compatible",
+    dataWraps: [sealRootData(ctx, input.r, input.s, header), { type: "nip44", ct: input.nip44Ct }],
+  });
+};
 
 /**
  * Merges two versions of the same vault (same S) after concurrent updates:
@@ -383,17 +400,17 @@ export const mergeVaults = (a: Vault, b: Vault): Result<Vault, EvolustrError> =>
   if (a.sHash !== b.sHash) return error("differentSecrets", "The vaults hold different data secrets");
   const byKey = new Map<string, RootWrap>();
   for (const w of [...a.rootWraps, ...b.rootWraps]) byKey.set(`${w.type}:${rootWrapKeyId(w)}`, w);
-  const strict = a.mode === "strict" || b.mode === "strict";
-  const root = rootDataWrap(a) ?? rootDataWrap(b);
-  const nip = nip44Wrap(a) ?? nip44Wrap(b);
+  // The mode and data wraps come from one version, since the mode is part of
+  // the root data wrap's AAD; strict wins, never re-adding nip44 (rule 5).
+  const base = a.mode === "strict" || b.mode !== "strict" ? a : b;
+  const other = base === a ? b : a;
+  // A root data wrap added concurrently on the other version is valid here only
+  // when both versions share the same header (same mode).
+  const borrowed = rootDataWrap(base) === undefined && other.mode === base.mode ? rootDataWrap(other) : undefined;
   return validateVault({
-    ...a,
-    mode: strict ? "strict" : "compatible",
+    ...base,
     rootWraps: [...byKey.values()],
-    dataWraps: [
-      ...(root === undefined ? [] : [root]),
-      ...(strict || nip === undefined ? [] : [nip]),
-    ],
+    dataWraps: borrowed === undefined ? base.dataWraps : [borrowed, ...base.dataWraps],
   });
 };
 

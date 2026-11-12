@@ -40,9 +40,26 @@ describe("decideVault (SPEC §6.3)", () => {
     expect(d).toMatchObject({ type: "follow", cutoff: 200 });
     if (d.type === "follow") expect(d.s).toEqual(s2);
   });
-  it("change not in history: follow, but cut-off unknown (ask before copying)", () => {
+  it("a vault that doesn't name the local secret in its history isn't followed on its own", () => {
     const { r, strict } = world();
-    expect(decideVault(ctx, { kind: "found", vault: strict }, { sHash: "unknown", r })).toMatchObject({ type: "follow", cutoff: null });
+    expect(decideVault(ctx, { kind: "found", vault: strict }, { sHash: "unknown", r })).toMatchObject({
+      type: "choose",
+      reason: "ambiguous",
+      options: ["followRelay", "restorePhrase"],
+    });
+  });
+  it("a replayed pre-strict vault is a rollback, never followed (#25)", () => {
+    const { r, s2, compat, strict } = world();
+    // The device is on the strict database; someone re-signs the old compatible vault.
+    const d = decideVault(ctx, { kind: "found", vault: compat }, { sHash: sHash(s2), r, copy: strict });
+    expect(d).toMatchObject({ type: "choose", reason: "replaced", options: ["republishCopy", "restorePhrase", "startNew"] });
+    // Without a local copy it still isn't followed: the user decides.
+    expect(decideVault(ctx, { kind: "found", vault: compat }, { sHash: sHash(s2), r })).toMatchObject({ type: "choose" });
+  });
+  it("same secret with an edited header is treated as replaced", () => {
+    const { r, s2, strict } = world();
+    const flipped = { ...strict, mode: "compatible" as const, dataWraps: [...strict.dataWraps, { type: "nip44" as const, ct: "x" }] };
+    expect(decideVault(ctx, { kind: "found", vault: flipped }, { sHash: sHash(s2), r, copy: strict })).toMatchObject({ type: "choose", reason: "replaced" });
   });
   it("replaced: device has R but the vault doesn't open with it", () => {
     const { s, compat } = world();

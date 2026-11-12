@@ -27,8 +27,10 @@ const world = () => {
   return { sk, signer, mem, device, decrypts, tick: (n = 1) => (clock += n) };
 };
 
+/** Connects; confirms the weak-vault prompt on a new device, as a user would. */
 const ready = async (p: ReturnType<ReturnType<ReturnType<typeof world>["device"]>["make"]>) => {
   const r = unwrap(await p.connect());
+  if (r.state === "needsUserAction" && r.action === "confirmWeak") return { state: "ready" as const, ...unwrap(await p.unlock()) };
   if (r.state !== "ready") throw new Error(`expected ready, got ${JSON.stringify(r)}`);
   return r;
 };

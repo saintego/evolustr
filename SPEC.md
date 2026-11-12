@@ -1,6 +1,6 @@
 # Evolustr Specification
 
-**Status:** Draft v0.12
+**Status:** Draft v0.13
 **Scope:** Nostr identity → one Evolu (local-first, E2E-encrypted SQLite) database per app, synced across devices, with **no backend and no storage other than Nostr relays and Evolu**.
 
 ---
@@ -87,8 +87,8 @@ Why two levels: the strong methods protect `R`, and `R` protects `S`. When `S` i
 **`R` is never reachable through NIP-44, even in `compatible` mode.** If it were, anyone who read the `nip44` wrap while the vault was weak would still know `R` after `makeStrict()`. The cost: a device that opened a `compatible` vault through `nip44` has `S` but not `R`. Once `R` exists, that device can read and write the data, but it **can't add a strong method** (passkey or signer wrap) until the user unlocks `R` there once, with a synced passkey, a capable signer that already has a wrap, or the recovery phrase. The client says so plainly instead of failing (`status.canAddStrongMethod`).
 
 `signer`, `passkey` and `root` wraps use **AES-256-GCM** with a random 12-byte IV and
-`AAD = "evolustr/v1|" + pubkey + "|" + appId + "|" + wrapType + "|" + (signerId | credId | sHash)`.
-Binding each wrap to its own key identifier (and the `root` wrap to the `sHash` of the `S` it holds) means concurrent additions never collide and a wrap can't be moved to another vault or swapped for an older one.
+`AAD = "evolustr/v1|" + pubkey + "|" + appId + "|" + wrapType + "|" + keyId`, where `keyId` is the `signerId` or `credId` for root wraps. For the `root` data wrap, `keyId` is the **vault header**: `sHash + "|" + mode + "|" + created + "|" + first 16 hex characters of SHA-256(history)`.
+Binding each wrap to its own key identifier means concurrent additions never collide and a wrap can't be moved to another vault. Binding the header into the `root` data wrap means nobody without `R` can change the mode, the creation time or the history: an edited header no longer opens with `R`. `downgrade()` therefore needs `R`, to seal the wrap again with the new mode.
 
 A vault may hold several `signer` wraps (one per capable signer, each with its own `M`, §5.3) and several `passkey` wraps.
 
@@ -409,15 +409,19 @@ Any app the user lets sign can publish a replacement vault event. Capable signer
 
 | Situation | What the client does |
 |---|---|
-| No local database for this `(pubkey, appId)` | First use on this device: unlock normally. If the vault is `compatible`, show its weak level before first use. |
-| Same `sHash` as the local database | Normal. |
-| Different `sHash`, and its `root` wrap opens with the `R` this device has | A legitimate change made by the user: a rotation (local `sHash` in `history`), a restore or a resolved create race. Follow it and migrate local rows as in §3.4. |
+| No local database for this `(pubkey, appId)` | First use on this device. If a capable signer or a cached `R` opens the vault, its header is verified: unlock normally. If the vault is `compatible` and only NIP-44 can open it, ask the user to confirm first (`needsUserAction: "confirmWeak"`), saying not to continue if they made the database strict elsewhere. |
+| Same `sHash` as the local database | Normal, unless the device has `R` and the vault's `root` wrap no longer opens with it (an edited header, e.g. strict flipped to compatible): then **replaced**. |
+| Different `sHash`, its `root` wrap opens with `R`, and its `history` contains the local `sHash` | A rotation moving forward (§3.4). Follow it and migrate local rows. |
+| Different `sHash`, its `root` wrap opens with `R`, and the vault's `sHash` is in the local copy's `history` | **Replaced (rollback).** Someone who can sign for the user re-signed an older vault; it opens with `R` because `R` never changes. Never follow it on its own: offer to republish the copy from Evolu. |
+| Different `sHash`, its `root` wrap opens with `R`, no history relation either way | Ask the user (a restore or a resolved create race looks like this, but so does a replay to a device without a copy). Following copies only missing rows and keeps the old local database. |
 | Different `sHash`, the device has `R`, but the vault has no `root` wrap that opens with it | **Replaced.** Nobody without `R` can make a valid `root` wrap. Offer to republish the copy from Evolu (§6.2 rule 5). |
 | Different `sHash`, the device has no `R` (it only used `nip44`), fetched vault is `strict` | Can't verify and can't unlock (§3.2 rule 8). Ask for a strong method or the recovery phrase. **Never** republish the local copy: it could undo a legitimate `makeStrict()`. Keep the local database; once the user unlocks `R` here, migrate its rows into the current one (§3.4) before deleting it. |
 | Different `sHash`, the device has no `R`, fetched vault is `compatible` | Can't tell a user change from an attack. Keep the local database, show both options to the user, and republish only on the user's choice. An attacker who can do this can already read the `nip44` wrap, so this is about availability, not secrecy. |
 | Vault missing or unreadable | Offer to republish the copy from Evolu, if this device has one. |
 
-Attacks against the strong path all fail: `signer`, `passkey` and `root` wraps can't be forged without the key, and AAD stops wraps being moved between vaults. A downgrade attack on a **new** device (replacing a `strict` vault with a `compatible` one) can make that device open an attacker's empty database, never the user's data; the client warns about the weak level before first use (first row above).
+`signer`, `passkey` and `root` wraps can't be forged without the key, AAD stops wraps being moved between vaults, and the header binding stops edited headers. Two attacks remain that a client can only answer by asking the user:
+- **Replay of an older genuine vault.** It opens with `R`. A device that has a local copy recognises it from the history; a device without one sees "no history relation" and asks.
+- **Downgrade on a new device:** replacing a `strict` vault with a `compatible` one holding a secret the attacker chose. The new device would open the attacker's empty database, and anything the user then writes there is readable by the attacker. This is why the first row asks for confirmation before using a vault only NIP-44 can open.
 
 When a vault fails these checks, the client never silently creates a new database. It shows the user what happened and offers what the table allows: republish the copy from Evolu, restore from the recovery phrase, or start a new database.
 
@@ -471,6 +475,7 @@ interface EvolustrOptions<S> {
   schema: S;                          // the app's Evolu schema
   relays: string[];
   requireStrong?: boolean;            // only strict databases (§2, §3.2 rule 1); default false
+  confirmWeakOnNewDevice?: boolean;   // §6.3 first row; default true
   appId?: string;                     // native apps; web uses §3.3
   passkey?: { rpName: string };       // enables client passkeys
   knownNsiteGateways?: string[];      // for appId = nsite:<npub>
@@ -481,7 +486,7 @@ interface Evolustr<S> {
   connect(): Promise<
     | { state: "ready"; pubkey: string; db: EvoluInstance<S>; status: Status }
     | { state: "needsUserAction";
-        action: "passkey" | "signerUnlock" | "recoveryPhrase" | "setupStrong" }
+        action: "passkey" | "signerUnlock" | "recoveryPhrase" | "setupStrong" | "confirmWeak" }
     | { state: "vaultChanged"; options: VaultChoice[] }
   >;
   /** Call from a click. Completes whatever connect() asked for.

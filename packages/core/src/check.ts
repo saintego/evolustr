@@ -3,7 +3,7 @@
  * Pure: the caller supplies what it fetched and what it already knows.
  */
 import type { Bytes } from "./bytes.ts";
-import { type Vault, type VaultContext, migrationCutoff, openRootData } from "./vault.ts";
+import { type Vault, type VaultContext, hasRootKey, migrationCutoff, openRootData } from "./vault.ts";
 
 export type Fetched =
   | { readonly kind: "found"; readonly vault: Vault }
@@ -29,7 +29,7 @@ export type VaultDecision =
   /** No vault anywhere and no local database: create one. */
   | { readonly type: "create" }
   | { readonly type: "same" }
-  /** A legitimate change (rotation, restore, resolved race): follow it and migrate. */
+  /** A rotation this device can verify (its secret is in the vault's history): follow and migrate. */
   | { readonly type: "follow"; readonly vault: Vault; readonly s: Bytes; readonly cutoff: number | null }
   /** The device can't verify a strict vault: needs a strong method or the phrase. */
   | { readonly type: "needsStrongUnlock"; readonly vault: Vault }
@@ -63,17 +63,35 @@ export const decideVault = (
 
   const vault = fetched.vault;
   if (local === null) return { type: "firstUse", vault, warnWeak: vault.mode === "compatible" };
-  if (vault.sHash === local.sHash) return { type: "same" };
+  const replaced: VaultDecision = {
+    type: "choose",
+    reason: "replaced",
+    vault,
+    options: canRepublish ? ["republishCopy", "restorePhrase", "startNew"] : ["restorePhrase", "startNew"],
+  };
+
+  if (vault.sHash === local.sHash) {
+    // Same secret, but an edited header (e.g. strict flipped to compatible)
+    // no longer opens with R: nobody without R can make a valid one.
+    if (local.r !== undefined && hasRootKey(vault) && !openRootData(ctx, vault, local.r).ok) return replaced;
+    return { type: "same" };
+  }
 
   if (local.r !== undefined) {
     const s = openRootData(ctx, vault, local.r);
-    if (s.ok) return { type: "follow", vault, s: s.value, cutoff: migrationCutoff(vault, local.sHash) };
-    // Nobody without R can make a root wrap that opens with it.
+    if (!s.ok) return replaced;
+    // Follow on its own only when moving forward: the vault's authenticated
+    // history names the local secret (#25). An older vault replayed by someone
+    // who can sign for the user opens with R too, so it must never be followed.
+    if (vault.history.some((h) => h.sHash === local.sHash)) {
+      return { type: "follow", vault, s: s.value, cutoff: migrationCutoff(vault, local.sHash) };
+    }
+    if (local.copy?.history.some((h) => h.sHash === vault.sHash) === true) return replaced;
     return {
       type: "choose",
-      reason: "replaced",
+      reason: "ambiguous",
       vault,
-      options: canRepublish ? ["republishCopy", "restorePhrase", "startNew"] : ["restorePhrase", "startNew"],
+      options: canRepublish ? ["republishCopy", "followRelay", "restorePhrase"] : ["followRelay", "restorePhrase"],
     };
   }
 

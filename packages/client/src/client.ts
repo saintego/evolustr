@@ -105,6 +105,12 @@ export interface ClientOptions {
   readonly clockMarginMs?: number;
   /** Defaults for shared settings; language and time zone usually come from the browser. */
   readonly settingsDefaults?: SharedSettings;
+  /**
+   * Ask before using a compatible vault on a new device when nothing stronger can
+   * verify it (`needsUserAction: "confirmWeak"`). Default true; turn off only if
+   * the app never offers strict mode.
+   */
+  readonly confirmWeakOnNewDevice?: boolean;
 }
 
 export type UnlockMethod = "signer" | "passkey" | "nip44" | "recovery" | "cache" | "created";
@@ -134,7 +140,12 @@ export interface Ready {
   readonly status: Status;
 }
 
-export type UserAction = "passkey" | "signerUnlock" | "recoveryPhrase" | "setupStrong";
+/**
+ * "confirmWeak": first use on this device of a compatible vault that can only be
+ * opened through NIP-44. Someone who can sign for the user could have replaced a
+ * strict vault with one like it (#26), so the user confirms before data is written.
+ */
+export type UserAction = "passkey" | "signerUnlock" | "recoveryPhrase" | "setupStrong" | "confirmWeak";
 
 export type ConnectResult =
   | ({ readonly state: "ready" } & Ready)
@@ -432,6 +443,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     ctx: VaultContext,
     vault: Vault,
     local: Pending["local"],
+    requireWeakConfirm = false,
   ): Promise<Result<ConnectResult>> => {
     if (caps?.ready === true && caps.signerId !== null && signerWrapFor(vault, caps.signerId) !== undefined) {
       const root = await rootFromSigner(ctx, vault);
@@ -451,6 +463,10 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
         return withReady(becomeReady(ctx, vault, s.value, local.r, "cache", db));
       }
+    }
+    if (vault.mode === "compatible" && requireWeakConfirm) {
+      session = { kind: "pending", ctx, action: "confirmWeak", vault, ...(local === undefined ? {} : { local }) };
+      return ok({ state: "needsUserAction", action: "confirmWeak" });
     }
     if (vault.mode === "compatible") {
       const s = await nip44OpenSecret(deps.signer, ctx.pubkey, vault);
@@ -542,7 +558,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       case "create":
         return createVault(ctx);
       case "firstUse":
-        return unlockFetched(ctx, decision.vault, undefined);
+        return unlockFetched(ctx, decision.vault, undefined, decision.warnWeak && options.confirmWeakOnNewDevice !== false);
       case "same": {
         const vault = fetched.kind === "found" ? fetched.vault : local!.copy!;
         return withReady(becomeReady(ctx, vault, local!.s, local!.r, "cache", local!.db));
@@ -615,6 +631,14 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       return root.ok ? openWithRoot(p, root.value, "signer") : root;
     }
     if (p.action === "setupStrong") return setupStrong(p.ctx, input?.acceptDeviceLoss === true);
+    if (p.action === "confirmWeak") {
+      if (p.vault === undefined) return error("noVault", "No vault to open");
+      const r = await unlockFetched(p.ctx, p.vault, p.local, false);
+      if (!r.ok) return r;
+      return r.value.state === "ready"
+        ? ok({ pubkey: r.value.pubkey, db: r.value.db, status: r.value.status })
+        : error("needsUserAction", `Still needs: ${r.value.state === "needsUserAction" ? r.value.action : r.value.state}`);
+    }
     return error("unsupported", `Unlocking with "${p.action}" isn't available in this build`);
   };
 
@@ -632,14 +656,18 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       }
       case "followRelay": {
         if (p.vault === undefined) return error("noVault", "No vault to follow");
-        const s = await nip44OpenSecret(deps.signer, p.ctx.pubkey, p.vault);
+        // The user chose this. Use R when it opens the vault; otherwise NIP-44
+        // (only a compatible vault has a nip44 wrap; a strict one never falls back).
+        const viaRoot = p.local?.r === undefined ? null : openRootData(p.ctx, p.vault, p.local.r);
+        const s = viaRoot?.ok ? viaRoot : p.vault.mode === "compatible" ? await nip44OpenSecret(deps.signer, p.ctx.pubkey, p.vault) : viaRoot ?? error("rootLocked", "A strong unlock is needed");
         if (!s.ok) return s;
         const db = await deps.openDatabase(s.value);
-        // Not verifiable: copy only rows missing there, never overwrite.
-        if (p.local !== undefined) {
-          await switchDatabase(p.local.db, db, { kind: "since", cutoffMs: Number.POSITIVE_INFINITY, marginMs: 0 });
+        // Not verifiable: copy only rows missing there, never overwrite, and keep
+        // the previous local database (it isn't deleted).
+        if (p.local !== undefined && p.local.db.sHash !== db.sHash) {
+          await migrateRows(p.local.db, db, { kind: "since", cutoffMs: Number.POSITIVE_INFINITY, marginMs: 0 });
         }
-        return becomeReady(p.ctx, p.vault, s.value, undefined, "nip44", db);
+        return becomeReady(p.ctx, p.vault, s.value, viaRoot?.ok ? p.local?.r : undefined, viaRoot?.ok ? "cache" : "nip44", db);
       }
       case "restorePhrase":
         if (input?.recoveryPhrase === undefined) return error("phraseRequired", "Pass the recovery phrase");
@@ -713,13 +741,14 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   const downgrade: Evolustr["downgrade"] = async () => {
     const s = requireReady();
     if (!s.ok) return s;
+    if (s.value.r === undefined) return error("rootLocked", "Unlock the root key on this device first (unlockRoot)");
     let ct: string;
     try {
       ct = await nip44SealSecret(deps.signer, s.value.ctx.pubkey, s.value.s);
     } catch (e) {
       return error("signerRefused", e instanceof Error ? e.message : String(e));
     }
-    const next = downgradeVault(s.value.vault, ct);
+    const next = downgradeVault(s.value.ctx, s.value.vault, { r: s.value.r, s: s.value.s, nip44Ct: ct });
     if (!next.ok) return next;
     const published = await publishVault(s.value.ctx, next.value);
     if (!published.ok) return published;
