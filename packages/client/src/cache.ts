@@ -110,3 +110,96 @@ export const asyncKeyValueCache = (store: AsyncKeyValue): SecretCache => {
     },
   };
 };
+
+/** Where an encrypted cache keeps its key: a non-extractable WebCrypto key. */
+export interface CryptoKeyStore {
+  readonly get: () => Promise<CryptoKey | null>;
+  readonly set: (key: CryptoKey) => Promise<void>;
+}
+
+/** Keeps the key in IndexedDB, which can store a CryptoKey without exposing its bytes. */
+export const indexedDbKeyStore = (dbName = "evolustr-keys"): CryptoKeyStore => {
+  const open = () =>
+    new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open(dbName, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore("keys");
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error ?? new Error("IndexedDB unavailable"));
+    });
+  const tx = async <T>(mode: IDBTransactionMode, f: (s: IDBObjectStore) => IDBRequest<T>) => {
+    const db = await open();
+    return new Promise<T>((resolve, reject) => {
+      const req = f(db.transaction("keys", mode).objectStore("keys"));
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error ?? new Error("IndexedDB error"));
+    }).finally(() => db.close());
+  };
+  return {
+    get: async () => ((await tx("readonly", (s) => s.get("cache"))) as CryptoKey | undefined) ?? null,
+    set: async (key) => void (await tx("readwrite", (s) => s.put(key, "cache"))),
+  };
+};
+
+export const memoryKeyStore = (): CryptoKeyStore => {
+  let key: CryptoKey | null = null;
+  return { get: async () => key, set: async (k) => void (key = k) };
+};
+
+/**
+ * A cache whose entries are encrypted with a non-extractable AES-GCM key (#27).
+ * It doesn't stop script running on the app's origin (an XSS can still ask for
+ * decryption), but plain reads of storage, backups or the browser profile only
+ * get ciphertext. Failures act as an empty cache.
+ */
+export const encryptedCache = (
+  store: KeyValue,
+  keyStore: CryptoKeyStore,
+  subtle: SubtleCrypto = globalThis.crypto.subtle,
+): SecretCache => {
+  let keyPromise: Promise<CryptoKey> | null = null;
+  const key = (): Promise<CryptoKey> =>
+    (keyPromise ??= (async () => {
+      const existing = await keyStore.get();
+      if (existing !== null) return existing;
+      const fresh = await subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+      await keyStore.set(fresh);
+      return fresh;
+    })());
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  return {
+    get: async (pubkey, appId) => {
+      try {
+        const raw = store.getItem(cacheKey(pubkey, appId));
+        if (raw === null) return null;
+        const { iv, ct } = JSON.parse(raw) as { iv: string; ct: string };
+        const ivBytes = fromBase64Url(iv);
+        const ctBytes = fromBase64Url(ct);
+        if (ivBytes === null || ctBytes === null) return null;
+        const plain = await subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(ivBytes) }, await key(), new Uint8Array(ctBytes));
+        return decode(dec.decode(plain));
+      } catch {
+        return null;
+      }
+    },
+    set: async (pubkey, appId, secrets) => {
+      try {
+        const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+        const ct = await subtle.encrypt({ name: "AES-GCM", iv }, await key(), enc.encode(encode(secrets)));
+        store.setItem(cacheKey(pubkey, appId), JSON.stringify({ iv: toBase64Url(iv), ct: toBase64Url(new Uint8Array(ct)) }));
+      } catch {
+        /* unavailable: unlock again next time */
+      }
+    },
+    remove: async (pubkey, appId) => {
+      try {
+        store.removeItem(cacheKey(pubkey, appId));
+      } catch {
+        /* ignore */
+      }
+    },
+  };
+};
+
+/** The recommended web cache: localStorage entries encrypted with a key kept in IndexedDB. */
+export const webSecretCache = (): SecretCache => encryptedCache(globalThis.localStorage, indexedDbKeyStore());

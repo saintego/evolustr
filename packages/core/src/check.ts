@@ -95,6 +95,12 @@ export const decideVault = (
     };
   }
 
+  // Without R the header can't be verified, but the local copy still tells a
+  // rollback (an older secret this device has moved past) or a swap from strict
+  // to a different, weak vault: both are replaced, never followed (#25, #27).
+  if (local.copy?.history.some((h) => h.sHash === vault.sHash) === true) return replaced;
+  if (local.copy?.mode === "strict" && vault.mode === "compatible") return replaced;
+
   if (vault.mode === "strict") {
     // Never republish here: it could undo a legitimate makeStrict().
     return { type: "needsStrongUnlock", vault };

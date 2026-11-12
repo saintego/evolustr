@@ -36,9 +36,9 @@ The user chooses one of two levels for each app's database:
 | Level | Who can read it | What the user needs on a new device |
 |---|---|---|
 | **Compatible** (default) | The user, and any app the user has allowed to *decrypt* with their signer. That's the same protection as Nostr direct messages. | Just their Nostr signer. |
-| **Strict** | Only the user. Other apps can't read it, even with signer permissions. | A passkey (synced by Apple, Google or a password manager), a signer that supports Evolustr, or the 12-word recovery phrase. |
+| **Strict** | Only the user, for everything written **after** the switch. Other apps can't read it, even with signer permissions. | A passkey (synced by Apple, Google or a password manager), a signer that supports Evolustr, or the 12-word recovery phrase. |
 
-Switching to strict is one action (`makeStrict()`). With a synced passkey it needs no extra step. With a passkey that lives on one device only, the user first saves the recovery phrase or adds a second passkey, because losing that one device would otherwise lose the data.
+Switching to strict is one action (`makeStrict()`). It protects what the user writes from then on. **Data written before the switch stays as readable as it was:** an app that had decrypt permission could have kept the old secret, and Evolu's relay keeps the old copy (Evolu can't delete it yet). So choose strict before storing anything sensitive. With a synced passkey it needs no extra step. With a passkey that lives on one device only, the user first saves the recovery phrase or adds a second passkey, because losing that one device would otherwise lose the data.
 
 ## Why use it (for Nostr developers)
 
@@ -70,15 +70,16 @@ Switching to strict is one action (`makeStrict()`). With a synced passkey it nee
 ```ts
 import { AppName, NonEmptyTrimmedString1000, createEvolu, id } from "@evolu/common";
 import { createEvoluDeps, createRun } from "@evolu/web";
-import { createEvolustr, detectCapableSigner, evoluDatabases, keyValueCache } from "@evolustr/client";
+import { createEvolustr, detectCapableSigner, evoluDatabases, webSecretCache } from "@evolustr/client";
 import { appIdFromOrigin, nip07Signer, poolRelays, webauthnPasskeys } from "@evolustr/core";
 
 const Schema = { note: { id: id("Note"), text: NonEmptyTrimmedString1000 } };
-const appId = appIdFromOrigin(location.origin, ["nsite.lol"]);
+const appId = appIdFromOrigin(location.origin, ["nsite.lol"]); // a Result: https: (or http: on localhost) only
+if (!appId.ok) throw new Error(appId.error.message);
 const run = createRun(createEvoluDeps());
 
 const databases = evoluDatabases({
-  appId,
+  appId: appId.value,
   schema: Schema,
   createEvolu: ({ schema, appOwner, appName }) =>
     run.ok(createEvolu(schema, {
@@ -93,11 +94,11 @@ const evolustr = createEvolustr(
     signer: nip07Signer(window.nostr),
     relays: poolRelays(),
     openDatabase: databases.open,
-    cache: keyValueCache(localStorage),
+    cache: webSecretCache(),                            // encrypted with a non-extractable key
     passkeys: webauthnPasskeys({ rpName: "My App" }),
     capableSigner: detectCapableSigner(window.nostr), // optional
   },
-  { appId, relayUrls: ["wss://relay.damus.io", "wss://nos.lol"] },
+  { appId: appId.value, relayUrls: ["wss://relay.damus.io", "wss://nos.lol"] },
 );
 
 const result = await evolustr.connect(); // never prompts for a passkey
@@ -117,6 +118,7 @@ Every method returns a `Result` (`{ ok: true, value }` or `{ ok: false, error }`
 - **nsite:** pass the gateways you trust to `appIdFromOrigin`, so `<npub>.gateway` maps to one app on every gateway. A passkey on one gateway doesn't work on another (WebAuthn binds passkeys to the domain); a capable signer does.
 - **Migration resets `createdAt`:** when a database becomes strict, rows are copied to a new Evolu owner and get new `createdAt` / `updatedAt` values. Keep your own `created` column if you show creation dates.
 - **Evolu reloads the page** when a local database is deleted unless you pass `onDatabaseDeleted`.
+- **The device cache holds the database secret.** Evolu needs it on every start. `webSecretCache()` encrypts it with a non-extractable key, which protects it from plain storage reads but not from script running on your page. Use a strict Content-Security-Policy (no inline scripts, no third-party scripts you don't trust): an XSS on your origin can read the user's data, as in any web app. The recovery phrase key is kept in memory only, unless you set `cacheRootKey: true`.
 
 ## Mobile (React Native)
 

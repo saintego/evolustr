@@ -1,6 +1,6 @@
-import { randomBytes } from "@evolustr/core";
+import { randomBytes, toBase64Url } from "@evolustr/core";
 import { describe, expect, it } from "vitest";
-import { keyValueCache, memoryCache, memoryDatabases, migrateRows } from "../src/index.ts";
+import { encryptedCache, keyValueCache, memoryCache, memoryDatabases, memoryKeyStore, migrateRows } from "../src/index.ts";
 
 describe("migrateRows (SPEC §3.4)", () => {
   it("copies everything in 'all' mode, keeping ids and deletion flags", async () => {
@@ -64,5 +64,32 @@ describe("secret cache", () => {
     });
     await broken.set("pk", "app", { s: randomBytes(16) });
     expect(await broken.get("pk", "app")).toBeNull();
+  });
+});
+
+describe("encrypted cache (#27)", () => {
+  const kv = () => {
+    const m = new Map<string, string>();
+    return { m, store: { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v), removeItem: (k: string) => void m.delete(k) } };
+  };
+  it("round-trips, and storage holds only ciphertext", async () => {
+    const { m, store } = kv();
+    const c = encryptedCache(store, memoryKeyStore());
+    const s = randomBytes(16);
+    await c.set("pk", "app", { s });
+    expect(await c.get("pk", "app")).toEqual({ s });
+    const stored = [...m.values()][0]!;
+    expect(stored).not.toContain(toBase64Url(s));
+    expect(Object.keys(JSON.parse(stored))).toEqual(["iv", "ct"]);
+  });
+  it("another key can't read it", async () => {
+    const { store } = kv();
+    await encryptedCache(store, memoryKeyStore()).set("pk", "app", { s: randomBytes(16) });
+    expect(await encryptedCache(store, memoryKeyStore()).get("pk", "app")).toBeNull();
+  });
+  it("the generated key isn't extractable", async () => {
+    const ks = memoryKeyStore();
+    await encryptedCache(kv().store, ks).set("pk", "app", { s: randomBytes(16) });
+    expect((await ks.get())?.extractable).toBe(false);
   });
 });

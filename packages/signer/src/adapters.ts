@@ -32,17 +32,29 @@ export const isIframeRequest = (data: unknown): data is IframeRequest =>
   typeof (data as IframeRequest).method === "string";
 
 /**
+ * Which app pages may call the signer. Required (#30): without it any site
+ * could embed the signer, and the only gate would be a prompt drawn inside an
+ * embeddable frame, which is open to clickjacking. Pass the embedding page's
+ * origin (e.g. from `location.ancestorOrigins`), a list, or a predicate.
+ */
+export type AllowedOrigins = string | ReadonlyArray<string> | ((origin: string) => boolean);
+
+const isAllowed = (allowed: AllowedOrigins, origin: string): boolean =>
+  typeof allowed === "function" ? allowed(origin) : typeof allowed === "string" ? origin === allowed : allowed.includes(origin);
+
+/**
  * Handles one message inside an iframe signer. The caller is `event.origin`,
- * which the browser sets; optionally only `allowedOrigin` is served.
+ * which the browser sets, and only allowed origins are served. Reply with
+ * `postMessage(response, event.origin)`, never with "*".
  */
 export const handleIframeMessage = async (
   signer: EvolustrSigner,
   event: { readonly origin: string; readonly data: unknown },
-  allowedOrigin?: string,
+  allowedOrigins: AllowedOrigins,
 ): Promise<IframeResponse | null> => {
   if (!isIframeRequest(event.data)) return null;
   if (!event.origin || event.origin === "null") return null;
-  if (allowedOrigin !== undefined && event.origin !== allowedOrigin) return null;
+  if (!isAllowed(allowedOrigins, event.origin)) return null;
   const r = await signer.handle(event.data.method, event.data.params ?? [], { identity: "verified", origin: event.origin });
   return toResponse(event.data.id, r);
 };
@@ -52,11 +64,11 @@ export const listenForIframeRequests = (
   signer: EvolustrSigner,
   self: Pick<Window, "addEventListener" | "removeEventListener">,
   reply: (response: IframeResponse, origin: string) => void,
-  allowedOrigin?: string,
+  allowedOrigins: AllowedOrigins,
 ): (() => void) => {
   const listener = (e: Event) => {
     const m = e as MessageEvent;
-    void handleIframeMessage(signer, { origin: m.origin, data: m.data }, allowedOrigin).then((r) => {
+    void handleIframeMessage(signer, { origin: m.origin, data: m.data }, allowedOrigins).then((r) => {
       if (r !== null) reply(r, m.origin);
     });
   };

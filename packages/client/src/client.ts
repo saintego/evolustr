@@ -10,6 +10,7 @@ import {
   type Bytes,
   type EvolustrError,
   type Fetched,
+  type NostrEvent,
   type Relays,
   type Result,
   type Signer,
@@ -112,6 +113,12 @@ export interface ClientOptions {
    * the app never offers strict mode.
    */
   readonly confirmWeakOnNewDevice?: boolean;
+  /**
+   * Also keep the root key R (the recovery phrase) in the device cache, so a
+   * reload can follow rotations and add strong methods without a passkey or
+   * signer click. Default false: R stays in memory for the session (#27).
+   */
+  readonly cacheRootKey?: boolean;
 }
 
 export type UnlockMethod = "signer" | "passkey" | "nip44" | "recovery" | "cache" | "created";
@@ -175,7 +182,11 @@ export interface Evolustr {
   readonly enrollPasskey: () => Promise<Result<{ readonly done: boolean }>>;
   /** Second click when the authenticator returned no PRF output at creation. */
   readonly finishPasskeySetup: () => Promise<Result<Status>>;
-  /** User's choice: replaces S and drops the NIP-44 wrap (SPEC §3.2 rules 3–4, §3.4). */
+  /**
+   * User's choice: replaces S and drops the NIP-44 wrap (SPEC §3.2 rules 3–4, §3.4).
+   * Protects what is written afterwards; data written before stays as readable
+   * as it was. Tell the user before calling it (#31).
+   */
   readonly makeStrict: (opts?: { readonly acceptDeviceLoss?: boolean }) => Promise<Result<Status>>;
   /**
    * This database's Evolu mnemonic (12 words), to use the data with Evolu
@@ -283,15 +294,22 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   const ensureSignerWrap = async (): Promise<void> => {
     if (session.kind !== "ready" || capable === undefined) return;
     const s = session;
-    const c = caps;
-    if (c === null || !c.ready || c.signerId === null || signerWrapFor(s.vault, c.signerId) !== undefined) return;
+    let c = caps;
+    if (c === null) return;
+    if (c.ready && c.signerId !== null && signerWrapFor(s.vault, c.signerId) !== undefined) return;
+    // A locked signer that needs a passkey click isn't asked here; the user adds it later.
+    if (!c.ready && c.signerPasskey) return;
     if (s.r === undefined && hasRootKey(s.vault)) return; // nip44-only device: can't add (SPEC §3.1)
     let key: Bytes;
     try {
+      // Asks the user to allow this app; a new signer creates its key here (#29).
       key = await capable.getWrapKey();
     } catch {
       return;
     }
+    c = await refreshCaps();
+    if (c === null || c.signerId === null || signerWrapFor(s.vault, c.signerId) !== undefined) return;
+    const signerIdNow = c.signerId;
     let vault = s.vault;
     const r = s.r ?? random(ROOT_KEY_LENGTH);
     if (s.r === undefined) {
@@ -299,11 +317,11 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       if (!withRoot.ok) return;
       vault = withRoot.value;
     }
-    const added = addRootWrap(vault, signerRootWrap(s.ctx, key, c.signerId, r));
+    const added = addRootWrap(vault, signerRootWrap(s.ctx, key, signerIdNow, r));
     if (!added.ok) return;
     const published = await publishVault(s.ctx, added.value);
     if (!published.ok) return;
-    await rememberMethod(s.db, { id: `signer:${c.signerId}`, method: { kind: "signer", recoverable: true } });
+    await rememberMethod(s.db, { id: `signer:${signerIdNow}`, method: { kind: "signer", recoverable: true } });
     await becomeReady(s.ctx, published.value, s.s, r, s.unlockedWith, s.db);
   };
 
@@ -336,12 +354,28 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (f.kind === "none") return { kind: "none" };
     if (f.kind === "incomplete") return { kind: "unreadable" };
     lastEventAt = Math.max(lastEventAt, f.event.created_at);
+    lastFetched = { event: f.event, missingOn: f.missingOn };
     const v = readVaultEvent(ctx, f.event);
     return v.ok ? { kind: "found", vault: v.value } : { kind: "unreadable" };
   };
 
-  /** Publishes, merging with the relay version first when it holds the same S (superset rule). */
-  const publishVault = async (ctx: VaultContext, vault: Vault): Promise<Result<Vault>> => {
+  /** The newest vault event seen, and relays that answered without it (#32). */
+  let lastFetched: { readonly event: NostrEvent; readonly missingOn: ReadonlyArray<string> } | null = null;
+
+  /** Sends the current vault event to relays that lack it; no new signature needed. */
+  const rebroadcastVault = async (): Promise<void> => {
+    const f = lastFetched;
+    if (f === null || f.missingOn.length === 0) return;
+    await deps.relays.publish(f.missingOn, f.event, timeoutMs).catch(() => undefined);
+    lastFetched = { ...f, missingOn: [] };
+  };
+
+  /**
+   * Publishes, merging with the relay version first when it holds the same S
+   * (superset rule). With `requireAll` (rotations, #32), a relay that still
+   * refuses after a retry makes it fail with `partialPublish`.
+   */
+  const publishVault = async (ctx: VaultContext, vault: Vault, requireAll = false): Promise<Result<Vault>> => {
     let toPublish = vault;
     const current = await fetchVault(ctx);
     if (current.kind === "found" && current.vault.sHash === vault.sHash) {
@@ -351,12 +385,18 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       toPublish = { ...merged.value, mode: vault.mode, dataWraps: vault.dataWraps };
     }
     const at = Math.max(now(), lastEventAt + 1);
+    let failed: ReadonlyArray<string>;
     try {
-      await publishReplaceable(deps.relays, options.relayUrls, deps.signer, vaultEvent(ctx, toPublish, at), timeoutMs);
+      const published = await publishReplaceable(deps.relays, options.relayUrls, deps.signer, vaultEvent(ctx, toPublish, at), timeoutMs);
+      failed = published.failed;
+      lastFetched = { event: published.event, missingOn: failed };
     } catch (e) {
       return error("publishFailed", e instanceof Error ? e.message : String(e));
     }
     lastEventAt = at;
+    if (requireAll && failed.length > 0) {
+      return error("partialPublish", `Not every relay accepted the change (${failed.join(", ")}); it completes on the next connect`);
+    }
     return ok(toPublish);
   };
 
@@ -387,7 +427,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   ): Promise<Result<Ready>> => {
     const database = db ?? (await deps.openDatabase(s));
     await database.setMeta(META_VAULT, serializeVault(vault));
-    await deps.cache.set(ctx.pubkey, ctx.appId, r === undefined ? { s } : { s, r });
+    // R is the recovery phrase: kept in memory only, unless the app opts in (#27).
+    await deps.cache.set(ctx.pubkey, ctx.appId, r === undefined || options.cacheRootKey !== true ? { s } : { s, r });
     const next: Unlocked = { kind: "ready", ctx, vault, s, db: database, unlockedWith, ...(r === undefined ? {} : { r }) };
     session = next;
     settingsState = { app: await readDoc(database, META_APP_SETTINGS), shared: await readDoc(database, META_SHARED_SETTINGS) };
@@ -481,7 +522,9 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       if (s.ok) {
         const db = await deps.openDatabase(s.value);
         if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
-        return withReady(becomeReady(ctx, vault, s.value, local?.r, "nip44", db));
+        // Keep a cached R only if it really opens this vault (#33).
+        const r = local?.r !== undefined && openRootData(ctx, vault, local.r).ok ? local.r : undefined;
+        return withReady(becomeReady(ctx, vault, s.value, r, "nip44", db));
       }
       if (s.error.type === "signerRefused") return s;
     }
@@ -520,6 +563,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
 
   const connect: Evolustr["connect"] = async () => {
     const result = await connectInner();
+    if (result.ok && result.value.state === "ready") await rebroadcastVault();
     if (result.ok && result.value.state === "ready" && capable !== undefined) {
       await ensureSignerWrap();
       const st = status();
@@ -701,7 +745,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!r.ok) return r;
     const check = openRootData(s.value.ctx, s.value.vault, r.value);
     if (!check.ok) return error("wrongPhrase", "This recovery phrase doesn't belong to this app's data");
-    await deps.cache.set(s.value.ctx.pubkey, s.value.ctx.appId, { s: s.value.s, r: r.value });
+    if (options.cacheRootKey === true) await deps.cache.set(s.value.ctx.pubkey, s.value.ctx.appId, { s: s.value.s, r: r.value });
     const next: Unlocked = { ...s.value, r: r.value };
     session = next;
     return ok(statusOf(next));
@@ -758,10 +802,11 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     }
     const next = downgradeVault(s.value.ctx, s.value.vault, { r: s.value.r, s: s.value.s, nip44Ct: ct });
     if (!next.ok) return next;
-    const published = await publishVault(s.value.ctx, next.value);
-    if (!published.ok) return published;
-    const ready = await becomeReady(s.value.ctx, published.value, s.value.s, s.value.r, s.value.unlockedWith, s.value.db);
-    return ready.ok ? ok(ready.value.status) : ready;
+    const published = await publishVault(s.value.ctx, next.value, true);
+    if (!published.ok && published.error.type !== "partialPublish") return published;
+    const ready = await becomeReady(s.value.ctx, published.ok ? published.value : next.value, s.value.s, s.value.r, s.value.unlockedWith, s.value.db);
+    if (!ready.ok) return ready;
+    return published.ok ? ok(ready.value.status) : published;
   };
 
   const createPasskey = async (ctx: VaultContext, vault: Vault | undefined): Promise<Result<CreatedPasskey>> => {
@@ -856,10 +901,16 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       const v = await s.value.db.getMeta(key);
       if (v !== null) await db.setMeta(key, v);
     }
-    const published = await publishVault(s.value.ctx, next.value);
-    if (!published.ok) {
+    const published = await publishVault(s.value.ctx, next.value, true);
+    if (!published.ok && published.error.type !== "partialPublish") {
       await db.deleteLocal();
       return published;
+    }
+    if (!published.ok) {
+      // Some relays have the strict vault: continue on S', but keep the old
+      // local database until every relay agrees (#32). connect() re-sends it.
+      const ready = await becomeReady(s.value.ctx, next.value, newS, s.value.r, s.value.unlockedWith, db);
+      return ready.ok ? published : ready;
     }
     await s.value.db.deleteLocal();
     const ready = await becomeReady(s.value.ctx, published.value, newS, s.value.r, s.value.unlockedWith, db);

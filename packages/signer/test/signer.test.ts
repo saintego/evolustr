@@ -50,13 +50,13 @@ describe("@evolustr/signer", () => {
     const k1 = unwrap(await s.getWrapKey(web(`https://${NPUB}.nsite.lol`)));
     const k2 = unwrap(await s.getWrapKey(web(`https://${NPUB}.other.gw`)));
     expect(k1).toEqual(k2);
-    expect(s.appIdFor(web(`https://${NPUB}.nsite.lol`))).toBe(`nsite:${NPUB}`);
+    expect(unwrap(s.appIdFor(web(`https://${NPUB}.nsite.lol`)))).toBe(`nsite:${NPUB}`);
   });
 
   it("NIP-46 and Android callers get their own app ids", () => {
     const s = createEvolustrSigner(setup().host());
-    expect(s.appIdFor({ identity: "connection", clientPubkey: "abc" })).toBe("nip46:abc");
-    expect(s.appIdFor({ identity: "verified", androidPackage: "com.example.notes" })).toBe("android:com.example.notes");
+    expect(unwrap(s.appIdFor({ identity: "connection", clientPubkey: "a".repeat(64) }))).toBe(`nip46:${"a".repeat(64)}`);
+    expect(unwrap(s.appIdFor({ identity: "verified", androidPackage: "com.example.notes" }))).toBe("android:com.example.notes");
   });
 
   it("a signer holding the nsec creates M once; a new device finds it via signerKey", async () => {
@@ -78,10 +78,10 @@ describe("@evolustr/signer", () => {
     unwrap(await a.enrollPasskey());
     const k1 = unwrap(await a.getWrapKey(web("https://a.example")));
     const b = createEvolustrSigner(t.host({ holdsNsec: false, passkeys: passkeys() }));
-    expect((await b.capabilities(web("https://a.example"))).ready).toBe(false);
+    expect(unwrap(await b.capabilities(web("https://a.example"))).ready).toBe(false);
     expect(unwrap(await b.getWrapKey(web("https://a.example")))).toEqual(k1);
     expect(t.gestures).toContain("unlock");
-    expect((await b.capabilities(web("https://a.example"))).signerPasskey).toBe(true);
+    expect(unwrap(await b.capabilities(web("https://a.example"))).signerPasskey).toBe(true);
   });
 
   it("with allowSkWrap false the nsec isn't used and no sk wrap is stored", async () => {
@@ -102,9 +102,15 @@ describe("@evolustr/signer", () => {
   it("capabilities report signerId once ready", async () => {
     const t = setup();
     const s = createEvolustrSigner(t.host());
-    const caps = await s.capabilities(web("https://a.example"));
+    // Before any app was allowed, capabilities creates and publishes nothing (#29).
+    expect(unwrap(await s.capabilities(web("https://a.example")))).toMatchObject({ ready: false, signerId: null });
+    expect((await t.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [signerVaultDTag(t.pubkey, SIGNER)] }, 100)).events).toHaveLength(0);
+    unwrap(await s.getWrapKey(web("https://a.example")));
+    const caps = unwrap(await s.capabilities(web("https://a.example")));
     expect(caps).toMatchObject({ identity: "verified", appId: "https://a.example", ready: true });
     expect(caps.signerId).toMatch(/^[0-9a-f]{16}$/);
+    // Different apps see different signer ids, so they can't link the user (#29).
+    expect(unwrap(await s.capabilities(web("https://b.example"))).signerId).not.toBe(caps.signerId);
   });
 
   it("recognises Evolustr vault events for auto-approve lists", () => {
@@ -113,5 +119,49 @@ describe("@evolustr/signer", () => {
     expect(s.isProtectedEvent({ kind: VAULT_KIND, tags: [["d", "evolustr:settings:v1"]] })).toBe(true);
     expect(s.isProtectedEvent({ kind: VAULT_KIND, tags: [["d", "other-app-data"]] })).toBe(false);
     expect(s.isProtectedEvent({ kind: 1, tags: [] })).toBe(false);
+  });
+
+  it("enrolling on a locked device unlocks the existing key instead of creating a second one (#28)", async () => {
+    const t = setup();
+    const passkeys = () => memoryPasskeys({ rpId: "signer.example", store: t.passkeyStore });
+    const a = createEvolustrSigner(t.host({ holdsNsec: false, passkeys: passkeys() }));
+    unwrap(await a.enrollPasskey());
+    const k1 = unwrap(await a.getWrapKey(web("https://a.example")));
+    // Second device, locked: it unlocks with the synced passkey and enrolls a
+    // different authenticator (e.g. a hardware key); the new wrap must hold the same M.
+    const synced = passkeys();
+    const hardware = memoryPasskeys({ rpId: "signer.example" });
+    const both = { ...synced, create: hardware.create, get: async (a: Parameters<typeof synced.get>[0]) => (a.allowCredIds.some((id) => hardware.store.has(id)) ? hardware.get(a) : synced.get(a)) };
+    const b = createEvolustrSigner(t.host({ holdsNsec: false, passkeys: both }));
+    unwrap(await b.enrollPasskey());
+    expect(unwrap(await b.getWrapKey(web("https://a.example")))).toEqual(k1);
+    // The hardware key alone (no synced passkey) also opens the same M.
+    const hwOnly = createEvolustrSigner(t.host({ holdsNsec: false, passkeys: { ...hardware, rpId: "signer.example" } }));
+    expect(unwrap(await hwOnly.getWrapKey(web("https://a.example")))).toEqual(k1);
+    // A third device whose passkeys can't open the vault can't add a wrap at all.
+    const c = createEvolustrSigner(t.host({ holdsNsec: false, passkeys: memoryPasskeys({ rpId: "signer.example" }) }));
+    expect(await c.enrollPasskey()).toMatchObject({ ok: false, error: { type: "signerLocked" } });
+  });
+
+  it("an empty or malformed signer vault is an error, not first use (#28)", async () => {
+    const t = setup();
+    const s = createEvolustrSigner(t.host());
+    const k1 = unwrap(await s.getWrapKey(web("https://a.example")));
+    // Someone publishes an empty signer vault over the real one.
+    const host = t.host();
+    await t.mem.relays.publish(URLS, await host.sign({ kind: VAULT_KIND, created_at: 99999, tags: [["d", signerVaultDTag(t.pubkey, SIGNER)]], content: JSON.stringify({ v: 1, wraps: [] }) }), 100);
+    const fresh = createEvolustrSigner(t.host());
+    expect(await fresh.getWrapKey(web("https://a.example"))).toMatchObject({ ok: false, error: { type: "invalidSignerVault" } });
+    // No new M was published over it.
+    const events = (await t.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [signerVaultDTag(t.pubkey, SIGNER)] }, 100)).events;
+    expect(JSON.parse(events[0]!.content)).toEqual({ v: 1, wraps: [] });
+    expect(k1).toHaveLength(32);
+  });
+
+  it("refuses insecure and malformed callers (#30)", async () => {
+    const s = createEvolustrSigner(setup().host());
+    expect(await s.getWrapKey(web("http://app.example"))).toMatchObject({ ok: false, error: { type: "insecureOrigin" } });
+    expect(await s.getWrapKey({ identity: "connection", clientPubkey: "x|y" })).toMatchObject({ ok: false, error: { type: "invalidCaller" } });
+    expect(await s.capabilities(web("not an origin"))).toMatchObject({ ok: false });
   });
 });

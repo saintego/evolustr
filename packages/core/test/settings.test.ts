@@ -32,4 +32,12 @@ describe("shared settings (SPEC §9)", () => {
     const bad = { v: 1 as const, values: { theme: { value: "purple", at: 1 } } };
     expect(resolveSetting("theme", bad, shared, d)).toBe("dark");
   });
+
+  it("ignores prototype keys like constructor and __proto__ (#33)", () => {
+    expect(setSetting(emptySettings, "constructor", 1, 1).ok).toBe(false);
+    expect(setSetting(emptySettings, "toString", "x", 1).ok).toBe(false);
+    const doc = unwrap(parseSettings('{"v":1,"values":{"__proto__":{"value":"x","at":1},"theme":{"value":"dark","at":2}}}'));
+    expect(Object.getPrototypeOf(doc.values)).toBeNull();
+    expect(resolveSetting("theme", emptySettings, doc, defaultSettings())).toBe("dark");
+  });
 });

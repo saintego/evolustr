@@ -1,4 +1,4 @@
-import { type Bytes, concat, toHex, utf8 } from "./bytes.ts";
+import { type Bytes, toHex, utf8 } from "./bytes.ts";
 import { hkdf, sha256 } from "./crypto.ts";
 
 /** Root key R and data secret S are 16 bytes (12 BIP-39 words). Signer master M is 32 bytes. */
@@ -39,6 +39,9 @@ export const signerSkWrapKey = (secretKey: Bytes): Bytes =>
 export const signerAppKey = (m: Bytes, appId: string): Bytes =>
   hkdf(m, `evolustr/v1|app|${appId}`);
 
-/** Label of a signer's wraps inside app vaults (SPEC §5.3). */
-export const signerId = (m: Bytes): string =>
-  short(sha256(concat(utf8("evolustr/v1/signer-id|"), m)));
+/**
+ * Label of a signer's wrap inside one app's vault (SPEC §5.3). Derived per app,
+ * so apps can't use it to link the same user across apps (#29).
+ */
+export const signerId = (m: Bytes, appId: string): string =>
+  toHex(hkdf(m, `evolustr/v1/signer-id|${appId}`, 8));

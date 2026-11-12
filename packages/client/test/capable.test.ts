@@ -43,7 +43,7 @@ const world = () => {
       ui: { confirm: async () => true, requestGesture: async () => {} },
       now,
     });
-    listenForIframeRequests(signer, signerWin, (response) => appWin.deliver(response, SIGNER_ORIGIN));
+    listenForIframeRequests(signer, signerWin, (response) => appWin.deliver(response, SIGNER_ORIGIN), appOrigin);
     const capableSigner = iframeCapableSigner({
       target: { postMessage: (msg) => queueMicrotask(() => signerWin.deliver(msg, appOrigin)) },
       signerOrigin: SIGNER_ORIGIN,

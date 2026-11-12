@@ -51,10 +51,10 @@ describe("hashes and HKDF match Node's implementation", () => {
     expect(sha256Hex("abc")).toBe(nodeSha("abc"));
     expect(sHash(ikm)).toBe(nodeSha(ikm).slice(0, 16));
   });
-  it("signerId is SHA-256 of prefix + M bytes, first 8 bytes", () => {
+  it("signerId is HKDF(M, app) and differs per app (#29)", () => {
     const m = randomBytes(32);
-    const expected = createHash("sha256").update("evolustr/v1/signer-id|").update(m).digest("hex").slice(0, 16);
-    expect(signerId(m)).toBe(expected);
+    expect(signerId(m, "https://a.example")).toBe(toHex(new Uint8Array(hkdfSync("sha256", m, new Uint8Array(0), utf8("evolustr/v1/signer-id|https://a.example"), 8))));
+    expect(signerId(m, "https://a.example")).not.toBe(signerId(m, "https://b.example"));
   });
 });
 
@@ -120,14 +120,20 @@ describe("d-tags", () => {
 describe("appIdFromOrigin", () => {
   const npub = "npub1sg6plzptd64u62a878hep2kev88swjh3tw00gjsfl8f237lmu63q0uf63m";
   it("uses the origin for normal sites", () => {
-    expect(appIdFromOrigin("https://app.example.com/path")).toBe("https://app.example.com");
+    expect(unwrap(appIdFromOrigin("https://app.example.com/path"))).toBe("https://app.example.com");
   });
   it("maps known nsite gateways to nsite:<npub>", () => {
-    expect(appIdFromOrigin(`https://${npub}.nsite.lol`, ["nsite.lol"])).toBe(`nsite:${npub}`);
-    expect(appIdFromOrigin(`https://${npub}.other.gw`, ["nsite.lol", "other.gw"])).toBe(`nsite:${npub}`);
+    expect(unwrap(appIdFromOrigin(`https://${npub}.nsite.lol`, ["nsite.lol"]))).toBe(`nsite:${npub}`);
+    expect(unwrap(appIdFromOrigin(`https://${npub}.other.gw`, ["nsite.lol", "other.gw"]))).toBe(`nsite:${npub}`);
   });
   it("keeps the origin on unknown gateways and for invalid npubs", () => {
-    expect(appIdFromOrigin(`https://${npub}.unknown.gw`, ["nsite.lol"])).toBe(`https://${npub}.unknown.gw`);
-    expect(appIdFromOrigin("https://npub1bad.nsite.lol", ["nsite.lol"])).toBe("https://npub1bad.nsite.lol");
+    expect(unwrap(appIdFromOrigin(`https://${npub}.unknown.gw`, ["nsite.lol"]))).toBe(`https://${npub}.unknown.gw`);
+    expect(unwrap(appIdFromOrigin("https://npub1bad.nsite.lol", ["nsite.lol"]))).toBe("https://npub1bad.nsite.lol");
+  });
+  it("refuses insecure and invalid origins, allowing http: only on localhost (#30)", () => {
+    expect(appIdFromOrigin("http://app.example.com")).toMatchObject({ ok: false, error: { type: "insecureOrigin" } });
+    expect(appIdFromOrigin("null")).toMatchObject({ ok: false, error: { type: "invalidOrigin" } });
+    expect(appIdFromOrigin("ftp://app.example.com").ok).toBe(false);
+    expect(unwrap(appIdFromOrigin("http://localhost:5173"))).toBe("http://localhost:5173");
   });
 });

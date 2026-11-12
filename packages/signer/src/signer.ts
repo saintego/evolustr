@@ -105,13 +105,14 @@ export type Method = (typeof METHODS)[number];
 export interface EvolustrSigner {
   /** For the host's message handler: `caller` comes from the host, never from params. */
   readonly handle: (method: string, params: ReadonlyArray<unknown>, caller: Caller) => Promise<Result<unknown>>;
-  readonly capabilities: (caller: Caller) => Promise<Capabilities>;
+  /** No prompt, and never creates or publishes anything (#29). */
+  readonly capabilities: (caller: Caller) => Promise<Result<Capabilities>>;
   /** 32-byte key for the caller's app vault (SPEC §5.3). */
   readonly getWrapKey: (caller: Caller) => Promise<Result<Bytes>>;
   readonly enrollPasskey: () => Promise<Result<void>>;
   /** For the host's auto-approve list (SPEC §5.5 rule 2). */
   readonly isProtectedEvent: (event: { readonly kind: number; readonly tags: ReadonlyArray<ReadonlyArray<string>> }) => boolean;
-  readonly appIdFor: (caller: Caller) => string;
+  readonly appIdFor: (caller: Caller) => Result<string>;
   readonly lock: () => Promise<void>;
 }
 
@@ -131,22 +132,35 @@ export const parseSignerVault = (json: string): Result<SignerVault, EvolustrErro
   }
   const wraps: SignerWrap[] = [];
   for (const w of data["wraps"]) {
-    if (!isRecord(w) || typeof w["iv"] !== "string" || typeof w["ct"] !== "string") continue;
+    // A malformed wrap is an error, never skipped: republishing without it
+    // would drop someone's way to unlock M (#28).
+    if (!isRecord(w) || typeof w["iv"] !== "string" || typeof w["ct"] !== "string") {
+      return error("invalidSignerVault", "Malformed wrap");
+    }
     const sealed = { iv: w["iv"], ct: w["ct"] };
     if (w["type"] === "sk") wraps.push({ type: "sk", ...sealed });
     else if (w["type"] === "passkey" && typeof w["rpId"] === "string" && typeof w["credId"] === "string") {
       wraps.push({ type: "passkey", rpId: w["rpId"], credId: w["credId"], ...sealed });
-    }
+    } else return error("invalidSignerVault", "Unknown wrap type");
   }
+  // A vault that exists but has no wraps isn't "first use" (#28).
+  if (wraps.length === 0) return error("invalidSignerVault", "The signer vault has no wraps");
   return ok({ v: 1, wraps });
 };
 
 const wrapId = (w: SignerWrap): string => (w.type === "sk" ? "sk" : w.credId);
 
-/** App identity from the caller only (SPEC §5.2). */
-export const appIdForCaller = (caller: Caller, knownNsiteGateways: ReadonlyArray<string> = []): string => {
-  if (caller.identity === "connection") return `nip46:${caller.clientPubkey}`;
-  if ("androidPackage" in caller) return `android:${caller.androidPackage}`;
+const PACKAGE_NAME = /^[A-Za-z][\w]*(\.[A-Za-z][\w]*)+$/;
+const HEX_PUBKEY = /^[0-9a-f]{64}$/;
+
+/** App identity from the caller only (SPEC §5.2); insecure or malformed callers get none (#30). */
+export const appIdForCaller = (caller: Caller, knownNsiteGateways: ReadonlyArray<string> = []): Result<string, EvolustrError> => {
+  if (caller.identity === "connection") {
+    return HEX_PUBKEY.test(caller.clientPubkey) ? ok(`nip46:${caller.clientPubkey}`) : error("invalidCaller", "Bad client pubkey");
+  }
+  if ("androidPackage" in caller) {
+    return PACKAGE_NAME.test(caller.androidPackage) ? ok(`android:${caller.androidPackage}`) : error("invalidCaller", "Bad package name");
+  }
   return appIdFromOrigin(caller.origin, knownNsiteGateways);
 };
 
@@ -223,8 +237,11 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     await host.cache?.set(pubkey, secret);
   };
 
-  /** Unlocks M without a click if possible: cache, then the nsec. */
-  const unlockQuiet = async (pubkey: string): Promise<Result<boolean>> => {
+  /**
+   * Unlocks M without a click if possible: cache, then the nsec. Creates M only
+   * when `create` is set and no signer vault exists at all (#28, #29).
+   */
+  const unlockQuiet = async (pubkey: string, create: boolean): Promise<Result<boolean>> => {
     if (m !== null) return ok(true);
     const cached = await host.cache?.get(pubkey);
     if (cached != null && cached.length === MASTER_SECRET_LENGTH) {
@@ -244,7 +261,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
           return ok(true);
         }
       }
-      if (vault === null || vault.wraps.length === 0) {
+      if (vault === null && create) {
         // First use: create M and protect it with the nsec.
         const fresh = random(MASTER_SECRET_LENGTH);
         const published = await publish(pubkey, withWrap(vault, sealM(pubkey, signerSkWrapKey(sk), { type: "sk" }, fresh)));
@@ -282,7 +299,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
 
   const ensureM = async (): Promise<Result<{ readonly pubkey: string; readonly m: Bytes }>> => {
     const pubkey = await host.getPublicKey();
-    const quiet = await unlockQuiet(pubkey);
+    const quiet = await unlockQuiet(pubkey, true);
     if (!quiet.ok) return quiet;
     if (!quiet.value) {
       const viaPasskey = await unlockWithPasskey(pubkey);
@@ -292,33 +309,41 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   };
 
   const capabilities: EvolustrSigner["capabilities"] = async (caller) => {
+    const appId = appIdFor(caller);
+    if (!appId.ok) return appId;
     const pubkey = await host.getPublicKey();
-    if (m === null) await unlockQuiet(pubkey);
-    return {
+    if (m === null) await unlockQuiet(pubkey, false);
+    return ok({
       identity: caller.identity,
-      appId: appIdFor(caller),
-      signerId: m === null ? null : computeSignerId(m),
+      appId: appId.value,
+      signerId: m === null ? null : computeSignerId(m, appId.value),
       ready: m !== null,
       signerPasskey: (vault?.wraps ?? []).some((w) => w.type === "passkey"),
-    };
+    });
   };
 
   const getWrapKey: EvolustrSigner["getWrapKey"] = async (caller) => {
     const appId = appIdFor(caller);
-    const allowed = await host.ui.confirm({ kind: "appKey", appId, identity: caller.identity });
+    if (!appId.ok) return appId;
+    const allowed = await host.ui.confirm({ kind: "appKey", appId: appId.value, identity: caller.identity });
     if (!allowed) return error("userRefused", "The user didn't allow this app");
     const unlocked = await ensureM();
     if (!unlocked.ok) return unlocked;
-    return ok(signerAppKey(unlocked.value.m, appId));
+    return ok(signerAppKey(unlocked.value.m, appId.value));
   };
 
   const enrollPasskey: EvolustrSigner["enrollPasskey"] = async () => {
     const passkeys = host.passkeys;
     if (passkeys === undefined) return error("noPasskeys", "This signer has no passkey support");
     const pubkey = await host.getPublicKey();
-    const quiet = await unlockQuiet(pubkey);
+    const quiet = await unlockQuiet(pubkey, false);
     if (!quiet.ok) return quiet;
     if (!(await host.ui.confirm({ kind: "enrollPasskey" }))) return error("userRefused", "Cancelled");
+    // A signer vault already exists: unlock M first, never create a second one (#28).
+    if (m === null && vault !== null) {
+      const unlocked = await unlockWithPasskey(pubkey);
+      if (!unlocked.ok) return error("signerLocked", "Unlock this signer's existing Evolustr key before adding a passkey");
+    }
     await host.ui.requestGesture("enrollPasskey");
     let created;
     try {
@@ -338,7 +363,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
       prfOutput = (await passkeys.get({ allowCredIds: [created.credId], prfInput: signerPrfInput(pubkey) })).prfOutput;
     }
     if (prfOutput === null) return error("prfUnsupported", "The passkey gave no PRF output");
-    // A passthrough signer that has no M yet creates it now.
+    // Only when no signer vault exists at all: create M now.
     const secret = m ?? random(MASTER_SECRET_LENGTH);
     let next = withWrap(vault, sealM(pubkey, signerPasskeyWrapKey(prfOutput), { type: "passkey", rpId: passkeys.rpId, credId: created.credId }, secret));
     if (!allowSk) next = { v: 1, wraps: next.wraps.filter((w) => w.type !== "sk") };
@@ -351,7 +376,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   const handle: EvolustrSigner["handle"] = async (method, _params, caller) => {
     switch (method) {
       case "evolustr_capabilities":
-        return ok(await capabilities(caller));
+        return capabilities(caller);
       case "evolustr_get_wrap_key": {
         const key = await getWrapKey(caller);
         return key.ok ? ok(toBase64Url(key.value)) : key;

@@ -47,6 +47,7 @@ try {
   await page.waitForFunction(() => document.querySelector("#detail")?.textContent?.includes("passkey added"), null, { timeout: 15000 });
   assert(!(await page.locator("#strict").isDisabled()), "after adding a passkey, strict can be chosen");
 
+  page.once("dialog", (d) => d.accept());
   await page.click("#strict");
   await page.waitForFunction(() => document.querySelector("#level")?.textContent?.startsWith("strong"), null, { timeout: 20000 });
   assert(true, "make strict switches to a strong database");
