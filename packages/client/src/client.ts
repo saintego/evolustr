@@ -10,6 +10,7 @@ import {
   type Bytes,
   type EvolustrError,
   type Fetched,
+  type NostrEvent,
   type Relays,
   type Result,
   type Signer,
@@ -349,12 +350,28 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (f.kind === "none") return { kind: "none" };
     if (f.kind === "incomplete") return { kind: "unreadable" };
     lastEventAt = Math.max(lastEventAt, f.event.created_at);
+    lastFetched = { event: f.event, missingOn: f.missingOn };
     const v = readVaultEvent(ctx, f.event);
     return v.ok ? { kind: "found", vault: v.value } : { kind: "unreadable" };
   };
 
-  /** Publishes, merging with the relay version first when it holds the same S (superset rule). */
-  const publishVault = async (ctx: VaultContext, vault: Vault): Promise<Result<Vault>> => {
+  /** The newest vault event seen, and relays that answered without it (#32). */
+  let lastFetched: { readonly event: NostrEvent; readonly missingOn: ReadonlyArray<string> } | null = null;
+
+  /** Sends the current vault event to relays that lack it; no new signature needed. */
+  const rebroadcastVault = async (): Promise<void> => {
+    const f = lastFetched;
+    if (f === null || f.missingOn.length === 0) return;
+    await deps.relays.publish(f.missingOn, f.event, timeoutMs).catch(() => undefined);
+    lastFetched = { ...f, missingOn: [] };
+  };
+
+  /**
+   * Publishes, merging with the relay version first when it holds the same S
+   * (superset rule). With `requireAll` (rotations, #32), a relay that still
+   * refuses after a retry makes it fail with `partialPublish`.
+   */
+  const publishVault = async (ctx: VaultContext, vault: Vault, requireAll = false): Promise<Result<Vault>> => {
     let toPublish = vault;
     const current = await fetchVault(ctx);
     if (current.kind === "found" && current.vault.sHash === vault.sHash) {
@@ -364,12 +381,18 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       toPublish = { ...merged.value, mode: vault.mode, dataWraps: vault.dataWraps };
     }
     const at = Math.max(now(), lastEventAt + 1);
+    let failed: ReadonlyArray<string>;
     try {
-      await publishReplaceable(deps.relays, options.relayUrls, deps.signer, vaultEvent(ctx, toPublish, at), timeoutMs);
+      const published = await publishReplaceable(deps.relays, options.relayUrls, deps.signer, vaultEvent(ctx, toPublish, at), timeoutMs);
+      failed = published.failed;
+      lastFetched = { event: published.event, missingOn: failed };
     } catch (e) {
       return error("publishFailed", e instanceof Error ? e.message : String(e));
     }
     lastEventAt = at;
+    if (requireAll && failed.length > 0) {
+      return error("partialPublish", `Not every relay accepted the change (${failed.join(", ")}); it completes on the next connect`);
+    }
     return ok(toPublish);
   };
 
@@ -534,6 +557,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
 
   const connect: Evolustr["connect"] = async () => {
     const result = await connectInner();
+    if (result.ok && result.value.state === "ready") await rebroadcastVault();
     if (result.ok && result.value.state === "ready" && capable !== undefined) {
       await ensureSignerWrap();
       const st = status();
@@ -772,10 +796,11 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     }
     const next = downgradeVault(s.value.ctx, s.value.vault, { r: s.value.r, s: s.value.s, nip44Ct: ct });
     if (!next.ok) return next;
-    const published = await publishVault(s.value.ctx, next.value);
-    if (!published.ok) return published;
-    const ready = await becomeReady(s.value.ctx, published.value, s.value.s, s.value.r, s.value.unlockedWith, s.value.db);
-    return ready.ok ? ok(ready.value.status) : ready;
+    const published = await publishVault(s.value.ctx, next.value, true);
+    if (!published.ok && published.error.type !== "partialPublish") return published;
+    const ready = await becomeReady(s.value.ctx, published.ok ? published.value : next.value, s.value.s, s.value.r, s.value.unlockedWith, s.value.db);
+    if (!ready.ok) return ready;
+    return published.ok ? ok(ready.value.status) : published;
   };
 
   const createPasskey = async (ctx: VaultContext, vault: Vault | undefined): Promise<Result<CreatedPasskey>> => {
@@ -870,10 +895,16 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       const v = await s.value.db.getMeta(key);
       if (v !== null) await db.setMeta(key, v);
     }
-    const published = await publishVault(s.value.ctx, next.value);
-    if (!published.ok) {
+    const published = await publishVault(s.value.ctx, next.value, true);
+    if (!published.ok && published.error.type !== "partialPublish") {
       await db.deleteLocal();
       return published;
+    }
+    if (!published.ok) {
+      // Some relays have the strict vault: continue on S', but keep the old
+      // local database until every relay agrees (#32). connect() re-sends it.
+      const ready = await becomeReady(s.value.ctx, next.value, newS, s.value.r, s.value.unlockedWith, db);
+      return ready.ok ? published : ready;
     }
     await s.value.db.deleteLocal();
     const ready = await becomeReady(s.value.ctx, published.value, newS, s.value.r, s.value.unlockedWith, db);

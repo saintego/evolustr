@@ -18,7 +18,10 @@ const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
 export const poolRelays = (pool: SimplePool = new SimplePool()): Relays => ({
   query: async (urls, filter, timeoutMs) => {
     const events = new Map<string, NostrEvent>();
+    const idsByRelay = new Map<string, Set<string>>();
     const one = async (url: string): Promise<boolean> => {
+      const ids = new Set<string>();
+      idsByRelay.set(url, ids);
       try {
         const relay = await withTimeout(pool.ensureRelay(url, { connectionTimeout: timeoutMs }), timeoutMs);
         return await new Promise<boolean>((resolve) => {
@@ -34,7 +37,10 @@ export const poolRelays = (pool: SimplePool = new SimplePool()): Relays => ({
           };
           const sub = relay.subscribe([toNtFilter(filter)], {
             onevent: (e) => {
-              if (isValidEvent(e as NostrEvent)) events.set(e.id, e as NostrEvent);
+              if (isValidEvent(e as NostrEvent)) {
+                events.set(e.id, e as NostrEvent);
+                ids.add(e.id);
+              }
             },
             oneose: () => {
               settle(true);
@@ -56,6 +62,7 @@ export const poolRelays = (pool: SimplePool = new SimplePool()): Relays => ({
       events: [...events.values()],
       answered: results.filter(([, ok]) => ok).map(([u]) => u),
       failed: results.filter(([, ok]) => !ok).map(([u]) => u),
+      idsByRelay,
     };
   },
   publish: async (urls, event, timeoutMs) => {
@@ -104,8 +111,13 @@ export const memoryRelays = (opts: { readonly down?: Set<string> } = {}) => {
   const relays: Relays = {
     query: (urls, filter) => {
       const answered = urls.filter((u) => !down.has(u));
-      const events = answered.flatMap((u) => store(u).filter((e) => matchFilter(toNtFilter(filter), e as Parameters<typeof matchFilter>[1])));
-      return Promise.resolve({ events, answered, failed: urls.filter((u) => down.has(u)) });
+      const per = new Map(answered.map((u) => [u, store(u).filter((e) => matchFilter(toNtFilter(filter), e as Parameters<typeof matchFilter>[1]))] as const));
+      return Promise.resolve({
+        events: [...per.values()].flat(),
+        answered,
+        failed: urls.filter((u) => down.has(u)),
+        idsByRelay: new Map([...per].map(([u, es]) => [u, new Set(es.map((e) => e.id))])),
+      });
     },
     publish: (urls, event) => {
       const accepted = urls.filter((u) => !down.has(u) && isValidEvent(event));

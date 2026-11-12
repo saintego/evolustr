@@ -2,7 +2,13 @@ import { isValidEvent } from "./verify.ts";
 import type { NostrEvent, Relays, Signer, UnsignedEvent } from "./types.ts";
 
 export type FetchedEvent =
-  | { readonly kind: "found"; readonly event: NostrEvent; readonly complete: boolean }
+  | {
+      readonly kind: "found";
+      readonly event: NostrEvent;
+      readonly complete: boolean;
+      /** Relays that answered without this newest version; send it to them (#32). */
+      readonly missingOn: ReadonlyArray<string>;
+    }
   /** Every relay answered and none has the event. */
   | { readonly kind: "none" }
   /** No event found, but not every relay answered: don't treat it as missing. */
@@ -38,20 +44,29 @@ export const fetchReplaceable = async (
   );
   const event = newest(result.events.filter((e) => matches(e, address)));
   const complete = result.failed.length === 0;
-  if (event !== undefined) return { kind: "found", event, complete };
+  if (event !== undefined) {
+    const missingOn = result.idsByRelay === undefined ? [] : result.answered.filter((u) => !result.idsByRelay!.get(u)?.has(event.id));
+    return { kind: "found", event, complete, missingOn };
+  }
   return complete ? { kind: "none" } : { kind: "incomplete" };
 };
 
-/** Signs and publishes a replaceable event; succeeds if at least one relay accepts it. */
+/**
+ * Signs and publishes a replaceable event; succeeds if at least one relay
+ * accepts it. Relays that refused get one more try with the same signed event;
+ * `failed` lists those that still refused.
+ */
 export const publishReplaceable = async (
   relays: Relays,
   urls: ReadonlyArray<string>,
   signer: Signer,
   event: UnsignedEvent,
   timeoutMs = 5000,
-): Promise<{ readonly event: NostrEvent; readonly accepted: ReadonlyArray<string> }> => {
+): Promise<{ readonly event: NostrEvent; readonly accepted: ReadonlyArray<string>; readonly failed: ReadonlyArray<string> }> => {
   const signed = await signer.signEvent(event);
-  const result = await relays.publish(urls, signed, timeoutMs);
-  if (result.accepted.length === 0) throw new Error("No relay accepted the event");
-  return { event: signed, accepted: result.accepted };
+  const first = await relays.publish(urls, signed, timeoutMs);
+  const retry = first.failed.length === 0 ? { accepted: [], failed: [] } : await relays.publish(first.failed, signed, timeoutMs);
+  const accepted = [...first.accepted, ...retry.accepted];
+  if (accepted.length === 0) throw new Error("No relay accepted the event");
+  return { event: signed, accepted, failed: retry.failed };
 };

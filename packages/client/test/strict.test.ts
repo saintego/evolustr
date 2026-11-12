@@ -208,4 +208,22 @@ describe("client passkeys and strict mode", () => {
     await w.mem.relays.publish(URLS, await w.signer.signEvent({ kind: VAULT_KIND, created_at: w.now(), tags: before.tags, content: before.content }), 100);
     expect(unwrap(await d.make().connect())).toMatchObject({ state: "vaultChanged", reason: "replaced" });
   });
+
+  it("a rotation only counts when every relay took it; connect re-sends it later (#32)", async () => {
+    const w = world();
+    const d = w.device({ options: { relayUrls: ["wss://r1", "wss://r2"] } });
+    const a = d.make();
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    w.mem.down.add("wss://r2");
+    expect(await a.makeStrict()).toMatchObject({ ok: false, error: { type: "partialPublish" } });
+    expect(a.status()?.mode).toBe("strict"); // continues on the new secret
+    w.mem.down.delete("wss://r2");
+    const dTag = appVaultDTag(ra.pubkey, APP);
+    const onR2 = () => w.mem.store("wss://r2").filter((e) => e.tags.some((t) => t[1] === dTag));
+    expect(JSON.parse(onR2()[0]!.content).mode).toBe("compatible");
+    // The next connect sends the strict vault to the relay that missed it.
+    await connectReady(d.make());
+    expect(JSON.parse(onR2()[0]!.content).mode).toBe("strict");
+  });
 });

@@ -37,6 +37,8 @@ export interface QueryResult {
   readonly answered: ReadonlyArray<string>;
   /** Relays that failed or timed out. */
   readonly failed: ReadonlyArray<string>;
+  /** Event ids each answering relay returned, to find relays that lack the newest version. */
+  readonly idsByRelay?: ReadonlyMap<string, ReadonlySet<string>>;
 }
 
 export interface PublishResult {
