@@ -119,6 +119,8 @@ export interface ClientOptions {
    * signer click. Default false: R stays in memory for the session (#27).
    */
   readonly cacheRootKey?: boolean;
+  /** Called as connect and unlock move through their steps; relays can be slow. */
+  readonly onProgress?: (step: ProgressStep) => void;
 }
 
 export type UnlockMethod = "signer" | "passkey" | "nip44" | "recovery" | "cache" | "created";
@@ -136,6 +138,9 @@ export interface Status {
   readonly passkeySupported: boolean;
   readonly backupRecommended: boolean;
 }
+
+/** Steps of connect / unlock, for showing progress (`onProgress`). */
+export type ProgressStep = "lookingUpVault" | "creatingVault" | "publishingVault" | "openingDatabase";
 
 export interface UnlockInput {
   readonly recoveryPhrase?: string;
@@ -253,7 +258,7 @@ interface KnownMethod {
 export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolustr => {
   const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
   const random = deps.randomBytes ?? defaultRandomBytes;
-  const timeoutMs = options.timeoutMs ?? 5000;
+  const timeoutMs = options.timeoutMs ?? 3000;
   const clockMarginMs = options.clockMarginMs ?? 5 * 60_000;
   let session: Session = { kind: "none" };
   let lastEventAt = 0;
@@ -344,10 +349,10 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
 
   // ── Relay helpers ──
 
-  const fetchVault = async (ctx: VaultContext): Promise<Fetched> => {
+  const fetchVault = async (ctx: VaultContext, urls: ReadonlyArray<string> = options.relayUrls): Promise<Fetched> => {
     const f = await fetchReplaceable(
       deps.relays,
-      options.relayUrls,
+      urls,
       { author: ctx.pubkey, kind: VAULT_KIND, d: appVaultDTag(ctx.pubkey, ctx.appId) },
       timeoutMs,
     );
@@ -357,6 +362,16 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     lastFetched = { event: f.event, missingOn: f.missingOn };
     const v = readVaultEvent(ctx, f.event);
     return v.ok ? { kind: "found", vault: v.value } : { kind: "unreadable" };
+  };
+
+  /** Relays that accepted the last publish. */
+  let lastAccepted: ReadonlyArray<string> = [];
+  const progress = (step: ProgressStep) => {
+    try {
+      options.onProgress?.(step);
+    } catch {
+      /* the app's callback must not break connecting */
+    }
   };
 
   /** The newest vault event seen, and relays that answered without it (#32). */
@@ -375,9 +390,16 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
    * (superset rule). With `requireAll` (rotations, #32), a relay that still
    * refuses after a retry makes it fail with `partialPublish`.
    */
-  const publishVault = async (ctx: VaultContext, vault: Vault, requireAll = false): Promise<Result<Vault>> => {
+  const publishVault = async (
+    ctx: VaultContext,
+    vault: Vault,
+    requireAll = false,
+    /** What the caller just fetched; skips a second lookup. */
+    known?: Fetched,
+  ): Promise<Result<Vault>> => {
     let toPublish = vault;
-    const current = await fetchVault(ctx);
+    progress("publishingVault");
+    const current = known ?? (await fetchVault(ctx));
     if (current.kind === "found" && current.vault.sHash === vault.sHash) {
       const merged = mergeVaults(vault, current.vault);
       if (!merged.ok) return merged;
@@ -389,6 +411,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     try {
       const published = await publishReplaceable(deps.relays, options.relayUrls, deps.signer, vaultEvent(ctx, toPublish, at), timeoutMs);
       failed = published.failed;
+      lastAccepted = published.accepted;
       lastFetched = { event: published.event, missingOn: failed };
     } catch (e) {
       return error("publishFailed", e instanceof Error ? e.message : String(e));
@@ -425,6 +448,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     unlockedWith: UnlockMethod,
     db?: AppDatabase,
   ): Promise<Result<Ready>> => {
+    progress("openingDatabase");
     const database = db ?? (await deps.openDatabase(s));
     await database.setMeta(META_VAULT, serializeVault(vault));
     // R is the recovery phrase: kept in memory only, unless the app opts in (#27).
@@ -472,10 +496,12 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     }
     const vault = createCompatibleVault(ctx, { s, nip44Ct, now: now() });
     if (!vault.ok) return vault;
-    const published = await publishVault(ctx, vault.value);
+    progress("creatingVault");
+    const published = await publishVault(ctx, vault.value, false, { kind: "none" });
     if (!published.ok) return published;
-    // Create race (SPEC §6.2 rule 2): if another device created one first, use theirs.
-    const check = await fetchVault(ctx);
+    // Create race (SPEC §6.2 rule 2): if another device created one first, use
+    // theirs. Asking the relays that just answered is enough and doesn't wait on slow ones.
+    const check = await fetchVault(ctx, lastAccepted.length > 0 ? lastAccepted : options.relayUrls);
     if (check.kind === "found" && check.vault.sHash !== published.value.sHash && check.vault.created <= published.value.created) {
       return unlockFetched(ctx, check.vault, undefined);
     }
@@ -563,7 +589,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
 
   const connect: Evolustr["connect"] = async () => {
     const result = await connectInner();
-    if (result.ok && result.value.state === "ready") await rebroadcastVault();
+    // In the background: a slow relay must not delay opening the app.
+    if (result.ok && result.value.state === "ready") void rebroadcastVault();
     if (result.ok && result.value.state === "ready" && capable !== undefined) {
       await ensureSignerWrap();
       const st = status();
@@ -580,6 +607,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       return error("signerRefused", e instanceof Error ? e.message : String(e));
     }
     const ctx: VaultContext = { pubkey, appId: options.appId };
+    progress("lookingUpVault");
     passkeySupported = passkeys === undefined ? false : await passkeys.supported().catch(() => false);
     await refreshCaps();
     const cached = await deps.cache.get(pubkey, options.appId);
