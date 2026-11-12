@@ -182,7 +182,11 @@ export interface Evolustr {
   readonly enrollPasskey: () => Promise<Result<{ readonly done: boolean }>>;
   /** Second click when the authenticator returned no PRF output at creation. */
   readonly finishPasskeySetup: () => Promise<Result<Status>>;
-  /** User's choice: replaces S and drops the NIP-44 wrap (SPEC §3.2 rules 3–4, §3.4). */
+  /**
+   * User's choice: replaces S and drops the NIP-44 wrap (SPEC §3.2 rules 3–4, §3.4).
+   * Protects what is written afterwards; data written before stays as readable
+   * as it was. Tell the user before calling it (#31).
+   */
   readonly makeStrict: (opts?: { readonly acceptDeviceLoss?: boolean }) => Promise<Result<Status>>;
   /**
    * This database's Evolu mnemonic (12 words), to use the data with Evolu

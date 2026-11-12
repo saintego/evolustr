@@ -36,9 +36,9 @@ The user chooses one of two levels for each app's database:
 | Level | Who can read it | What the user needs on a new device |
 |---|---|---|
 | **Compatible** (default) | The user, and any app the user has allowed to *decrypt* with their signer. That's the same protection as Nostr direct messages. | Just their Nostr signer. |
-| **Strict** | Only the user. Other apps can't read it, even with signer permissions. | A passkey (synced by Apple, Google or a password manager), a signer that supports Evolustr, or the 12-word recovery phrase. |
+| **Strict** | Only the user, for everything written **after** the switch. Other apps can't read it, even with signer permissions. | A passkey (synced by Apple, Google or a password manager), a signer that supports Evolustr, or the 12-word recovery phrase. |
 
-Switching to strict is one action (`makeStrict()`). With a synced passkey it needs no extra step. With a passkey that lives on one device only, the user first saves the recovery phrase or adds a second passkey, because losing that one device would otherwise lose the data.
+Switching to strict is one action (`makeStrict()`). It protects what the user writes from then on. **Data written before the switch stays as readable as it was:** an app that had decrypt permission could have kept the old secret, and Evolu's relay keeps the old copy (Evolu can't delete it yet). So choose strict before storing anything sensitive. With a synced passkey it needs no extra step. With a passkey that lives on one device only, the user first saves the recovery phrase or adds a second passkey, because losing that one device would otherwise lose the data.
 
 ## Why use it (for Nostr developers)
 

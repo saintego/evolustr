@@ -227,6 +227,7 @@ $("passkey").onclick = async (e) => {
   if ($("error").textContent === "" && !$("detail").textContent?.includes("again")) $("detail").textContent += " · passkey added";
 };
 action("strict", async (c) => {
+  if (!confirm("Strict protects notes you write from now on. Notes written before stay as private as they were (any app you let decrypt with your signer could have kept the old key). Continue?")) return { ok: true };
   const r = await c.makeStrict();
   if (!r.ok && r.error.type === "backupRequired" && confirm(`${r.error.message}\n\nAccept losing these notes if you lose this device?`)) {
     return c.makeStrict({ acceptDeviceLoss: true });
