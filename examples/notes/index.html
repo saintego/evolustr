@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Evolustr Notes</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#fff; --fg:#1d1d1f; --muted:#6e6e73; --card:#f5f5f7; --accent:#0a66c2; --warn:#9a6700; --ok:#1a7f37; }
+    :root[data-theme="dark"] { --bg:#111; --fg:#f5f5f7; --muted:#a1a1a6; --card:#1c1c1e; --accent:#4c9aff; --warn:#d29922; --ok:#3fb950; }
+    @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#111; --fg:#f5f5f7; --muted:#a1a1a6; --card:#1c1c1e; --accent:#4c9aff; --warn:#d29922; --ok:#3fb950; } }
+    body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    main { max-width:640px; margin:0 auto; padding:24px 16px 48px; }
+    h1 { font-size:1.5rem; margin:0 0 4px; }
+    .muted { color:var(--muted); }
+    section { background:var(--card); border-radius:12px; padding:16px; margin:16px 0; }
+    button { font:inherit; padding:8px 14px; border-radius:8px; border:0; background:var(--accent); color:#fff; cursor:pointer; margin:4px 8px 4px 0; }
+    button:disabled { opacity:.5; cursor:default; }
+    input { font:inherit; padding:8px; border-radius:8px; border:1px solid var(--muted); background:var(--bg); color:var(--fg); width:100%; box-sizing:border-box; }
+    ul { padding-left:20px; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:.85rem; background:var(--bg); }
+    .weak { color:var(--warn); } .strong { color:var(--ok); }
+    #phrase { font-family:ui-monospace, Menlo, monospace; word-spacing:.3em; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Evolustr Notes</h1>
+    <p class="muted">A demo of <code>@evolustr/client</code>: your notes in Evolu, opened with your Nostr login.</p>
+    <section id="session"><button id="connect">Connect</button> <span id="state" class="muted">Not connected</span></section>
+    <section id="actions" hidden>
+      <div>Level: <span id="level" class="badge"></span> <span id="detail" class="muted"></span></div>
+      <button id="unlock" hidden>Unlock</button>
+      <button id="usePhrase" hidden>Use recovery phrase</button>
+      <button id="passkey">Add passkey</button>
+      <button id="strict">Make strict</button>
+      <button id="downgrade">Turn strict off</button>
+      <button id="showPhrase">Show recovery phrase</button>
+      <button id="exportEvolu">Export Evolu phrase</button>
+      <button id="theme">Toggle theme for all apps</button>
+      <button id="logout">Log out</button>
+      <p id="phrase" hidden></p>
+    </section>
+    <section id="notes" hidden>
+      <form id="add"><input id="text" placeholder="Write a note and press Enter" maxlength="1000"></form>
+      <ul id="list"></ul>
+    </section>
+    <p id="error" class="weak" role="alert"></p>
+  </main>
+  <script type="module" src="./src/main.ts"></script>
+</body>
+</html>

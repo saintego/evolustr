@@ -1,0 +1,22 @@
+{
+  "name": "evolustr-monorepo",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "npm run build -w @evolustr/core -w @evolustr/client -w @evolustr/signer -w @evolustr/react -w @evolustr/rn"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.18.2",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0",
+    "ws": "^8.18.3"
+  }
+}
