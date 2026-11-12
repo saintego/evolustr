@@ -1,26 +1,32 @@
 name: Publish to npm
-# Manual: Actions → Publish to npm → Run workflow. Needs the NPM_TOKEN secret.
+# Manual: Actions → Publish to npm → Run workflow.
+# Uses npm trusted publishing (OIDC): no long-lived token. One-time setup in #21:
+# add this repository and workflow as a trusted publisher for each package on
+# npmjs.com, and create the protected "npm" environment (Settings → Environments).
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@11
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
       - run: npm publish --provenance -w @evolustr/core -w @evolustr/client -w @evolustr/signer -w @evolustr/react -w @evolustr/rn
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

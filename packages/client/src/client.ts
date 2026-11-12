@@ -522,7 +522,9 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       if (s.ok) {
         const db = await deps.openDatabase(s.value);
         if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
-        return withReady(becomeReady(ctx, vault, s.value, local?.r, "nip44", db));
+        // Keep a cached R only if it really opens this vault (#33).
+        const r = local?.r !== undefined && openRootData(ctx, vault, local.r).ok ? local.r : undefined;
+        return withReady(becomeReady(ctx, vault, s.value, r, "nip44", db));
       }
       if (s.error.type === "signerRefused") return s;
     }
