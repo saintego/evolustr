@@ -107,7 +107,7 @@ describe("client, compatible mode", () => {
 
   it("a replaced vault is detected by a device with R and the copy is republished", async () => {
     const w = world();
-    const d = w.device();
+    const d = w.device({ cacheRootKey: true });
     const a = d.make();
     const ra = await ready(a);
     await a.showRecoveryPhrase();

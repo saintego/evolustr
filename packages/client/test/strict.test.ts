@@ -114,7 +114,7 @@ describe("client passkeys and strict mode", () => {
     await connectReady(a);
     await a.enrollPasskey();
     // Device C opens the vault with the synced passkey (so it has R), then goes offline.
-    const c = w.device();
+    const c = w.device({ options: { cacheRootKey: true } });
     const cc = c.make();
     const rc = await connectReady(cc);
     unwrap(await cc.unlockRoot());
@@ -161,7 +161,7 @@ describe("client passkeys and strict mode", () => {
 
   it("a replayed pre-strict vault doesn't undo strict mode on a device with R (#25)", async () => {
     const w = world();
-    const d = w.device();
+    const d = w.device({ options: { cacheRootKey: true } });
     const a = d.make();
     const ra = await connectReady(a);
     await a.enrollPasskey();
@@ -191,5 +191,21 @@ describe("client passkeys and strict mode", () => {
     // Apps that never offer strict mode can turn the prompt off.
     const c = w.device({ options: { confirmWeakOnNewDevice: false } }).make();
     expect(unwrap(await c.connect()).state).toBe("ready");
+  });
+
+  it("R isn't cached by default; a replay is still refused using the local copy (#27)", async () => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    const before = (await w.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [appVaultDTag(ra.pubkey, APP)] }, 100)).events[0]!;
+    await a.makeStrict();
+    const cached = await d.cache.get(ra.pubkey, APP);
+    expect(cached?.s).toBeDefined();
+    expect(cached?.r).toBeUndefined();
+    w.tick(1000);
+    await w.mem.relays.publish(URLS, await w.signer.signEvent({ kind: VAULT_KIND, created_at: w.now(), tags: before.tags, content: before.content }), 100);
+    expect(unwrap(await d.make().connect())).toMatchObject({ state: "vaultChanged", reason: "replaced" });
   });
 });

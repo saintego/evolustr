@@ -112,6 +112,12 @@ export interface ClientOptions {
    * the app never offers strict mode.
    */
   readonly confirmWeakOnNewDevice?: boolean;
+  /**
+   * Also keep the root key R (the recovery phrase) in the device cache, so a
+   * reload can follow rotations and add strong methods without a passkey or
+   * signer click. Default false: R stays in memory for the session (#27).
+   */
+  readonly cacheRootKey?: boolean;
 }
 
 export type UnlockMethod = "signer" | "passkey" | "nip44" | "recovery" | "cache" | "created";
@@ -394,7 +400,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   ): Promise<Result<Ready>> => {
     const database = db ?? (await deps.openDatabase(s));
     await database.setMeta(META_VAULT, serializeVault(vault));
-    await deps.cache.set(ctx.pubkey, ctx.appId, r === undefined ? { s } : { s, r });
+    // R is the recovery phrase: kept in memory only, unless the app opts in (#27).
+    await deps.cache.set(ctx.pubkey, ctx.appId, r === undefined || options.cacheRootKey !== true ? { s } : { s, r });
     const next: Unlocked = { kind: "ready", ctx, vault, s, db: database, unlockedWith, ...(r === undefined ? {} : { r }) };
     session = next;
     settingsState = { app: await readDoc(database, META_APP_SETTINGS), shared: await readDoc(database, META_SHARED_SETTINGS) };
@@ -708,7 +715,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!r.ok) return r;
     const check = openRootData(s.value.ctx, s.value.vault, r.value);
     if (!check.ok) return error("wrongPhrase", "This recovery phrase doesn't belong to this app's data");
-    await deps.cache.set(s.value.ctx.pubkey, s.value.ctx.appId, { s: s.value.s, r: r.value });
+    if (options.cacheRootKey === true) await deps.cache.set(s.value.ctx.pubkey, s.value.ctx.appId, { s: s.value.s, r: r.value });
     const next: Unlocked = { ...s.value, r: r.value };
     session = next;
     return ok(statusOf(next));

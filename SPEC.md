@@ -401,7 +401,7 @@ A `compatible` vault that has no `R` yet has empty `rootWraps` and only the `nip
 3. **Adding a wrap:** fetch, add the wrap (wraps are keyed by `signerId` / `credId`, so concurrent additions merge), publish, fetch again to check. Never drop a wrap without an explicit user action. `makeStrict()` and `downgrade()` are such actions.
 4. **Self-healing:** after unlocking, re-add your own wrap if a concurrent update dropped it. Never re-add `nip44` to a `strict` vault (§3.2 rule 5).
 5. **Keep a copy in Evolu:** after a successful unlock, store the vault event in the app database itself (table `evolustr_meta`, key `vault`). It lives in that `(pubkey, appId)` database only (§2), and Evolu syncs it, so every device that has the database also has the last good vault (§6.3).
-6. **Device cache:** Evolu needs `S` every time the app starts (§2), so a device caches the unlocked `S`, and may cache `R`, for its `(pubkey, appId)`: in device-local storage on the web, in secure storage on mobile. `logout()` removes both; `logout({ deleteLocalData: true })` also deletes the local database.
+6. **Device cache:** Evolu needs `S` every time the app starts (§2), so a device caches the unlocked `S` for its `(pubkey, appId)`: on the web encrypted with a non-extractable WebCrypto key kept in IndexedDB, on mobile in secure storage. `R` is the recovery phrase and survives every rotation, so it stays **in memory** for the session unless the app opts in (`cacheRootKey`). Without a cached `R`, a device still recognises replays and strict-to-weak swaps from its local vault copy (§6.3). `logout()` removes both; `logout({ deleteLocalData: true })` also deletes the local database.
 
 ### 6.3 Checking a fetched vault
 

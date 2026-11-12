@@ -21,7 +21,7 @@ import {
   detectCapableSigner,
   evoluDatabases,
   evolustrSchema,
-  keyValueCache,
+  webSecretCache,
   type WithEvolustr,
 } from "@evolustr/client";
 import {
@@ -161,7 +161,7 @@ $("connect").onclick = async () => {
       signer,
       relays: poolRelays(),
       openDatabase: databases.open,
-      cache: keyValueCache(localStorage),
+      cache: webSecretCache(),
       passkeys: webauthnPasskeys({ rpName: "Evolustr Notes" }),
       capableSigner: detectCapableSigner((window as unknown as { nostr?: unknown }).nostr),
     },
