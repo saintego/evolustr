@@ -43,8 +43,14 @@ const Schema = {
 type AppSchema = WithEvolustr<typeof Schema>;
 
 const params = new URLSearchParams(location.search);
-const relayUrls = (params.get("relays") ?? "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net").split(",");
-const appId = appIdFromOrigin(location.origin, ["nsite.lol"]);
+const DEFAULT_RELAYS = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"];
+// ?relays= only works on localhost (for tests): on the public demo a crafted
+// link could otherwise point it at relays that hold back newer vaults (#33).
+const isLocal = ["localhost", "127.0.0.1"].includes(location.hostname);
+const relayUrls = isLocal && params.get("relays") ? params.get("relays")!.split(",") : DEFAULT_RELAYS;
+const appIdResult = appIdFromOrigin(location.origin, ["nsite.lol"]);
+if (!appIdResult.ok) document.body.textContent = `This page can't keep app data: ${appIdResult.error.message}`;
+const appId = appIdResult.ok ? appIdResult.value : "";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const show = (id: string, visible: boolean) => ($(id).hidden = !visible);
@@ -161,7 +167,7 @@ $("connect").onclick = async () => {
     },
     { appId, relayUrls },
   );
-  $("state").textContent = `Connecting with ${label}…`;
+  $("state").textContent = `Connecting with ${label} via ${relayUrls.join(", ")}…`;
   const r = await client.connect();
   if (!r.ok) return fail(r.error.message);
   await handle(r.value);

@@ -283,15 +283,22 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   const ensureSignerWrap = async (): Promise<void> => {
     if (session.kind !== "ready" || capable === undefined) return;
     const s = session;
-    const c = caps;
-    if (c === null || !c.ready || c.signerId === null || signerWrapFor(s.vault, c.signerId) !== undefined) return;
+    let c = caps;
+    if (c === null) return;
+    if (c.ready && c.signerId !== null && signerWrapFor(s.vault, c.signerId) !== undefined) return;
+    // A locked signer that needs a passkey click isn't asked here; the user adds it later.
+    if (!c.ready && c.signerPasskey) return;
     if (s.r === undefined && hasRootKey(s.vault)) return; // nip44-only device: can't add (SPEC §3.1)
     let key: Bytes;
     try {
+      // Asks the user to allow this app; a new signer creates its key here (#29).
       key = await capable.getWrapKey();
     } catch {
       return;
     }
+    c = await refreshCaps();
+    if (c === null || c.signerId === null || signerWrapFor(s.vault, c.signerId) !== undefined) return;
+    const signerIdNow = c.signerId;
     let vault = s.vault;
     const r = s.r ?? random(ROOT_KEY_LENGTH);
     if (s.r === undefined) {
@@ -299,11 +306,11 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       if (!withRoot.ok) return;
       vault = withRoot.value;
     }
-    const added = addRootWrap(vault, signerRootWrap(s.ctx, key, c.signerId, r));
+    const added = addRootWrap(vault, signerRootWrap(s.ctx, key, signerIdNow, r));
     if (!added.ok) return;
     const published = await publishVault(s.ctx, added.value);
     if (!published.ok) return;
-    await rememberMethod(s.db, { id: `signer:${c.signerId}`, method: { kind: "signer", recoverable: true } });
+    await rememberMethod(s.db, { id: `signer:${signerIdNow}`, method: { kind: "signer", recoverable: true } });
     await becomeReady(s.ctx, published.value, s.s, r, s.unlockedWith, s.db);
   };
 

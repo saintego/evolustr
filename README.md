@@ -74,11 +74,12 @@ import { createEvolustr, detectCapableSigner, evoluDatabases, keyValueCache } fr
 import { appIdFromOrigin, nip07Signer, poolRelays, webauthnPasskeys } from "@evolustr/core";
 
 const Schema = { note: { id: id("Note"), text: NonEmptyTrimmedString1000 } };
-const appId = appIdFromOrigin(location.origin, ["nsite.lol"]);
+const appId = appIdFromOrigin(location.origin, ["nsite.lol"]); // a Result: https: (or http: on localhost) only
+if (!appId.ok) throw new Error(appId.error.message);
 const run = createRun(createEvoluDeps());
 
 const databases = evoluDatabases({
-  appId,
+  appId: appId.value,
   schema: Schema,
   createEvolu: ({ schema, appOwner, appName }) =>
     run.ok(createEvolu(schema, {
@@ -97,7 +98,7 @@ const evolustr = createEvolustr(
     passkeys: webauthnPasskeys({ rpName: "My App" }),
     capableSigner: detectCapableSigner(window.nostr), // optional
   },
-  { appId, relayUrls: ["wss://relay.damus.io", "wss://nos.lol"] },
+  { appId: appId.value, relayUrls: ["wss://relay.damus.io", "wss://nos.lol"] },
 );
 
 const result = await evolustr.connect(); // never prompts for a passkey
