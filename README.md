@@ -1,8 +1,6 @@
 # Evolustr
 
-Log in with Nostr, get your app's private [Evolu](https://www.evolu.dev) database on every device.
-
-Evolustr connects a Nostr identity (any NIP-07 extension, NIP-46 bunker or NIP-55 signer) to a local-first, end-to-end encrypted Evolu database. The secret that opens the database is kept in an encrypted Nostr event, so a user who logs in on a new device gets their data without copying 12 words around. There is no backend.
+Log in with Nostr, and your app's private data is on every device you use.
 
 > [!WARNING]
 > **EARLY ALPHA: DON'T USE IT FOR DATA YOU CAN'T AFFORD TO LOSE**
@@ -14,16 +12,48 @@ Evolustr connects a Nostr identity (any NIP-07 extension, NIP-46 bunker or NIP-5
 >
 > The design is in [SPEC.md](SPEC.md).
 
-## How private is it?
+## In plain words
 
-Each app database has a level, and the **user** chooses it:
+- **Nostr** gives a user one identity (a key pair) that works across many apps. A *signer* (a browser extension like Alby, a phone app like Amber, or a remote "bunker") keeps the private key, and apps ask it to sign or encrypt things.
+- **[Evolu](https://www.evolu.dev)** is a database that lives on the user's own devices. It works offline, and syncs between those devices through a relay that only ever sees encrypted data.
+- **The gap:** an Evolu database is opened by a secret, which Evolu shows as 12 words. Without help, users would have to write those words down and type them on every new device.
+- **Evolustr** stores that secret, encrypted, as a Nostr event. When the user logs in with Nostr on another device, Evolustr finds the event, has it decrypted, and opens the same database. There is no server of yours involved.
 
-| Level | What protects the data | Works with |
+## How it works
+
+1. The user logs in with their Nostr signer.
+2. Evolustr looks for this app's *vault* event on Nostr relays. The vault holds the database secret, encrypted.
+3. **First time anywhere:** Evolustr creates a new random secret, encrypts it, and publishes the vault.
+4. **On another device:** Evolustr fetches the vault, the signer decrypts it (the user may see a prompt), and Evolu opens the database. Evolu then syncs the data from its relay.
+5. The device remembers the secret, so the next start opens without prompts. "Log out" forgets it.
+
+Each app gets its own database. Apps can also share a few harmless preferences, such as dark mode or language, through one shared settings event.
+
+## Who can read the data?
+
+The user chooses one of two levels for each app's database:
+
+| Level | Who can read it | What the user needs on a new device |
 |---|---|---|
-| **Compatible** (default) | Your Nostr signer (NIP-44 encryption). **As private as your Nostr DMs:** an app you let decrypt with your signer could read it. | Every signer, every device, nothing to set up. |
-| **Strict** | A passkey on the app's domain, or an Evolustr-capable signer, plus a 12-word recovery phrase. Other apps can't read it, even with signer permissions. | Browsers with passkey PRF (Chrome, Android, …), or a capable signer. |
+| **Compatible** (default) | The user, and any app the user has allowed to *decrypt* with their signer. That's the same protection as Nostr direct messages. | Just their Nostr signer. |
+| **Strict** | Only the user. Other apps can't read it, even with signer permissions. | A passkey (synced by Apple, Google or a password manager), a signer that supports Evolustr, or the 12-word recovery phrase. |
 
-Making a database strict is a single action (`makeStrict()`); the data moves to a new secret. Synced passkeys (iCloud Keychain, Google Password Manager) need no extra backup step; device-bound ones ask for the recovery phrase first.
+Switching to strict is one action (`makeStrict()`). With a synced passkey it needs no extra step. With a passkey that lives on one device only, the user first saves the recovery phrase or adds a second passkey, because losing that one device would otherwise lose the data.
+
+## Why use it (for Nostr developers)
+
+- **Private app data next to a public identity.** Settings, drafts, notes, bookmarks, app state: things that shouldn't be public events, available on every device the user logs in from.
+- **A real database instead of encrypted events.** You could store everything in NIP-44-encrypted events (kind 30078). That works for a little data. Evolu gives you SQL queries, offline use, conflict-free merging when two devices edit at once, and efficient sync of many small changes.
+- **No backend to run.** Vaults live on Nostr relays, data on Evolu's relay (theirs or one you host). It works on static hosting and nsites.
+- **Any signer works.** Signers that implement the Evolustr Signer API, and passkeys, make strict mode smoother; see [docs/signer-integration.md](docs/signer-integration.md).
+
+## What it doesn't do
+
+- **It isn't a backup.** The data lives on the user's devices and on the Evolu relay. A relay can go away. Keep backups of anything important.
+- **It doesn't hide which apps a user uses.** Vault events are public. Their names are hashed, which stops anyone from listing all users of an app at once, but not from checking one user against a list of known apps.
+- **Compatible mode trusts every app the user lets decrypt.** If that isn't acceptable for your data, require strict mode (`requireStrong`).
+- **Strict mode can lock users out.** If they lose every passkey, the signer that holds their key and the recovery phrase, the data is gone. Nobody can recover it, including you.
+- **It isn't audited**, and the format may still change (see the warning above).
 
 ## Packages
 
@@ -82,7 +112,8 @@ Every method returns a `Result` (`{ ok: true, value }` or `{ ok: false, error }`
 
 ### Things to know
 
-- **Same app, new device:** compatible databases open with one decrypt prompt; strict ones with a synced passkey, a capable signer, or the recovery phrase.
+- **Same app, new device:** compatible databases open after one confirmation (`needsUserAction: "confirmWeak"`, so the user notices if a strict database was swapped for a weak one) and a decrypt prompt; strict ones with a synced passkey, a capable signer, or the recovery phrase.
+- **Leaving Evolustr:** `exportEvoluMnemonic()` gives the database's own Evolu phrase, which opens the data in any Evolu app without Nostr. Anyone with it can read and change the data.
 - **nsite:** pass the gateways you trust to `appIdFromOrigin`, so `<npub>.gateway` maps to one app on every gateway. A passkey on one gateway doesn't work on another (WebAuthn binds passkeys to the domain); a capable signer does.
 - **Migration resets `createdAt`:** when a database becomes strict, rows are copied to a new Evolu owner and get new `createdAt` / `updatedAt` values. Keep your own `created` column if you show creation dates.
 - **Evolu reloads the page** when a local database is deleted unless you pass `onDatabaseDeleted`.
