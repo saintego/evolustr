@@ -65,8 +65,11 @@ export const publishReplaceable = async (
 ): Promise<{ readonly event: NostrEvent; readonly accepted: ReadonlyArray<string>; readonly failed: ReadonlyArray<string> }> => {
   const signed = await signer.signEvent(event);
   const first = await relays.publish(urls, signed, timeoutMs);
-  const retry = first.failed.length === 0 ? { accepted: [], failed: [] } : await relays.publish(first.failed, signed, timeoutMs);
+  // Retry relays that refused quickly; one that timed out would just time out again.
+  const timedOut = new Set(first.timedOut ?? []);
+  const toRetry = first.failed.filter((u) => !timedOut.has(u));
+  const retry = toRetry.length === 0 ? { accepted: [], failed: [] } : await relays.publish(toRetry, signed, timeoutMs);
   const accepted = [...first.accepted, ...retry.accepted];
   if (accepted.length === 0) throw new Error("No relay accepted the event");
-  return { event: signed, accepted, failed: retry.failed };
+  return { event: signed, accepted, failed: [...first.failed.filter((u) => timedOut.has(u)), ...retry.failed] };
 };

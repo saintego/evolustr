@@ -70,6 +70,11 @@ const pickSigner = (): { signer: Signer; label: string } => {
 
 const evoluDeps = createEvoluDeps();
 const run = createRun(evoluDeps);
+// Show Evolu's own errors (database refused, worker failed, ...) instead of hanging silently.
+evoluDeps.evoluError.subscribe(() => {
+  const e = evoluDeps.evoluError.get();
+  if (e !== null) fail(`Evolu: ${JSON.stringify(e).slice(0, 300)}`);
+});
 const databases = evoluDatabases({
   appId,
   schema: Schema,
@@ -150,7 +155,35 @@ const handle = async (result: ConnectResult) => {
     show("usePhrase", true);
     return;
   }
-  $("state").textContent = `Your vault changed (${result.reason}). Options: ${result.options.join(", ")}`;
+  const reasons = {
+    replaced: "Your notes' vault on the relays was replaced by something this device doesn't trust.",
+    ambiguous: "Your notes' vault on the relays changed, and this device can't verify the change.",
+    missing: "Your notes' vault wasn't found, or not every relay answered.",
+  } as const;
+  const labels = {
+    republishCopy: "Restore this device's copy",
+    followRelay: "Use the version on the relays",
+    restorePhrase: "Use recovery phrase",
+    startNew: "Start new notes",
+  } as const;
+  $("state").textContent = reasons[result.reason];
+  $("choices").replaceChildren(
+    ...result.options.map((choice) => {
+      const b = document.createElement("button");
+      b.textContent = labels[choice];
+      b.onclick = async () => {
+        if (client === null) return;
+        if (choice === "startNew" && !confirm("Start a new, empty notes database? If you have notes elsewhere, they won't be here.")) return;
+        const phrase = choice === "restorePhrase" ? prompt("Recovery phrase (12 words)") : null;
+        if (choice === "restorePhrase" && phrase === null) return;
+        const r = await client.resolveVaultChange(choice, phrase === null ? undefined : { recoveryPhrase: phrase });
+        if (!r.ok) return fail(r.error.message);
+        $("choices").replaceChildren();
+        await becameReady();
+      };
+      return b;
+    }),
+  );
 };
 
 $("connect").onclick = async () => {
@@ -165,7 +198,19 @@ $("connect").onclick = async () => {
       passkeys: webauthnPasskeys({ rpName: "Evolustr Notes" }),
       capableSigner: detectCapableSigner((window as unknown as { nostr?: unknown }).nostr),
     },
-    { appId, relayUrls },
+    {
+      appId,
+      relayUrls,
+      onProgress: (step) => {
+        const text = {
+          lookingUpVault: "Looking up your notes' vault on the relays…",
+          creatingVault: "First time: creating your notes' vault…",
+          publishingVault: "Saving the vault to the relays (a slow relay can take a few seconds)…",
+          openingDatabase: "Opening your notes…",
+        } as const;
+        $("state").textContent = text[step];
+      },
+    },
   );
   $("state").textContent = `Connecting with ${label} via ${relayUrls.join(", ")}…`;
   const r = await client.connect();

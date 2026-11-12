@@ -71,15 +71,17 @@ export const poolRelays = (pool: SimplePool = new SimplePool()): Relays => ({
         try {
           const relay = await withTimeout(pool.ensureRelay(url, { connectionTimeout: timeoutMs }), timeoutMs);
           await withTimeout(relay.publish(event as Parameters<typeof relay.publish>[0]), timeoutMs);
-          return [url, true] as const;
-        } catch {
-          return [url, false] as const;
+          return [url, "ok"] as const;
+        } catch (e) {
+          // Ours ("timeout") or nostr-tools' own ("publish timed out", "connection timed out").
+          return [url, /time(d)?\s?out/i.test(e instanceof Error ? e.message : String(e)) ? "timeout" : "error"] as const;
         }
       }),
     );
     return {
-      accepted: results.filter(([, ok]) => ok).map(([u]) => u),
-      failed: results.filter(([, ok]) => !ok).map(([u]) => u),
+      accepted: results.filter(([, r]) => r === "ok").map(([u]) => u),
+      failed: results.filter(([, r]) => r !== "ok").map(([u]) => u),
+      timedOut: results.filter(([, r]) => r === "timeout").map(([u]) => u),
     };
   },
 });

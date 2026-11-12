@@ -44,6 +44,8 @@ export interface QueryResult {
 export interface PublishResult {
   readonly accepted: ReadonlyArray<string>;
   readonly failed: ReadonlyArray<string>;
+  /** Failed relays that didn't answer in time; retrying them right away only adds waiting. */
+  readonly timedOut?: ReadonlyArray<string>;
 }
 
 /** Relay access behind an interface, so tests can use an in-memory fake. */
