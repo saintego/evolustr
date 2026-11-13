@@ -129,6 +129,8 @@ Another app's site can't ask your passkey for this secret. That's what makes str
 
 If the signer protects M with the nsec, anyone holding the nsec can rebuild M and every app key. `status.dependsOnNsec` tells you when that's the case.
 
+**More than one signer.** Each signer product has its own M, kept in its own signer vault: a browser extension, Amber and nostr-shard-signer don't share one, and can't read each other's. You don't depend on one of them, because the app's vault holds **one root wrap per signer**, next to the passkeys. Each wrap opens the same R, so any one of them unlocks the database. The catch: each signer has to be added once, on a device where R is already unlocked (by another signer, a passkey or the phrase). A signer that was never added can't help, so the app should offer "add this signer" when a new capable signer appears. Different installations of the *same* signer (say, the extension on two computers) share one M through its signer vault, so they count as one.
+
 ### The recovery phrase
 
 The phrase **is** R, written as 12 words (the same word list Bitcoin wallets use). Typing it gives R directly, which opens S through the `root` data wrap. It needs no device, no passkey and no signer, which is why users should keep it safe.
@@ -155,7 +157,18 @@ When something doesn't add up, the client never silently follows. It returns `va
 
 ## Common questions
 
-**Why not derive S from the user's nsec or a signature?** Most signers never reveal the nsec, and Nostr signatures differ every time you sign the same thing, so they can't produce a stable secret. Any app the user lets sign could also ask for the same signature.
+**Why not compute S instead of storing it, e.g. from the nsec or a signature?** Most signers never reveal the nsec, and Nostr signatures differ every time you sign the same thing, so they can't produce a stable secret. Any app the user lets sign could also ask for the same signature.
+
+**Why not S = NIP-44 encryption of "1" (or "2", "3" after a rotation)?** NIP-44 also picks a random nonce on every call, so encrypting "1" twice gives two different results: there's nothing stable to use as S. Standard signers offer no operation that gives the same secret output twice.
+
+**A capable signer can derive a stable key from M and the app. Why not use that as S directly, with no vault?** For one user with one signer it would work, but:
+
+- **S would belong to that signer.** Another signer (extension vs. Amber) has a different M and would produce a different S, so the user could never switch signers or use two. A passkey couldn't open the database either; its PRF output is a different number again.
+- **Compatible mode would be impossible**: standard signers can't derive anything stable, so they'd have no way in.
+- **Rotation needs a counter.** Making a database strict means a new S ("path 2"). Every device must learn that "2" is current, so the counter has to be stored somewhere, which is a vault again.
+- **No recovery phrase independent of the signer.** Losing the signer, or its M, would lose the data.
+
+The vault is what lets several independent keys (passkeys, signers, the phrase, the NIP-44 copy) all open the same S. Deriving keys from M and the app is still used, just one step earlier: it produces the key that opens that signer's root wrap.
 
 **Can the Evolu relay or the Nostr relays read my data?** No. Evolu's relay stores data encrypted with S; Nostr relays store sealed envelopes.
 
