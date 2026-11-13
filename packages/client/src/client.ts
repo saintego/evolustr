@@ -364,6 +364,9 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     return v.ok ? { kind: "found", vault: v.value } : { kind: "unreadable" };
   };
 
+  /** A vault to publish in the background once connect is ready (self-heal, #37). */
+  let healAfterConnect: Vault | null = null;
+
   /** Relays that accepted the last publish. */
   let lastAccepted: ReadonlyArray<string> = [];
   const progress = (step: ProgressStep) => {
@@ -396,12 +399,16 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     requireAll = false,
     /** What the caller just fetched; skips a second lookup. */
     known?: Fetched,
+    /** R, when the caller knows it and the session doesn't yet. */
+    rootKey?: Bytes,
   ): Promise<Result<Vault>> => {
     let toPublish = vault;
     progress("publishingVault");
     const current = known ?? (await fetchVault(ctx));
     if (current.kind === "found" && current.vault.sHash === vault.sHash) {
-      const merged = mergeVaults(vault, current.vault);
+      // The local version wins on the same wrap id; with R, forged wraps are dropped (#37).
+      const sessionR = rootKey ?? (session.kind === "ready" && session.ctx.appId === ctx.appId ? session.r : undefined);
+      const merged = mergeVaults(vault, current.vault, { ctx, r: sessionR });
       if (!merged.ok) return merged;
       // A local downgrade or upgrade decides the mode; merging only adds wraps.
       toPublish = { ...merged.value, mode: vault.mode, dataWraps: vault.dataWraps };
@@ -442,14 +449,26 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   /** Opens the database for S, keeps the vault copy and the cache, and becomes ready. */
   const becomeReady = async (
     ctx: VaultContext,
-    vault: Vault,
+    vaultIn: Vault,
     s: Bytes,
     r: Bytes | undefined,
     unlockedWith: UnlockMethod,
     db?: AppDatabase,
   ): Promise<Result<Ready>> => {
     progress("openingDatabase");
+    let vault = vaultIn;
     const database = db ?? (await deps.openDatabase(s));
+    // With R known, drop root wraps whose tag doesn't verify, and put the
+    // cleaned vault back on the relays in the background (#37).
+    if (r !== undefined) {
+      const pruned = mergeVaults(vault, vault, { ctx, r });
+      if (pruned.ok && pruned.value.rootWraps.length !== vault.rootWraps.length) {
+        vault = pruned.value;
+        const cleaned = vault;
+        const rootKey = r;
+        queueMicrotask(() => void publishVault(ctx, cleaned, false, undefined, rootKey).catch(() => undefined));
+      }
+    }
     await database.setMeta(META_VAULT, serializeVault(vault));
     // R is the recovery phrase: kept in memory only, unless the app opts in (#27).
     await deps.cache.set(ctx.pubkey, ctx.appId, r === undefined || options.cacheRootKey !== true ? { s } : { s, r });
@@ -590,7 +609,12 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   const connect: Evolustr["connect"] = async () => {
     const result = await connectInner();
     // In the background: a slow relay must not delay opening the app.
-    if (result.ok && result.value.state === "ready") void rebroadcastVault();
+    if (result.ok && result.value.state === "ready") {
+      const heal = healAfterConnect;
+      healAfterConnect = null;
+      if (heal !== null && session.kind === "ready") void publishVault(session.ctx, heal).catch(() => undefined);
+      else void rebroadcastVault();
+    }
     if (result.ok && result.value.state === "ready" && capable !== undefined) {
       await ensureSignerWrap();
       const st = status();
@@ -640,7 +664,13 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       case "firstUse":
         return unlockFetched(ctx, decision.vault, undefined, decision.warnWeak && options.confirmWeakOnNewDevice !== false);
       case "same": {
-        const vault = fetched.kind === "found" ? fetched.vault : local!.copy!;
+        // (d) merged from the checked copy: wraps from the copy are never dropped (#37, #38).
+        const fetchedVault = fetched.kind === "found" ? fetched.vault : local!.copy!;
+        const merged = mergeVaults(local!.copy ?? fetchedVault, fetchedVault, { ctx, r: local!.r });
+        const vault = merged.ok ? merged.value : (local!.copy ?? fetchedVault);
+        // Self-heal (SPEC §6.2 rule 4): the relays lost or altered wraps this device still has.
+        const onRelays = new Set(fetchedVault.rootWraps.map((w) => JSON.stringify(w)));
+        if (vault.rootWraps.some((w) => !onRelays.has(JSON.stringify(w)))) healAfterConnect = vault;
         return withReady(becomeReady(ctx, vault, local!.s, local!.r, "cache", local!.db));
       }
       case "follow": {
@@ -774,7 +804,15 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const check = openRootData(s.value.ctx, s.value.vault, r.value);
     if (!check.ok) return error("wrongPhrase", "This recovery phrase doesn't belong to this app's data");
     if (options.cacheRootKey === true) await deps.cache.set(s.value.ctx.pubkey, s.value.ctx.appId, { s: s.value.s, r: r.value });
-    const next: Unlocked = { ...s.value, r: r.value };
+    // Now that R is known, drop root wraps with a bad tag and publish the result (#37).
+    const pruned = mergeVaults(s.value.vault, s.value.vault, { ctx: s.value.ctx, r: r.value });
+    let vault = s.value.vault;
+    if (pruned.ok && pruned.value.rootWraps.length !== vault.rootWraps.length) {
+      const published = await publishVault(s.value.ctx, pruned.value, false, undefined, r.value);
+      vault = published.ok ? published.value : pruned.value;
+      await s.value.db.setMeta(META_VAULT, serializeVault(vault));
+    }
+    const next: Unlocked = { ...s.value, vault, r: r.value };
     session = next;
     return ok(statusOf(next));
   };

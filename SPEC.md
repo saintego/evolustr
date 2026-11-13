@@ -1,6 +1,6 @@
 # Evolustr Specification
 
-**Status:** Draft v0.13
+**Status:** Draft v0.15 (v0.15 changed the vault format: root-wrap tags and the full history hash. Early alpha, so there is no migration.)
 **Scope:** Nostr identity → one Evolu (local-first, E2E-encrypted SQLite) database per app, synced across devices, with **no backend and no storage other than Nostr relays and Evolu**.
 
 ---
@@ -87,7 +87,9 @@ Why two levels: the strong methods protect `R`, and `R` protects `S`. When `S` i
 **`R` is never reachable through NIP-44, even in `compatible` mode.** If it were, anyone who read the `nip44` wrap while the vault was weak would still know `R` after `makeStrict()`. The cost: a device that opened a `compatible` vault through `nip44` has `S` but not `R`. Once `R` exists, that device can read and write the data, but it **can't add a strong method** (passkey or signer wrap) until the user unlocks `R` there once, with a synced passkey, a capable signer that already has a wrap, or the recovery phrase. The client says so plainly instead of failing (`status.canAddStrongMethod`).
 
 `signer`, `passkey` and `root` wraps use **AES-256-GCM** with a random 12-byte IV and
-`AAD = "evolustr/v1|" + pubkey + "|" + appId + "|" + wrapType + "|" + keyId`, where `keyId` is the `signerId` or `credId` for root wraps. For the `root` data wrap, `keyId` is the **vault header**: `sHash + "|" + mode + "|" + created + "|" + first 16 hex characters of SHA-256(history)`.
+`AAD = "evolustr/v1|" + pubkey + "|" + appId + "|" + wrapType + "|" + keyId`, where `keyId` is the `signerId` or `credId` for root wraps. For the `root` data wrap, `keyId` is the **vault header**: `sHash + "|" + mode + "|" + created + "|" + SHA-256(history)` (all 64 hex characters).
+
+Each root wrap also carries a **`tag`**: `hex(HMAC-SHA256(HKDF(R, "evolustr/v1/wrap-auth|" + appId), AAD + "|" + (rpId or "") + "|" + iv + "|" + ct))`. Only someone holding `R` can add or change a root wrap. A device that knows `R` drops wraps whose tag doesn't verify; one that doesn't keeps the union with its own copy winning (§6.2). At most 32 root wraps per vault.
 Binding each wrap to its own key identifier means concurrent additions never collide and a wrap can't be moved to another vault. Binding the header into the `root` data wrap means nobody without `R` can change the mode, the creation time or the history: an edited header no longer opens with `R`. `downgrade()` therefore needs `R`, to seal the wrap again with the new mode.
 
 A vault may hold several `signer` wraps (one per capable signer, each with its own `M`, §5.3) and several `passkey` wraps.
@@ -381,9 +383,9 @@ The pubkey is part of the hash, so two users of the same app have **different** 
     { "sHash": "<hex 8B>", "created": 1720000000 }
   ],
   "rootWraps": [                  // wraps of R
-    { "type": "signer", "signerId": "<hex 8B>", "iv": "…", "ct": "…" },
+    { "type": "signer", "signerId": "<hex 8B>", "iv": "…", "ct": "…", "tag": "<hex 32B>" },
     { "type": "signer", "signerId": "<another signer>", "iv": "…", "ct": "…" },
-    { "type": "passkey", "rpId": "app.example.com", "credId": "<base64url>", "iv": "…", "ct": "…" }
+    { "type": "passkey", "rpId": "app.example.com", "credId": "<base64url>", "iv": "…", "ct": "…", "tag": "<hex 32B>" }
   ],
   "dataWraps": [                  // wraps of S
     { "type": "root", "iv": "…", "ct": "…" }
@@ -398,8 +400,8 @@ A `compatible` vault that has no `R` yet has empty `rootWraps` and only the `nip
 
 1. **Lookup:** query all configured relays and wait for EOSE from each, or a timeout. Never decide "no vault exists" from a single relay.
 2. **Create** only when every relay answered and none has the vault. After publishing, fetch again. If a vault with a different `sHash` and an earlier `created` appears, keep the earlier one (moving any rows already written is open question §11.3).
-3. **Adding a wrap:** fetch, add the wrap (wraps are keyed by `signerId` / `credId`, so concurrent additions merge), publish, fetch again to check. Never drop a wrap without an explicit user action. `makeStrict()` and `downgrade()` are such actions.
-4. **Self-healing:** after unlocking, re-add your own wrap if a concurrent update dropped it. Never re-add `nip44` to a `strict` vault (§3.2 rule 5).
+3. **Adding a wrap:** fetch, add the wrap (wraps are keyed by `signerId` / `credId`, so concurrent additions merge), publish, fetch again to check. When merging, the **local** version wins on the same id, and with `R` known, wraps whose tag doesn't verify are dropped from both sides. Never drop a wrap without an explicit user action. `makeStrict()` and `downgrade()` are such actions.
+4. **Self-healing:** after connecting, if the relays lack or altered a wrap the local copy has, publish the merged vault in the background. After unlocking with `R`, prune wraps with a bad tag and publish. Never re-add `nip44` to a `strict` vault (§3.2 rule 5).
 5. **Keep a copy in Evolu:** after a successful unlock, store the vault event in the app database itself (table `evolustr_meta`, key `vault`). It lives in that `(pubkey, appId)` database only (§2), and Evolu syncs it, so every device that has the database also has the last good vault (§6.3).
 6. **Device cache:** Evolu needs `S` every time the app starts (§2), so a device caches the unlocked `S` for its `(pubkey, appId)`: on the web encrypted with a non-extractable WebCrypto key kept in IndexedDB, on mobile in secure storage. `R` is the recovery phrase and survives every rotation, so it stays **in memory** for the session unless the app opts in (`cacheRootKey`). Without a cached `R`, a device still recognises replays and strict-to-weak swaps from its local vault copy (§6.3). `logout()` removes both; `logout({ deleteLocalData: true })` also deletes the local database.
 

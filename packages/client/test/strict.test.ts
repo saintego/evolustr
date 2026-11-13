@@ -226,4 +226,66 @@ describe("client passkeys and strict mode", () => {
     await connectReady(d.make());
     expect(JSON.parse(onR2()[0]!.content).mode).toBe("strict");
   });
+
+  /** The attacker re-signs the current vault with its JSON changed by `edit`. */
+  const tamper = async (w: ReturnType<typeof world>, pubkey: string, edit: (v: Record<string, unknown>) => void) => {
+    const current = (await w.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [appVaultDTag(pubkey, APP)] }, 100)).events[0]!;
+    const json = JSON.parse(current.content) as Record<string, unknown>;
+    edit(json);
+    w.tick(100);
+    await w.mem.relays.publish(URLS, await w.signer.signEvent({ kind: VAULT_KIND, created_at: w.now(), tags: current.tags, content: JSON.stringify(json) }), 100);
+  };
+  const relayVault = async (w: ReturnType<typeof world>, pubkey: string) =>
+    JSON.parse((await w.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [appVaultDTag(pubkey, APP)] }, 100)).events[0]!.content) as { rootWraps: Array<{ credId?: string; ct: string }> };
+  const settle = () => new Promise((r) => setTimeout(r, 20));
+
+  it("stripped root wraps come back from the local copy (#37 strip)", async () => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    await a.makeStrict();
+    await tamper(w, ra.pubkey, (v) => (v["rootWraps"] = []));
+    const again = await connectReady(d.make());
+    const copy = JSON.parse((await again.db.getMeta("vault"))!) as { rootWraps: unknown[] };
+    expect(copy.rootWraps).toHaveLength(1);
+    await settle();
+    expect((await relayVault(w, ra.pubkey)).rootWraps).toHaveLength(1);
+  });
+
+  it("a corrupted passkey wrap is repaired, and another device can still unlock (#37 corrupt)", async () => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    await a.makeStrict();
+    await tamper(w, ra.pubkey, (v) => {
+      const wraps = v["rootWraps"] as Array<{ ct: string }>;
+      wraps[0]!.ct = "AAAAAAAAAAAAAAAAAAAAAAAA";
+    });
+    await connectReady(d.make());
+    await settle();
+    const b = w.device().make();
+    expect(unwrap(await b.connect())).toEqual({ state: "needsUserAction", action: "passkey" });
+    expect(unwrap(await b.unlock()).status.unlockedWith).toBe("passkey");
+  });
+
+  it("a junk wrap is pruned once R is known (#37 prune)", async () => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    await a.makeStrict();
+    await tamper(w, ra.pubkey, (v) => {
+      const wraps = v["rootWraps"] as Array<Record<string, string>>;
+      wraps.push({ ...wraps[0]!, credId: "junk" });
+    });
+    const c = d.make();
+    await connectReady(c);
+    unwrap(await c.unlockRoot());
+    expect((await relayVault(w, ra.pubkey)).rootWraps.map((x) => x.credId)).not.toContain("junk");
+  });
 });
