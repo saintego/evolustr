@@ -70,7 +70,9 @@ describe("client with a capable iframe signer", () => {
     const a = w.device("https://notes.example");
     const r = await ready(a);
     expect(r.status).toMatchObject({ signer: "capable-verified", canMakeStrict: true, mode: "compatible" });
-    expect(unwrap(await a.makeStrict())).toMatchObject({ mode: "strict", level: "strong" });
+    expect(r.status.dependsOnNsec).toBe(false);
+    // The signer holds the nsec (sk wrap), so strict data depends on the nsec (#43).
+    expect(unwrap(await a.makeStrict())).toMatchObject({ mode: "strict", level: "strong", dependsOnNsec: true });
   });
 
   it("a new device with the same signer opens a strict vault without any prompt", async () => {

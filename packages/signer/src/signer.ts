@@ -111,6 +111,8 @@ export interface Capabilities {
   readonly signerPasskey: boolean;
   /** M can be recovered on another device: an `sk` wrap, or a synced signer passkey (#42). */
   readonly recoverable: boolean;
+  /** M is protected by the nsec (an `sk` wrap): anyone with the nsec can derive app keys (#43). */
+  readonly nsecProtected: boolean;
 }
 
 export const METHODS = ["evolustr_capabilities", "evolustr_get_wrap_key", "evolustr_enroll_passkey"] as const;
@@ -393,6 +395,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
       ready: m !== null,
       signerPasskey: (vault?.wraps ?? []).some((w) => w.type === "passkey"),
       recoverable: (vault?.wraps ?? []).some((w) => w.type === "sk" || (w.type === "passkey" && w.synced === true)),
+      nsecProtected: (vault?.wraps ?? []).some((w) => w.type === "sk"),
     });
   };
 

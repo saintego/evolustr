@@ -138,6 +138,11 @@ export interface Status {
   readonly canAddStrongMethod: boolean;
   readonly passkeySupported: boolean;
   readonly backupRecommended: boolean;
+  /**
+   * The vault is strict and this session's capable signer protects its key with
+   * the nsec: anyone who has the user's nsec can open this data (#43).
+   */
+  readonly dependsOnNsec: boolean;
 }
 
 /** Steps of connect / unlock, for showing progress (`onProgress`). */
@@ -459,6 +464,11 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     canMakeStrict: s.r !== undefined && s.vault.mode === "compatible",
     canAddStrongMethod: s.r !== undefined || !hasRootKey(s.vault),
     passkeySupported,
+    dependsOnNsec:
+      s.vault.mode === "strict" &&
+      caps?.nsecProtected === true &&
+      caps.signerId !== null &&
+      signerWrapFor(s.vault, caps.signerId) !== undefined,
     backupRecommended:
       s.vault.mode === "strict" &&
       backupRequirement(backupState.methods.map((m) => m.method), backupState.phraseConfirmed) !== "none",

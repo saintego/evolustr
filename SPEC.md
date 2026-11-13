@@ -353,6 +353,7 @@ Thin adapters cover the common hosts: `adapters/iframe` (postMessage signers), `
 **nostr-shard-signer** (iframe signer, verified origin) embeds `@evolustr/signer` as the first host:
 
 - **Integration:** the iframe's message handler passes `evolustr_*` requests to `evolustr.handle()` with `origin: event.origin`. `nostr-bridge.js` adds `window.nostr.evolustr` and forwards its calls to the iframe, the same way it forwards `signEvent`. The auto-approve list calls `isProtectedEvent()`. `signerKey` is the signer's own origin.
+- **`sk` mode in general:** anyone with the nsec can derive `M` from the public signer vault, then every app key, `R` and `S`. So strict through a signer in `sk` mode is strong against apps with signer *permissions*, not against anyone who has the nsec. Capabilities report `nsecProtected`; the client's `status.dependsOnNsec` shows it.
 - **OAuth mode** holds the nsec, so `M` can use the `sk` wrap. The Web3Auth `clientId` owner can recover the nsec, and so `M` and every app key derived from it. For users who don't accept that, the signer offers a signer passkey and drops the `sk` wrap. If a looser version of the signer uses a shared `clientId`, that owner is whoever controls the shared project.
 - **Passthrough mode** (extension or bunker through the bridge) has no nsec, so the API is available only after the user enrolls a signer passkey. The signer's own vault event is then signed by the extension or bunker, through the bridge. The parent page sees only the AES-encrypted vault: it could block the publish, but not read or forge `M`.
 - Per-app separation relies on `event.origin`, not on the `clientId` allowlist, so it holds in the looser version too.
@@ -444,7 +445,7 @@ Shared settings are always ⚠️ by design (§9). The level shown is the **high
 
 | Signer ↓ / Hosting → | Own domain (web) | nsite (gateway subdomain) | Mobile app |
 |---|---|---|---|
-| **Capable signer, verified identity** (extension, iframe signer, NIP-55) | ✅ | ✅ same data on every known gateway | ✅ (Android, NIP-55) |
+| **Capable signer, verified identity** (extension, iframe signer, NIP-55) | ✅ (with the `sk` wrap: strong against permissions, **not against nsec holders**) | ✅ same data on every known gateway (same caveat) | ✅ (Android, NIP-55; same caveat) |
 | **Capable signer, NIP-46 bunker** | 🔶 | 🔶 | 🔶 |
 | **Standard signer + client passkey** | ✅ | ✅ on one gateway; other gateways via the recovery phrase | ✅ (associated domain) |
 | **Standard signer, no passkey (or no PRF)** | ⚠️ (✅ with the recovery phrase typed on each new device) | ⚠️ (same) | ⚠️ (same) |

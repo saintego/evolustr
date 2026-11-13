@@ -109,7 +109,7 @@ How your signer stores `M` decides who besides the user could derive app keys:
 
 | Your signer | `allowSkWrap` | Result |
 |---|---|---|
-| Holds the nsec, and only the user can recover it | `true` | Keys without any passkey; a new device with the same nsec gets them silently. |
+| Holds the nsec, and only the user can recover it | `true` | Keys without any passkey; a new device with the same nsec gets them silently. **But anyone who has the nsec can then open strict data too**: many users have pasted their nsec into several clients. Tell the user when they turn Evolustr on, and offer the passkey option below. `capabilities()` reports `nsecProtected`. |
 | Holds the nsec, but a third party can recover it (OAuth/MPC login, custodial bunker) | Offer the user a choice | With the `sk` wrap, that third party could derive the app keys. Offer a signer passkey and `allowSkWrap: false` instead. |
 | Passes requests to another signer (no nsec) | n/a | The API works after the user enrolls a signer passkey. |
 

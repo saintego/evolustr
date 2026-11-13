@@ -292,4 +292,22 @@ describe("@evolustr/signer", () => {
       expect(unwrap(await s.capabilities(web("https://a.example"))).recoverable).toBe(false);
     });
   });
+
+  describe("nsecProtected (#43)", () => {
+    it("true with the nsec", async () => {
+      const s = createEvolustrSigner(setup().host());
+      unwrap(await s.getWrapKey(web("https://a.example")));
+      expect(unwrap(await s.capabilities(web("https://a.example"))).nsecProtected).toBe(true);
+    });
+    it("false in passthrough mode with a signer passkey", async () => {
+      const s = createEvolustrSigner(setup().host({ holdsNsec: false, passkeys: memoryPasskeys({ rpId: "signer.example" }) }));
+      unwrap(await s.enrollPasskey());
+      expect(unwrap(await s.capabilities(web("https://a.example"))).nsecProtected).toBe(false);
+    });
+    it("false with allowSkWrap off and a signer passkey", async () => {
+      const s = createEvolustrSigner(setup().host({ allowSkWrap: false, passkeys: memoryPasskeys({ rpId: "signer.example" }) }));
+      unwrap(await s.enrollPasskey());
+      expect(unwrap(await s.capabilities(web("https://a.example"))).nsecProtected).toBe(false);
+    });
+  });
 });

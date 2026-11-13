@@ -11,6 +11,8 @@ export interface SignerCapabilities {
   readonly signerPasskey: boolean;
   /** M can be recovered on another device (#42). Older signers don't send it: counts as false. */
   readonly recoverable?: boolean;
+  /** The signer's key is protected by the nsec, so nsec holders can open strict data (#43). */
+  readonly nsecProtected?: boolean;
 }
 
 export interface CapableSigner {
