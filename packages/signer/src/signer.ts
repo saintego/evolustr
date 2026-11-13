@@ -78,6 +78,12 @@ export interface SignerHost {
     readonly get: (pubkey: string) => Promise<Bytes | null>;
     readonly set: (pubkey: string, m: Bytes) => Promise<void>;
     readonly remove: (pubkey: string) => Promise<void>;
+    /**
+     * The last good signer vault (JSON), kept on the device (#41). Without these,
+     * a replaced signer vault on the relays locks out devices that don't have M cached.
+     */
+    readonly getVault?: (pubkey: string) => Promise<string | null>;
+    readonly setVault?: (pubkey: string, json: string) => Promise<void>;
   };
   readonly ui: {
     /** Show a prompt with the verified caller; the host may remember answers. */
@@ -145,10 +151,24 @@ export const parseSignerVault = (json: string): Result<SignerVault, EvolustrErro
   }
   // A vault that exists but has no wraps isn't "first use" (#28).
   if (wraps.length === 0) return error("invalidSignerVault", "The signer vault has no wraps");
+  if (wraps.length > MAX_SIGNER_WRAPS) return error("invalidSignerVault", "Too many wraps");
   return ok({ v: 1, wraps });
 };
 
 const wrapId = (w: SignerWrap): string => (w.type === "sk" ? "sk" : w.credId);
+
+export const MAX_SIGNER_WRAPS = 32;
+
+/** Union of two signer vaults by wrap id; `local` wins on the same id (#41). */
+export const mergeSignerVaults = (local: SignerVault, fetched: SignerVault): SignerVault => {
+  const byId = new Map<string, SignerWrap>();
+  for (const w of local.wraps) byId.set(`${w.type}:${wrapId(w)}`, w);
+  for (const w of fetched.wraps) {
+    const k = `${w.type}:${wrapId(w)}`;
+    if (!byId.has(k) && byId.size < MAX_SIGNER_WRAPS) byId.set(k, w);
+  }
+  return { v: 1, wraps: [...byId.values()] };
+};
 
 const PACKAGE_NAME = /^[A-Za-z][\w]*(\.[A-Za-z][\w]*)+$/;
 const HEX_PUBKEY = /^[0-9a-f]{64}$/;
@@ -178,6 +198,8 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   let vault: SignerVault | null = null;
   /** True once the signer vault was read from the relays this session (#40). */
   let vaultLoaded = false;
+  /** The relays lack wraps the local copy has (#41); fixed after an approved key request. */
+  let needsHeal = false;
   let lastEventAt = 0;
 
   const appIdFor = (caller: Caller) => appIdForCaller(caller, host.knownNsiteGateways);
@@ -195,12 +217,29 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     return parseSignerVault(f.event.content);
   };
 
-  /** Loads the signer vault once per session; null when none exists (#40). */
+  /**
+   * Loads the signer vault once per session; null when none exists (#40). With a
+   * local copy (#41), it's merged with the relay version, or used instead of a
+   * missing or invalid one; `needsHeal` marks wraps the relays lack.
+   */
   const loadVault = async (pubkey: string): Promise<Result<SignerVault | null>> => {
     if (vaultLoaded) return ok(vault);
     const fetched = await fetchVault(pubkey);
-    if (!fetched.ok) return fetched;
-    vault = fetched.value;
+    if (!fetched.ok && fetched.error.type !== "invalidSignerVault") return fetched;
+    const copyText = (await host.cache?.getVault?.(pubkey)) ?? null;
+    const copy = copyText === null ? null : parseSignerVault(copyText);
+    const local = copy?.ok ? copy.value : null;
+    if (local === null) {
+      if (!fetched.ok) return fetched;
+      vault = fetched.value;
+    } else if (!fetched.ok || fetched.value === null) {
+      vault = local;
+      needsHeal = true;
+    } else {
+      vault = mergeSignerVaults(local, fetched.value);
+      const onRelays = new Set(fetched.value.wraps.map((w) => JSON.stringify(w)));
+      needsHeal = vault.wraps.some((w) => !onRelays.has(JSON.stringify(w)));
+    }
     vaultLoaded = true;
     return ok(vault);
   };
@@ -228,6 +267,8 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     }
     lastEventAt = at;
     vault = next;
+    needsHeal = false;
+    await host.cache?.setVault?.(pubkey, JSON.stringify(next));
     return ok(next);
   };
 
@@ -246,9 +287,11 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     wraps: [...(v?.wraps ?? []).filter((x) => !(x.type === w.type && wrapId(x) === wrapId(w))), w],
   });
 
+  /** Called after a wrap opened to M, or after creating M: the vault is good (#41). */
   const remember = async (pubkey: string, secret: Bytes) => {
     m = secret;
     await host.cache?.set(pubkey, secret);
+    if (vault !== null) await host.cache?.setVault?.(pubkey, JSON.stringify(vault));
   };
 
   /**
@@ -345,6 +388,10 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     if (!allowed) return error("userRefused", "The user didn't allow this app");
     const unlocked = await ensureM();
     if (!unlocked.ok) return unlocked;
+    // Self-heal (#41): the user just approved this app and M is unlocked. With M
+    // from the cache the vault may not be loaded yet; a failure here doesn't block.
+    if (!vaultLoaded) await loadVault(unlocked.value.pubkey);
+    if (needsHeal && vault !== null) await publish(unlocked.value.pubkey, vault);
     return ok(signerAppKey(unlocked.value.m, appId.value));
   };
 
@@ -412,6 +459,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     m = null;
     vault = null;
     vaultLoaded = false;
+    needsHeal = false;
     if (pubkey !== null) await host.cache?.remove(pubkey);
   };
 

@@ -52,6 +52,18 @@ const evolustr = createEvolustrSigner({
 });
 ```
 
+### Keep a local copy of the signer vault
+
+Give `cache` the optional `getVault` / `setVault` methods (any device-local storage). The signer then keeps the last good list of its wraps and merges it with the relay version. Without them, anyone who can sign for the user can replace the signer vault on the relays and lock out every device that doesn't have `M` cached.
+
+```ts
+cache: {
+  get, set, remove,                         // the unlocked M, device-local
+  getVault: (pubkey) => store.get(`signer-vault:${pubkey}`),
+  setVault: (pubkey, json) => store.set(`signer-vault:${pubkey}`, json),
+},
+```
+
 ## 2. Route `evolustr_*` requests
 
 Pass requests to `evolustr.handle()` with the caller **your platform** reports:
