@@ -139,4 +139,10 @@ describe("decideVault (SPEC §6.3)", () => {
       expect(decideVault(ctx, { kind: "found", vault: other }, { sHash: sHash(s), copy })).toMatchObject({ type: "choose", reason: "ambiguous" });
     });
   });
+
+  it("a vault whose secret is only in the device's seen list is a rollback (#44)", () => {
+    const s = randomBytes(16);
+    const old = unwrap(createCompatibleVault(ctx, { s: randomBytes(16), nip44Ct: "x", now: 1 }));
+    expect(decideVault(ctx, { kind: "found", vault: old }, { sHash: sHash(s), seen: [old.sHash] })).toMatchObject({ type: "choose", reason: "replaced" });
+  });
 });

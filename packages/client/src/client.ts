@@ -39,6 +39,7 @@ import {
   signerRootWrap,
   signerWrapFor,
   sha256,
+  sha256Hex,
   utf8,
   appVaultDTag,
   createCompatibleVault,
@@ -91,6 +92,16 @@ export interface ClientDeps {
   readonly cache: SecretCache;
   /** Client passkeys on this app's domain (SPEC §4); omit to disable. */
   readonly passkeys?: Passkeys | undefined;
+  /**
+   * A small non-secret store that survives logout (e.g. localStorage): the last
+   * mode and secret hash per (pubkey, appId). After a logout it still tells a
+   * strict vault swapped for a weak one (#44).
+   */
+  readonly hints?: {
+    readonly get: (key: string) => Promise<string | null>;
+    readonly set: (key: string, value: string) => Promise<void>;
+    readonly remove?: (key: string) => Promise<void>;
+  };
   /** An Evolustr-capable signer (SPEC §5), e.g. from `detectCapableSigner(window.nostr)`. */
   readonly capableSigner?: CapableSigner | undefined;
   /** Unix seconds. */
@@ -255,6 +266,9 @@ type Session = { readonly kind: "none" } | Unlocked | Pending;
 
 export const META_PHRASE_CONFIRMED = "phraseConfirmed";
 export const META_APP_SETTINGS = "appSettings";
+/** Data secrets this device moved past, for rollback detection beyond the vault's history (#44). */
+export const META_SEEN_SECRETS = "seenSecrets";
+const SEEN_LIMIT = 200;
 /** Strong methods known for this database, for the backup check (SPEC §3.2 rule 3a). */
 export const META_STRONG_METHODS = "strongMethods";
 
@@ -382,13 +396,38 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (f.kind === "none") return { kind: "none" };
     if (f.kind === "incomplete") return { kind: "unreadable" };
     lastEventAt = Math.max(lastEventAt, f.event.created_at);
-    lastFetched = { event: f.event, missingOn: f.missingOn };
+    // Not re-sent until it passes the checks: never spread a forged event (#44).
+    lastSeenEvent = { event: f.event, missingOn: f.missingOn };
     const v = readVaultEvent(ctx, f.event);
     return v.ok ? { kind: "found", vault: v.value } : { kind: "unreadable" };
   };
 
+  const hintKey = (ctx: VaultContext) => `evolustr:hint:${sha256Hex(`${ctx.pubkey}|${ctx.appId}`)}`;
+  const readHint = async (ctx: VaultContext): Promise<{ mode?: string; sHash?: string } | null> => {
+    try {
+      const text = await deps.hints?.get(hintKey(ctx));
+      return text == null ? null : (JSON.parse(text) as { mode?: string; sHash?: string });
+    } catch {
+      return null;
+    }
+  };
+
+  /** Secrets this device has moved past, from its local database (#44). */
+  let knownSeen: ReadonlyArray<string> = [];
+  const readSeen = async (db: AppDatabase): Promise<ReadonlyArray<string>> => {
+    try {
+      const list = JSON.parse((await db.getMeta(META_SEEN_SECRETS)) ?? "[]") as unknown;
+      return Array.isArray(list) ? list.filter((x): x is string => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  };
+
   /** A vault to publish in the background once connect is ready (self-heal, #37). */
   let healAfterConnect: Vault | null = null;
+
+  /** The newest vault event fetched, before it was checked (#44). */
+  let lastSeenEvent: { readonly event: NostrEvent; readonly missingOn: ReadonlyArray<string> } | null = null;
 
   /** Relays that accepted the last publish. */
   let lastAccepted: ReadonlyArray<string> = [];
@@ -491,7 +530,14 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   ): Promise<Result<Ready>> => {
     progress("openingDatabase");
     let vault = vaultIn;
+    // The secret this device had before, if it's moving to another one (#44).
+    const previous = session.kind === "ready" ? session.db.sHash : session.kind === "pending" ? session.local?.db.sHash : undefined;
     const database = db ?? (await deps.openDatabase(s));
+    {
+      const seen = [...new Set([...knownSeen, ...(await readSeen(database)), ...(previous !== undefined && previous !== database.sHash ? [previous] : [])])];
+      knownSeen = seen.slice(-SEEN_LIMIT);
+      if (knownSeen.length > 0) await database.setMeta(META_SEEN_SECRETS, JSON.stringify(knownSeen));
+    }
     // With R known, drop root wraps whose tag doesn't verify, and put the
     // cleaned vault back on the relays in the background (#37).
     if (r !== undefined) {
@@ -504,6 +550,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       }
     }
     await database.setMeta(META_VAULT, serializeVault(vault));
+    await deps.hints?.set(hintKey(ctx), JSON.stringify({ mode: vault.mode, sHash: vault.sHash })).catch(() => undefined);
     // R is the recovery phrase: kept in memory only, unless the app opts in (#27).
     await deps.cache.set(ctx.pubkey, ctx.appId, r === undefined || options.cacheRootKey !== true ? { s } : { s, r });
     const next: Unlocked = { kind: "ready", ctx, vault, s, db: database, unlockedWith, ...(r === undefined ? {} : { r }) };
@@ -556,7 +603,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     // theirs. Asking the relays that just answered is enough and doesn't wait on slow ones.
     const check = await fetchVault(ctx, lastAccepted.length > 0 ? lastAccepted : options.relayUrls);
     if (check.kind === "found" && check.vault.sHash !== published.value.sHash && check.vault.created <= published.value.created) {
-      return unlockFetched(ctx, check.vault, undefined);
+      // A vault that appeared after this device's publish is as unknown as on first use (#44).
+      return unlockFetched(ctx, check.vault, undefined, options.confirmWeakOnNewDevice !== false);
     }
     // Local copy source (#38): (a) made by this device.
     return withReady(becomeReady(ctx, published.value, s, undefined, "created"));
@@ -691,6 +739,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       const db = await deps.openDatabase(cached.s);
       const copyText = await db.getMeta(META_VAULT);
       const copy = copyText === null ? undefined : parseVault(copyText);
+      knownSeen = await readSeen(db);
       local = {
         db,
         s: cached.s,
@@ -699,12 +748,27 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       };
     }
 
+    // Logged out before, but this device knew the database was strict: a weak
+    // vault now is a swap, not a first use (#44).
+    if (local === undefined && fetched.kind === "found" && fetched.vault.mode === "compatible") {
+      const hint = await readHint(ctx);
+      if (hint?.mode === "strict") {
+        session = { kind: "pending", ctx, action: "choose", vault: fetched.vault };
+        return ok({ state: "vaultChanged", reason: "replaced", options: ["restorePhrase", "startNew"] });
+      }
+    }
+
     const decision = decideVault(
       ctx,
       fetched,
       local === undefined
         ? null
-        : { sHash: local.db.sHash, ...(local.r === undefined ? {} : { r: local.r }), ...(local.copy === undefined ? {} : { copy: local.copy }) },
+        : {
+            sHash: local.db.sHash,
+            seen: knownSeen,
+            ...(local.r === undefined ? {} : { r: local.r }),
+            ...(local.copy === undefined ? {} : { copy: local.copy }),
+          },
     );
 
     switch (decision.type) {
@@ -720,6 +784,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         // Self-heal (SPEC §6.2 rule 4): the relays lost or altered wraps this device still has.
         const onRelays = new Set(fetchedVault.rootWraps.map((w) => JSON.stringify(w)));
         if (vault.rootWraps.some((w) => !onRelays.has(JSON.stringify(w)))) healAfterConnect = vault;
+        // The fetched event passed the checks unchanged: it may be re-sent to relays that miss it.
+        else if (fetched.kind === "found") lastFetched = lastSeenEvent;
         return withReady(becomeReady(ctx, vault, local!.s, local!.r, "cache", local!.db));
       }
       case "follow": {
@@ -1030,7 +1096,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!next.ok) return next;
     const db = await deps.openDatabase(newS);
     await migrateRows(s.value.db, db, { kind: "all" });
-    for (const key of [META_APP_SETTINGS, META_SHARED_SETTINGS, META_STRONG_METHODS, META_PHRASE_CONFIRMED]) {
+    for (const key of [META_APP_SETTINGS, META_SHARED_SETTINGS, META_STRONG_METHODS, META_PHRASE_CONFIRMED, META_SEEN_SECRETS]) {
       const v = await s.value.db.getMeta(key);
       if (v !== null) await db.setMeta(key, v);
     }
@@ -1160,7 +1226,10 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     await deps.cache.remove(s.ctx.pubkey, s.ctx.appId);
     const db = s.kind === "ready" ? s.db : s.local?.db;
     if (db === undefined) return;
-    if (opts?.deleteLocalData === true) await db.deleteLocal();
+    if (opts?.deleteLocalData === true) {
+      await db.deleteLocal();
+      await deps.hints?.remove?.(hintKey(s.ctx)).catch(() => undefined);
+    }
     else await db.close();
   };
 

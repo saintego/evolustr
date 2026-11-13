@@ -419,4 +419,31 @@ describe("client passkeys and strict mode", () => {
     await c.connect();
     expect(await c.unlock({ recoveryPhrase: "abandon ".repeat(11) + "about" })).toMatchObject({ ok: false, error: { type: "wrongPhrase" } });
   });
+
+  it("after logout, a strict vault swapped for a weak one is still caught with hints (#44)", async () => {
+    const w = world();
+    const hintStore = new Map<string, string>();
+    const hints = { get: async (k: string) => hintStore.get(k) ?? null, set: async (k: string, v: string) => void hintStore.set(k, v) };
+    const dbs = memoryDatabases(["notes"]);
+    const cache = memoryCache();
+    const make = (withHints: boolean) =>
+      createEvolustr(
+        { signer: w.signer, relays: w.mem.relays, openDatabase: dbs.open, cache, now: () => w.tick(1), passkeys: memoryPasskeys({ rpId: RP }), ...(withHints ? { hints } : {}) },
+        { appId: APP, relayUrls: URLS },
+      );
+    const a = make(true);
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    await a.showRecoveryPhrase().then((p) => a.confirmRecoveryPhrase(unwrap(p)));
+    unwrap(await a.makeStrict());
+    await a.logout();
+    const ctx = { pubkey: ra.pubkey, appId: APP };
+    const evilS = randomBytes(16);
+    const evil = unwrap(createCompatibleVault(ctx, { s: evilS, nip44Ct: await nip44SealSecret(w.signer, ra.pubkey, evilS), now: w.now() + 500 }));
+    w.tick(1000);
+    await w.mem.relays.publish(URLS, await w.signer.signEvent(vaultEvent(ctx, evil, w.now())), 100);
+    expect(unwrap(await make(true).connect())).toMatchObject({ state: "vaultChanged", reason: "replaced" });
+    // Without hints it's a first use, behind the weak-vault confirmation.
+    expect(unwrap(await make(false).connect())).toEqual({ state: "needsUserAction", action: "confirmWeak" });
+  });
 });

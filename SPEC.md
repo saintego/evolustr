@@ -414,7 +414,7 @@ Any app the user lets sign can publish a replacement vault event. Capable signer
 
 | Situation | What the client does |
 |---|---|
-| No local database for this `(pubkey, appId)` | First use on this device. If a capable signer or a cached `R` opens the vault, its header is verified: unlock normally. If the vault is `compatible` and only NIP-44 can open it, ask the user to confirm first (`needsUserAction: "confirmWeak"`), saying not to continue if they made the database strict elsewhere. |
+| No local database for this `(pubkey, appId)` | If a non-secret hint kept across logout says this device last saw the database **strict** and the vault is now `compatible`: **replaced**. Otherwise first use on this device. If a capable signer or a cached `R` opens the vault, its header is verified: unlock normally. If the vault is `compatible` and only NIP-44 can open it, ask the user to confirm first (`needsUserAction: "confirmWeak"`), saying not to continue if they made the database strict elsewhere. |
 | Same `sHash`, device has `R` | The vault's `root` wrap opens with `R`: normal. It doesn't open, or the vault lost the root data wrap the copy has: **replaced**. No root key on either side: normal. |
 | Same `sHash`, no `R`, no copy | Normal. |
 | Same `sHash`, no `R`, copy | Header and data wraps equal the copy's: normal (only root wraps may differ; the copy's win). The copy has no root key and the vault only added one, with the same header and `nip44` wrap: normal. The copy **has** a root key and the vault differs: ask for a **strong unlock** (a legitimate downgrade looks like this; only `R` can tell). Otherwise: ask the user. |

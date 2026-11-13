@@ -176,7 +176,12 @@ export const encryptedCache = (
         const ivBytes = fromBase64Url(iv);
         const ctBytes = fromBase64Url(ct);
         if (ivBytes === null || ctBytes === null) return null;
-        const plain = await subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(ivBytes) }, await key(), new Uint8Array(ctBytes));
+        // The slot name is the AAD: an entry copied to another slot doesn't decrypt (#44).
+        const plain = await subtle.decrypt(
+          { name: "AES-GCM", iv: new Uint8Array(ivBytes), additionalData: enc.encode(cacheKey(pubkey, appId)) },
+          await key(),
+          new Uint8Array(ctBytes),
+        );
         return decode(dec.decode(plain));
       } catch {
         return null;
@@ -185,7 +190,7 @@ export const encryptedCache = (
     set: async (pubkey, appId, secrets) => {
       try {
         const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
-        const ct = await subtle.encrypt({ name: "AES-GCM", iv }, await key(), enc.encode(encode(secrets)));
+        const ct = await subtle.encrypt({ name: "AES-GCM", iv, additionalData: enc.encode(cacheKey(pubkey, appId)) }, await key(), enc.encode(encode(secrets)));
         store.setItem(cacheKey(pubkey, appId), JSON.stringify({ iv: toBase64Url(iv), ct: toBase64Url(new Uint8Array(ct)) }));
       } catch {
         /* unavailable: unlock again next time */

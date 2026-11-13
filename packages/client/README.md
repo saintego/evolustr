@@ -16,6 +16,11 @@ Every method returns a `Result`: `{ ok: true, value }` or `{ ok: false, error: {
 | `partialPublish` | `makeStrict`, `downgrade` | Not every relay took the change; it completes on the next `connect()`. |
 | `rootLocked` | `enrollPasskey`, `showRecoveryPhrase`, `downgrade` | Call `unlockRoot()` first. |
 
+## Optional dependencies
+
+- `hints`: a small non-secret store that survives logout (for example `localStorage`). It keeps the last mode and secret hash per user and app, so after a logout the device still notices a strict database swapped for a weak one. Removed by `logout({ deleteLocalData: true })`.
+- `cache`: `webSecretCache()` on the web. Its entries are bound to their slot; entries written by earlier versions don't decrypt anymore and act as an empty cache (the user unlocks once).
+
 ## States from `connect()`
 
 - `ready`: use the database.

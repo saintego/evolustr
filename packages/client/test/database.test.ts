@@ -93,3 +93,17 @@ describe("encrypted cache (#27)", () => {
     expect((await ks.get())?.extractable).toBe(false);
   });
 });
+
+describe("encrypted cache slot binding (#44)", () => {
+  it("an entry copied to another slot doesn't decrypt", async () => {
+    const m = new Map<string, string>();
+    const store = { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v), removeItem: (k: string) => void m.delete(k) };
+    const c = encryptedCache(store, memoryKeyStore());
+    await c.set("pk", "app1", { s: randomBytes(16) });
+    await c.set("pk", "app2", { s: randomBytes(16) });
+    const [k1, k2] = [...m.keys()];
+    m.set(k2!, m.get(k1!)!);
+    expect(await c.get("pk", "app2")).toBeNull();
+    expect(await c.get("pk", "app1")).not.toBeNull();
+  });
+});
