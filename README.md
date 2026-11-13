@@ -21,6 +21,8 @@ Log in with Nostr, and your app's private data is on every device you use.
 
 ## How it works
 
+For what each secret is, where it's stored and how it's locked, without assuming a cryptography background, read **[docs/how-it-works.md](docs/how-it-works.md)**.
+
 1. The user logs in with their Nostr signer.
 2. Evolustr looks for this app's *vault* event on Nostr relays. The vault holds the database secret, encrypted.
 3. **First time anywhere:** Evolustr creates a new random secret, encrypts it, and publishes the vault.
