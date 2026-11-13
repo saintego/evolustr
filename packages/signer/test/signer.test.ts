@@ -93,6 +93,31 @@ describe("@evolustr/signer", () => {
     expect(JSON.parse(stored.events[0]!.content).wraps.map((w: { type: string }) => w.type)).toEqual(["passkey"]);
   });
 
+  it("allowSkWrap as a function follows the user's choice at runtime", async () => {
+    const t = setup();
+    let consent = false;
+    const s = createEvolustrSigner(t.host({ allowSkWrap: () => consent, passkeys: memoryPasskeys({ rpId: "signer.example" }) }));
+    expect(await s.getWrapKey(web("https://a.example"))).toMatchObject({ ok: false, error: { type: "signerLocked" } });
+    consent = true;
+    unwrap(await s.getWrapKey(web("https://a.example")));
+    const stored = await t.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [signerVaultDTag(t.pubkey, SIGNER)] }, 100);
+    expect(JSON.parse(stored.events[0]!.content).wraps.map((w: { type: string }) => w.type)).toEqual(["sk"]);
+  });
+
+  it("moving from the sk wrap to a passkey keeps M and drops the sk wrap", async () => {
+    const t = setup();
+    const k1 = unwrap(await createEvolustrSigner(t.host()).getWrapKey(web("https://a.example")));
+    // Another session, M not cached; the user no longer accepts the sk wrap.
+    const passkeys = () => memoryPasskeys({ rpId: "signer.example", store: t.passkeyStore });
+    const s = createEvolustrSigner(t.host({ allowSkWrap: () => false, passkeys: passkeys() }));
+    unwrap(await s.enrollPasskey());
+    const stored = await t.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [signerVaultDTag(t.pubkey, SIGNER)] }, 100);
+    const types = [...stored.events].sort((a, b) => b.created_at - a.created_at)[0]!.content;
+    expect(JSON.parse(types).wraps.map((w: { type: string }) => w.type)).toEqual(["passkey"]);
+    const next = createEvolustrSigner(t.host({ allowSkWrap: false, passkeys: passkeys() }));
+    expect(unwrap(await next.getWrapKey(web("https://a.example")))).toEqual(k1);
+  });
+
   it("the user can refuse an app", async () => {
     const t = setup();
     const s = createEvolustrSigner(t.host({ refuse: true }));
