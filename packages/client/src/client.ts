@@ -14,6 +14,7 @@ import {
   type Relays,
   type Result,
   type Signer,
+  type RootWrap,
   type Vault,
   type VaultChoice,
   type VaultContext,
@@ -175,6 +176,10 @@ export interface Evolustr {
   /**
    * Completes `needsUserAction`, from a click. Pass the phrase for "recoveryPhrase";
    * for "setupStrong" with a device-bound passkey, pass `acceptDeviceLoss`.
+   *
+   * Errors to handle: `wrongPhrase`; `vaultReplaced` when the unlock proved the
+   * vault on the relays isn't the user's (#39): call
+   * `resolveVaultChange("republishCopy")` to restore this device's copy.
    */
   readonly unlock: (input?: UnlockInput) => Promise<Result<Ready>>;
   readonly resolveVaultChange: (
@@ -281,7 +286,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   };
 
   /** R through the capable signer's wrap (SPEC §8.2 step 2). May wait for a click in the signer. */
-  const rootFromSigner = async (ctx: VaultContext, vault: Vault): Promise<Result<Bytes>> => {
+  const rootFromSigner = async (ctx: VaultContext, vault: Vault, copy?: Vault): Promise<Result<Bytes>> => {
     if (capable === undefined) return error("noCapableSigner", "No Evolustr-capable signer");
     let key: Bytes;
     try {
@@ -290,9 +295,17 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       return error("signerRefused", e instanceof Error ? e.message : String(e));
     }
     const c = await refreshCaps();
-    const wrap = c?.signerId == null ? undefined : signerWrapFor(vault, c.signerId);
-    if (wrap === undefined) return error("noSignerWrap", "This signer has no wrap in the vault yet");
-    return openRootWrap(ctx, wrap, key);
+    if (c?.signerId == null) return error("noSignerWrap", "This signer has no wrap in the vault yet");
+    // The fetched vault's wrap first, then the local copy's (#39).
+    const wraps = [signerWrapFor(vault, c.signerId), copy === undefined ? undefined : signerWrapFor(copy, c.signerId)].filter(
+      (w): w is RootWrap => w !== undefined,
+    );
+    if (wraps.length === 0) return error("noSignerWrap", "This signer has no wrap in the vault yet");
+    for (const wrap of wraps) {
+      const opened = openRootWrap(ctx, wrap, key);
+      if (opened.ok) return opened;
+    }
+    return error("signerRefused", "The signer's key didn't open its wrap");
   };
 
   /** After an unlock: add this signer's wrap, creating R if the vault has none (SPEC §8.2 step 5). */
@@ -327,6 +340,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const published = await publishVault(s.ctx, added.value);
     if (!published.ok) return;
     await rememberMethod(s.db, { id: `signer:${signerIdNow}`, method: { kind: "signer", recoverable: true } });
+    // Local copy source (#38): (a) made by this device: its signer wrap added.
     await becomeReady(s.ctx, published.value, s.s, r, s.unlockedWith, s.db);
   };
 
@@ -446,7 +460,13 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       backupRequirement(backupState.methods.map((m) => m.method), backupState.phraseConfirmed) !== "none",
   });
 
-  /** Opens the database for S, keeps the vault copy and the cache, and becomes ready. */
+  /**
+   * Opens the database for S, keeps the vault copy and the cache, and becomes
+   * ready. The only writer of the local vault copy (META_VAULT), the trust anchor
+   * of decideVault (#38): every caller passes a vault this device (a) made, (b)
+   * opened with R, (c) opened through NIP-44 after the user chose or confirmed
+   * it, or (d) merged from the checked copy.
+   */
   const becomeReady = async (
     ctx: VaultContext,
     vaultIn: Vault,
@@ -524,6 +544,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (check.kind === "found" && check.vault.sHash !== published.value.sHash && check.vault.created <= published.value.created) {
       return unlockFetched(ctx, check.vault, undefined);
     }
+    // Local copy source (#38): (a) made by this device.
     return withReady(becomeReady(ctx, published.value, s, undefined, "created"));
   };
 
@@ -546,6 +567,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         if (s.ok) {
           const db = await deps.openDatabase(s.value);
           if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
+          // Local copy source (#38): (b) opened with R from the signer.
           return withReady(becomeReady(ctx, vault, s.value, root.value, "signer", db));
         }
       }
@@ -555,6 +577,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       if (s.ok) {
         const db = await deps.openDatabase(s.value);
         await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
+        // Local copy source (#38): (b) opened with the cached R.
         return withReady(becomeReady(ctx, vault, s.value, local.r, "cache", db));
       }
     }
@@ -569,6 +592,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
         // Keep a cached R only if it really opens this vault (#33).
         const r = local?.r !== undefined && openRootData(ctx, vault, local.r).ok ? local.r : undefined;
+        // Local copy source (#38): (c) opened through NIP-44: a compatible vault, after confirmWeak on a new device.
         return withReady(becomeReady(ctx, vault, s.value, r, "nip44", db));
       }
       if (s.error.type === "signerRefused") return s;
@@ -578,10 +602,12 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
 
   /** A strong method is needed: a passkey (from a click) if one matches, else the phrase. */
   const askStrongUnlock = (ctx: VaultContext, vault: Vault, local: Pending["local"]): Result<ConnectResult> => {
-    const signerCanOpen = caps !== null && vault.rootWraps.some((w) => w.type === "signer");
+    // Choose from the fetched vault's and the local copy's wraps together (#39).
+    const wraps = [...vault.rootWraps, ...(local?.copy?.rootWraps ?? [])];
+    const signerCanOpen = caps !== null && wraps.some((w) => w.type === "signer");
     const action: UserAction = signerCanOpen
       ? "signerUnlock"
-      : passkeys !== undefined && passkeySupported && passkeyWrapsFor(vault, passkeys.rpId).length > 0
+      : passkeys !== undefined && passkeySupported && wraps.some((w) => w.type === "passkey" && w.rpId === passkeys.rpId)
         ? "passkey"
         : "recoveryPhrase";
     session = { kind: "pending", ctx, action, vault, ...(local === undefined ? {} : { local }) };
@@ -589,19 +615,28 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   };
 
   /** Opens R with one of this domain's passkeys (SPEC §4.3). Call from a click. */
-  const rootFromPasskey = async (ctx: VaultContext, vault: Vault): Promise<Result<Bytes>> => {
+  /**
+   * Opens R with one of this domain's passkeys (SPEC §4.3). Call from a click.
+   * Wraps from the local copy are tried too, so a fetched vault with missing or
+   * corrupted wraps can't lock the device out (#39).
+   */
+  const rootFromPasskey = async (ctx: VaultContext, vault: Vault, copy?: Vault): Promise<Result<Bytes>> => {
     if (passkeys === undefined) return error("noPasskeys", "Passkeys aren't enabled");
-    const wraps = passkeyWrapsFor(vault, passkeys.rpId);
-    if (wraps.length === 0) return error("noPasskeyWrap", "No passkey for this site is registered in the vault");
+    const candidates = [...passkeyWrapsFor(vault, passkeys.rpId), ...(copy === undefined ? [] : passkeyWrapsFor(copy, passkeys.rpId))];
+    if (candidates.length === 0) return error("noPasskeyWrap", "No passkey for this site is registered in the vault");
     let result;
     try {
-      result = await passkeys.get({ allowCredIds: wraps.map((w) => w.credId), prfInput: clientPrfInput(ctx.pubkey, ctx.appId) });
+      result = await passkeys.get({ allowCredIds: [...new Set(candidates.map((w) => w.credId))], prfInput: clientPrfInput(ctx.pubkey, ctx.appId) });
     } catch (e) {
       return error("passkeyFailed", e instanceof Error ? e.message : String(e));
     }
-    const wrap = wraps.find((w) => w.credId === result.credId);
-    if (wrap === undefined || result.prfOutput === null) return error("passkeyFailed", "The passkey gave no usable result");
-    return openRootWrap(ctx, wrap, passkeyWrapKey(result.prfOutput, ctx.appId));
+    if (result.prfOutput === null) return error("passkeyFailed", "The passkey gave no usable result");
+    const key = passkeyWrapKey(result.prfOutput, ctx.appId);
+    for (const wrap of candidates.filter((w) => w.credId === result.credId)) {
+      const opened = openRootWrap(ctx, wrap, key);
+      if (opened.ok) return opened;
+    }
+    return error("passkeyFailed", "The passkey didn't open any wrap of this vault");
   };
 
   // ── API ──
@@ -676,6 +711,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       case "follow": {
         const db = await deps.openDatabase(decision.s);
         await switchDatabase(local?.db, db, migrationModeFor(decision.vault, local!.db.sHash));
+        // Local copy source (#38): (b) opened with R (decideVault "follow").
         return withReady(becomeReady(ctx, decision.vault, decision.s, local!.r, "cache", db));
       }
       case "needsStrongUnlock":
@@ -709,9 +745,17 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       vault = f.vault;
     }
     const s = openRootData(p.ctx, vault, r.value);
-    if (!s.ok) return error("wrongPhrase", "This recovery phrase doesn't open this app's data");
+    if (!s.ok) {
+      // R is real (it opens this device's copy), so the fetched vault is foreign (#39).
+      if (p.local?.copy !== undefined && openRootData(p.ctx, p.local.copy, r.value).ok) {
+        session = { kind: "pending", ctx: p.ctx, action: "choose", vault, local: { ...p.local, r: r.value } };
+        return error("vaultReplaced", "The vault on the relays isn't yours; restore this device's copy with resolveVaultChange(\"republishCopy\")");
+      }
+      return error("wrongPhrase", "This recovery phrase doesn't open this app's data");
+    }
     const db = await deps.openDatabase(s.value);
     if (p.local !== undefined) await switchDatabase(p.local.db, db, migrationModeFor(vault, p.local.db.sHash));
+    // Local copy source (#38): (b) opened with R from a passkey, signer or the phrase.
     return becomeReady(p.ctx, vault, s.value, r.value, how, db);
   };
 
@@ -732,12 +776,12 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (p.action === "recoveryPhrase") return error("phraseRequired", "Pass the recovery phrase");
     if (p.action === "passkey") {
       if (p.vault === undefined) return error("noVault", "No vault to unlock");
-      const root = await rootFromPasskey(p.ctx, p.vault);
+      const root = await rootFromPasskey(p.ctx, p.vault, p.local?.copy);
       return root.ok ? openWithRoot(p, root.value, "passkey") : root;
     }
     if (p.action === "signerUnlock") {
       if (p.vault === undefined) return error("noVault", "No vault to unlock");
-      const root = await rootFromSigner(p.ctx, p.vault);
+      const root = await rootFromSigner(p.ctx, p.vault, p.local?.copy);
       return root.ok ? openWithRoot(p, root.value, "signer") : root;
     }
     if (p.action === "setupStrong") return setupStrong(p.ctx, input?.acceptDeviceLoss === true);
@@ -762,6 +806,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         if (p.local?.copy === undefined) return error("noCopy", "This device has no copy of the vault");
         const published = await publishVault(p.ctx, p.local.copy);
         if (!published.ok) return published;
+        // Local copy source (#38): (a) this device's own copy, republished.
         return becomeReady(p.ctx, published.value, p.local.s, p.local.r, "cache", p.local.db);
       }
       case "followRelay": {
@@ -769,6 +814,10 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         // The user chose this. Use R when it opens the vault; otherwise NIP-44
         // (only a compatible vault has a nip44 wrap; a strict one never falls back).
         const viaRoot = p.local?.r === undefined ? null : openRootData(p.ctx, p.vault, p.local.r);
+        // A database protected by a root key never follows a vault only NIP-44 opens (#38).
+        if (!viaRoot?.ok && p.local?.copy !== undefined && hasRootKey(p.local.copy)) {
+          return error("unsafeFollow", "This device's data is protected by a root key; restore with a strong method instead");
+        }
         const s = viaRoot?.ok ? viaRoot : p.vault.mode === "compatible" ? await nip44OpenSecret(deps.signer, p.ctx.pubkey, p.vault) : viaRoot ?? error("rootLocked", "A strong unlock is needed");
         if (!s.ok) return s;
         const db = await deps.openDatabase(s.value);
@@ -777,6 +826,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         if (p.local !== undefined && p.local.db.sHash !== db.sHash) {
           await migrateRows(p.local.db, db, { kind: "since", cutoffMs: Number.POSITIVE_INFINITY, marginMs: 0 });
         }
+        // Local copy source (#38): (b) opened with R, or (c) through NIP-44 after the user chose to follow.
         return becomeReady(p.ctx, p.vault, s.value, viaRoot?.ok ? p.local?.r : undefined, viaRoot?.ok ? "cache" : "nip44", db);
       }
       case "restorePhrase":
@@ -829,6 +879,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!withRoot.ok) return withRoot;
     const published = await publishVault(s.value.ctx, withRoot.value);
     if (!published.ok) return published;
+    // Local copy source (#38): (a) made by this device.
     const ready = await becomeReady(s.value.ctx, published.value, s.value.s, r, s.value.unlockedWith, s.value.db);
     return ready.ok ? ok(rootKeyToPhrase(r)) : ready;
   };
@@ -870,6 +921,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!next.ok) return next;
     const published = await publishVault(s.value.ctx, next.value, true);
     if (!published.ok && published.error.type !== "partialPublish") return published;
+    // Local copy source (#38): (a) made by this device (downgrade).
     const ready = await becomeReady(s.value.ctx, published.ok ? published.value : next.value, s.value.s, s.value.r, s.value.unlockedWith, s.value.db);
     if (!ready.ok) return ready;
     return published.ok ? ok(ready.value.status) : published;
@@ -914,6 +966,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const published = await publishVault(s.ctx, added.value);
     if (!published.ok) return published;
     await rememberMethod(s.db, { id: `passkey:${created.credId}`, method: { kind: "passkey", synced: created.synced } });
+    // Local copy source (#38): (a) made by this device (passkey added).
     const ready = await becomeReady(s.ctx, published.value, s.s, r, s.unlockedWith, s.db);
     return ready.ok ? ok(ready.value.status) : ready;
   };
@@ -975,10 +1028,12 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!published.ok) {
       // Some relays have the strict vault: continue on S', but keep the old
       // local database until every relay agrees (#32). connect() re-sends it.
+      // Local copy source (#38): (a) made by this device (makeStrict).
       const ready = await becomeReady(s.value.ctx, next.value, newS, s.value.r, s.value.unlockedWith, db);
       return ready.ok ? published : ready;
     }
     await s.value.db.deleteLocal();
+    // Local copy source (#38): (a) made by this device (makeStrict).
     const ready = await becomeReady(s.value.ctx, published.value, newS, s.value.r, s.value.unlockedWith, db);
     return ready.ok ? ok(ready.value.status) : ready;
   };
@@ -1002,6 +1057,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         if (!published.ok) return published;
         const db = await deps.openDatabase(s);
         await db.setMeta(META_STRONG_METHODS, JSON.stringify([{ id: `signer:${c.signerId}`, method: { kind: "signer", recoverable: true } }]));
+        // Local copy source (#38): (a) made by this device (requireStrong).
         return becomeReady(ctx, published.value, s, r, "signer", db);
       }
     }
@@ -1029,6 +1085,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!published.ok) return published;
     const db = await deps.openDatabase(s);
     await db.setMeta(META_STRONG_METHODS, JSON.stringify([{ id: `passkey:${created.value.credId}`, method }]));
+    // Local copy source (#38): (a) made by this device (requireStrong).
     return becomeReady(ctx, published.value, s, r, "passkey", db);
   };
 

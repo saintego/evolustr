@@ -1,4 +1,4 @@
-import { type Bytes, VAULT_KIND, appVaultDTag, memoryRelays, secretKeySigner, unwrap } from "@evolustr/core";
+import { type Bytes, VAULT_KIND, appVaultDTag, createCompatibleVault, createStrictVault, memoryRelays, nip44SealSecret, randomBytes, secretKeySigner, unwrap, vaultEvent } from "@evolustr/core";
 import { generateSecretKey } from "nostr-tools/pure";
 import { describe, expect, it } from "vitest";
 import { memoryPasskeys } from "@evolustr/core";
@@ -287,5 +287,136 @@ describe("client passkeys and strict mode", () => {
     await connectReady(c);
     unwrap(await c.unlockRoot());
     expect((await relayVault(w, ra.pubkey)).rootWraps.map((x) => x.credId)).not.toContain("junk");
+  });
+
+  /** The forged same-secret compatible vault from #38 step 1. */
+  const poison = (w: ReturnType<typeof world>, pubkey: string) =>
+    tamper(w, pubkey, (v) => {
+      v["mode"] = "compatible";
+      v["history"] = [];
+      v["rootWraps"] = [];
+      v["dataWraps"] = [{ type: "nip44", ct: "x" }];
+    });
+  const strictDevice = async (w: ReturnType<typeof world>, opts: Partial<ClientOptions> = {}) => {
+    const d = w.device({ options: opts });
+    const a = d.make();
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    const phrase = unwrap(await a.showRecoveryPhrase());
+    await a.makeStrict();
+    return { d, a, pubkey: ra.pubkey, phrase };
+  };
+
+  it("poison without R: a strong unlock is required and the local copy is unchanged (#38)", async () => {
+    const w = world();
+    const { d, pubkey } = await strictDevice(w);
+    const before = await (await d.make().connect().then((r) => (unwrap(r) as { db: { getMeta: (k: string) => Promise<string | null> } }).db)).getMeta("vault");
+    await poison(w, pubkey);
+    const c = d.make();
+    expect(unwrap(await c.connect())).toMatchObject({ state: "needsUserAction" });
+    const db = await d.dbs.open((await d.cache.get(pubkey, APP))!.s);
+    expect(await db.getMeta("vault")).toBe(before);
+    expect(JSON.parse(before!).mode).toBe("strict");
+  });
+
+  it("poison with R: replaced (#38)", async () => {
+    const w = world();
+    const { d, pubkey } = await strictDevice(w, { cacheRootKey: true });
+    await poison(w, pubkey);
+    expect(unwrap(await d.make().connect())).toMatchObject({ state: "vaultChanged", reason: "replaced" });
+  });
+
+  it("two-step attack: no followRelay to the attacker's weak vault (#38)", async () => {
+    const w = world();
+    const { d, pubkey } = await strictDevice(w);
+    await poison(w, pubkey);
+    await d.make().connect();
+    const ctx = { pubkey, appId: APP };
+    const evilS = randomBytes(16);
+    const evil = unwrap(createCompatibleVault(ctx, { s: evilS, nip44Ct: await nip44SealSecret(w.signer, pubkey, evilS), now: w.now() + 500 }));
+    w.tick(1000);
+    await w.mem.relays.publish(URLS, await w.signer.signEvent(vaultEvent(ctx, evil, w.now())), 100);
+    const r = unwrap(await d.make().connect());
+    expect(r).toMatchObject({ state: "vaultChanged", reason: "replaced" });
+    if (r.state === "vaultChanged") expect(r.options).not.toContain("followRelay");
+  });
+
+  it("the recovery phrase stays the same through a poison attempt (#38)", async () => {
+    const w = world();
+    const { d, pubkey, phrase } = await strictDevice(w);
+    await poison(w, pubkey);
+    const c = d.make();
+    await c.connect();
+    // The real phrase doesn't open the forged vault, but it opens this device's copy (#39).
+    expect(await c.unlock({ recoveryPhrase: phrase })).toMatchObject({ ok: false, error: { type: "vaultReplaced" } });
+    const ready = unwrap(await c.resolveVaultChange("republishCopy"));
+    expect(ready.status.mode).toBe("strict");
+    expect(unwrap(await c.showRecoveryPhrase())).toBe(phrase);
+  });
+
+  it("legit: another device adding R doesn't trigger a prompt (#38)", async () => {
+    const w = world();
+    const a = w.device().make();
+    await connectReady(a);
+    const bd = w.device();
+    await connectReady(bd.make());
+    await a.showRecoveryPhrase();
+    expect(unwrap(await bd.make().connect()).state).toBe("ready");
+  });
+
+  it("legit downgrade elsewhere: a strong unlock, then compatible (#38)", async () => {
+    const w = world();
+    const { a } = await strictDevice(w);
+    const bd = w.device();
+    const b = bd.make();
+    expect(unwrap(await b.connect())).toEqual({ state: "needsUserAction", action: "passkey" });
+    unwrap(await b.unlock());
+    unwrap(await a.downgrade());
+    const b2 = bd.make();
+    expect(unwrap(await b2.connect())).toMatchObject({ state: "needsUserAction" });
+    expect(unwrap(await b2.unlock()).status.mode).toBe("compatible");
+  });
+
+  /** An attacker's own strict vault that carries copies of the user's passkey wraps (#39). */
+  const foreignStrict = async (w: ReturnType<typeof world>, pubkey: string, corrupt: boolean) => {
+    const current = (await w.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [appVaultDTag(pubkey, APP)] }, 100)).events[0]!;
+    const real = JSON.parse(current.content) as { rootWraps: Array<Record<string, string>> };
+    const ctx = { pubkey, appId: APP };
+    const fake = unwrap(createStrictVault(ctx, { s: randomBytes(16), r: randomBytes(16), now: w.now() + 500, rootWraps: [] }));
+    const wraps = real.rootWraps.map((x) => (corrupt ? { ...x, ct: "AAAAAAAAAAAAAAAAAAAAAAAA" } : x));
+    w.tick(1000);
+    await w.mem.relays.publish(URLS, await w.signer.signEvent({ kind: VAULT_KIND, created_at: w.now(), tags: current.tags, content: JSON.stringify({ ...fake, rootWraps: wraps }) }), 100);
+  };
+
+  it("a foreign strict vault with the user's passkey wraps: vaultReplaced, then restore (#39)", async () => {
+    const w = world();
+    const { d, pubkey } = await strictDevice(w);
+    const before = (await connectReady(d.make())).db.sHash;
+    await foreignStrict(w, pubkey, false);
+    const c = d.make();
+    expect(unwrap(await c.connect())).toMatchObject({ state: "needsUserAction" });
+    expect(await c.unlock()).toMatchObject({ ok: false, error: { type: "vaultReplaced" } });
+    const restored = unwrap(await c.resolveVaultChange("republishCopy"));
+    expect(restored.status.mode).toBe("strict");
+    expect(restored.db.sHash).toBe(before);
+    expect(unwrap(await d.make().connect()).state).not.toBe("vaultChanged");
+  });
+
+  it("the copy's passkey wrap is used when the fetched one is corrupted (#39)", async () => {
+    const w = world();
+    const { d, pubkey } = await strictDevice(w);
+    await foreignStrict(w, pubkey, true);
+    const c = d.make();
+    await c.connect();
+    expect(await c.unlock()).toMatchObject({ ok: false, error: { type: "vaultReplaced" } });
+  });
+
+  it("a wrong recovery phrase is still wrongPhrase (#39)", async () => {
+    const w = world();
+    const { d, pubkey } = await strictDevice(w);
+    await foreignStrict(w, pubkey, false);
+    const c = d.make();
+    await c.connect();
+    expect(await c.unlock({ recoveryPhrase: "abandon ".repeat(11) + "about" })).toMatchObject({ ok: false, error: { type: "wrongPhrase" } });
   });
 });

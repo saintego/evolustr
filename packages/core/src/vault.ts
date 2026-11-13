@@ -293,6 +293,13 @@ export const openRootData = (
   );
 };
 
+/** Same header and same data wraps (root: iv+ct, nip44: ct). Root wraps are not compared (#38). */
+export const sameVaultCore = (a: Vault, b: Vault): boolean =>
+  headerBinding(a) === headerBinding(b) &&
+  JSON.stringify(a.dataWraps.map(dataWrapKey).sort()) === JSON.stringify(b.dataWraps.map(dataWrapKey).sort());
+
+const dataWrapKey = (w: DataWrap): string => (w.type === "root" ? `root|${w.iv}|${w.ct}` : `nip44|${w.ct}`);
+
 /** Checks a decrypted nip44 payload against the vault's `sHash`. */
 export const checkDataSecret = (vault: Vault, s: Bytes): Result<Bytes, EvolustrError> =>
   s.length === DATA_SECRET_LENGTH && sHash(s) === vault.sHash
@@ -364,7 +371,11 @@ export const addRootWrap = (vault: Vault, wrap: RootWrap): Result<Vault, Evolust
   return validateVault({ ...vault, rootWraps: [...others, wrap] });
 };
 
-/** Removes one root wrap; only on an explicit user action (SPEC §6.2 rule 3). */
+/**
+ * Removes one root wrap; only on an explicit user action (SPEC §6.2 rule 3).
+ * TODO(#37): the client never calls this. With "never drop a wrap", a removal
+ * would need a tombstone authenticated with R.
+ */
 export const removeRootWrap = (vault: Vault, type: RootWrap["type"], keyId: string): Vault => ({
   ...vault,
   rootWraps: vault.rootWraps.filter((w) => !(w.type === type && rootWrapKeyId(w) === keyId)),
