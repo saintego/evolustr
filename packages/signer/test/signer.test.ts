@@ -164,4 +164,49 @@ describe("@evolustr/signer", () => {
     expect(await s.getWrapKey({ identity: "connection", clientPubkey: "x|y" })).toMatchObject({ ok: false, error: { type: "invalidCaller" } });
     expect(await s.capabilities(web("not an origin"))).toMatchObject({ ok: false });
   });
+
+  describe("M from the cache doesn't skip reading the signer vault (#40)", () => {
+    const memCache = () => {
+      const m = new Map<string, Bytes>();
+      return { get: async (k: string) => m.get(k) ?? null, set: async (k: string, v: Bytes) => void m.set(k, v), remove: async (k: string) => void m.delete(k) };
+    };
+    const wrapsOnRelay = async (t: ReturnType<typeof setup>) =>
+      JSON.parse((await t.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [signerVaultDTag(t.pubkey, SIGNER)] }, 100)).events[0]!.content).wraps as Array<{ type: string }>;
+
+    it("enrolling with M cached keeps the sk wrap and the other passkeys", async () => {
+      const t = setup();
+      const cache = memCache();
+      const pk1 = memoryPasskeys({ rpId: "signer.example" });
+      const one = createEvolustrSigner(t.host({ cache, passkeys: pk1 }));
+      unwrap(await one.getWrapKey(web("https://a.example")));
+      unwrap(await one.enrollPasskey());
+      expect((await wrapsOnRelay(t)).map((w) => w.type)).toEqual(["sk", "passkey"]);
+      // A second instance starts with M in the cache.
+      const two = createEvolustrSigner(t.host({ cache, passkeys: memoryPasskeys({ rpId: "signer.example" }) }));
+      unwrap(await two.enrollPasskey());
+      expect((await wrapsOnRelay(t)).map((w) => w.type)).toEqual(["sk", "passkey", "passkey"]);
+    });
+
+    it("with the relays down, enrolling fails and publishes nothing", async () => {
+      const t = setup();
+      const cache = memCache();
+      unwrap(await createEvolustrSigner(t.host({ cache })).getWrapKey(web("https://a.example")));
+      const before = await wrapsOnRelay(t);
+      t.mem.down.add(URLS[0]!);
+      const s = createEvolustrSigner(t.host({ cache, passkeys: memoryPasskeys({ rpId: "signer.example" }) }));
+      expect((await s.enrollPasskey()).ok).toBe(false);
+      t.mem.down.clear();
+      expect(await wrapsOnRelay(t)).toEqual(before);
+    });
+
+    it("capabilities with M cached report the signer passkey", async () => {
+      const t = setup();
+      const cache = memCache();
+      const one = createEvolustrSigner(t.host({ cache, passkeys: memoryPasskeys({ rpId: "signer.example" }) }));
+      unwrap(await one.getWrapKey(web("https://a.example")));
+      unwrap(await one.enrollPasskey());
+      const two = createEvolustrSigner(t.host({ cache }));
+      expect(unwrap(await two.capabilities(web("https://a.example")))).toMatchObject({ ready: true, signerPasskey: true });
+    });
+  });
 });

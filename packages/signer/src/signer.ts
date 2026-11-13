@@ -176,6 +176,8 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   const allowSk = host.allowSkWrap !== false;
   let m: Bytes | null = null;
   let vault: SignerVault | null = null;
+  /** True once the signer vault was read from the relays this session (#40). */
+  let vaultLoaded = false;
   let lastEventAt = 0;
 
   const appIdFor = (caller: Caller) => appIdForCaller(caller, host.knownNsiteGateways);
@@ -193,7 +195,19 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     return parseSignerVault(f.event.content);
   };
 
+  /** Loads the signer vault once per session; null when none exists (#40). */
+  const loadVault = async (pubkey: string): Promise<Result<SignerVault | null>> => {
+    if (vaultLoaded) return ok(vault);
+    const fetched = await fetchVault(pubkey);
+    if (!fetched.ok) return fetched;
+    vault = fetched.value;
+    vaultLoaded = true;
+    return ok(vault);
+  };
+
   const publish = async (pubkey: string, next: SignerVault): Promise<Result<SignerVault>> => {
+    // Never publish from an unknown state: it would drop wraps added elsewhere (#40).
+    if (!vaultLoaded) return error("signerVaultUnknown", "Load the signer vault before changing it");
     const at = Math.max(now(), lastEventAt + 1);
     const signer: Signer = {
       getPublicKey: host.getPublicKey,
@@ -248,9 +262,8 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
       m = cached;
       return ok(true);
     }
-    const fetched = await fetchVault(pubkey);
-    if (!fetched.ok) return fetched;
-    vault = fetched.value;
+    const loaded = await loadVault(pubkey);
+    if (!loaded.ok) return loaded;
     const sk = host.getSecretKey?.() ?? null;
     if (sk !== null && allowSk) {
       const skWrap = vault?.wraps.find((w) => w.type === "sk");
@@ -313,6 +326,9 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     if (!appId.ok) return appId;
     const pubkey = await host.getPublicKey();
     if (m === null) await unlockQuiet(pubkey, false);
+    // M may come from the cache without the vault being read: read it, ignoring
+    // failures (still never creates or publishes anything, #29).
+    if (!vaultLoaded) await loadVault(pubkey);
     return ok({
       identity: caller.identity,
       appId: appId.value,
@@ -336,6 +352,9 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     const passkeys = host.passkeys;
     if (passkeys === undefined) return error("noPasskeys", "This signer has no passkey support");
     const pubkey = await host.getPublicKey();
+    // The current wrap list must be known before adding to it (#40).
+    const loaded = await loadVault(pubkey);
+    if (!loaded.ok) return loaded;
     const quiet = await unlockQuiet(pubkey, false);
     if (!quiet.ok) return quiet;
     if (!(await host.ui.confirm({ kind: "enrollPasskey" }))) return error("userRefused", "Cancelled");
@@ -391,6 +410,8 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   const lock: EvolustrSigner["lock"] = async () => {
     const pubkey = await host.getPublicKey().catch(() => null);
     m = null;
+    vault = null;
+    vaultLoaded = false;
     if (pubkey !== null) await host.cache?.remove(pubkey);
   };
 
