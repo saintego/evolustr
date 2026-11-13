@@ -274,4 +274,22 @@ describe("@evolustr/signer", () => {
       expect(await createEvolustrSigner(t.host()).getWrapKey(web("https://a.example"))).toMatchObject({ ok: false, error: { type: "invalidSignerVault" } });
     });
   });
+
+  describe("recoverable (#42)", () => {
+    it("true with the nsec (sk wrap)", async () => {
+      const s = createEvolustrSigner(setup().host());
+      unwrap(await s.getWrapKey(web("https://a.example")));
+      expect(unwrap(await s.capabilities(web("https://a.example"))).recoverable).toBe(true);
+    });
+    it("true with only a synced signer passkey", async () => {
+      const s = createEvolustrSigner(setup().host({ holdsNsec: false, passkeys: memoryPasskeys({ rpId: "signer.example", synced: true }) }));
+      unwrap(await s.enrollPasskey());
+      expect(unwrap(await s.capabilities(web("https://a.example"))).recoverable).toBe(true);
+    });
+    it("false with only a device-bound signer passkey", async () => {
+      const s = createEvolustrSigner(setup().host({ holdsNsec: false, passkeys: memoryPasskeys({ rpId: "signer.example", synced: false }) }));
+      unwrap(await s.enrollPasskey());
+      expect(unwrap(await s.capabilities(web("https://a.example"))).recoverable).toBe(false);
+    });
+  });
 });

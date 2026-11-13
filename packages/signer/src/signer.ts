@@ -48,7 +48,13 @@ export type Caller =
 
 export type SignerWrap =
   | ({ readonly type: "sk" } & Sealed)
-  | ({ readonly type: "passkey"; readonly rpId: string; readonly credId: string } & Sealed);
+  | ({
+      readonly type: "passkey";
+      readonly rpId: string;
+      readonly credId: string;
+      /** The passkey was synced (BS flag) when enrolled (#42). */
+      readonly synced?: boolean;
+    } & Sealed);
 
 export interface SignerVault {
   readonly v: 1;
@@ -103,6 +109,8 @@ export interface Capabilities {
   readonly signerId: string | null;
   readonly ready: boolean;
   readonly signerPasskey: boolean;
+  /** M can be recovered on another device: an `sk` wrap, or a synced signer passkey (#42). */
+  readonly recoverable: boolean;
 }
 
 export const METHODS = ["evolustr_capabilities", "evolustr_get_wrap_key", "evolustr_enroll_passkey"] as const;
@@ -146,7 +154,13 @@ export const parseSignerVault = (json: string): Result<SignerVault, EvolustrErro
     const sealed = { iv: w["iv"], ct: w["ct"] };
     if (w["type"] === "sk") wraps.push({ type: "sk", ...sealed });
     else if (w["type"] === "passkey" && typeof w["rpId"] === "string" && typeof w["credId"] === "string") {
-      wraps.push({ type: "passkey", rpId: w["rpId"], credId: w["credId"], ...sealed });
+      wraps.push({
+        type: "passkey",
+        rpId: w["rpId"],
+        credId: w["credId"],
+        ...(typeof w["synced"] === "boolean" ? { synced: w["synced"] } : {}),
+        ...sealed,
+      });
     } else return error("invalidSignerVault", "Unknown wrap type");
   }
   // A vault that exists but has no wraps isn't "first use" (#28).
@@ -272,7 +286,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     return ok(next);
   };
 
-  const sealM = (pubkey: string, key: Bytes, w: { type: "sk" } | { type: "passkey"; rpId: string; credId: string }, secret: Bytes): SignerWrap => {
+  const sealM = (pubkey: string, key: Bytes, w: { type: "sk" } | { type: "passkey"; rpId: string; credId: string; synced?: boolean }, secret: Bytes): SignerWrap => {
     const id = w.type === "sk" ? "sk" : w.credId;
     return { ...w, ...seal(key, secret, signerWrapAad(pubkey, host.signerKey, w.type, id)) } as SignerWrap;
   };
@@ -378,6 +392,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
       signerId: m === null ? null : computeSignerId(m, appId.value),
       ready: m !== null,
       signerPasskey: (vault?.wraps ?? []).some((w) => w.type === "passkey"),
+      recoverable: (vault?.wraps ?? []).some((w) => w.type === "sk" || (w.type === "passkey" && w.synced === true)),
     });
   };
 
@@ -431,7 +446,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     if (prfOutput === null) return error("prfUnsupported", "The passkey gave no PRF output");
     // Only when no signer vault exists at all: create M now.
     const secret = m ?? random(MASTER_SECRET_LENGTH);
-    let next = withWrap(vault, sealM(pubkey, signerPasskeyWrapKey(prfOutput), { type: "passkey", rpId: passkeys.rpId, credId: created.credId }, secret));
+    let next = withWrap(vault, sealM(pubkey, signerPasskeyWrapKey(prfOutput), { type: "passkey", rpId: passkeys.rpId, credId: created.credId, synced: created.synced }, secret));
     if (!allowSk) next = { v: 1, wraps: next.wraps.filter((w) => w.type !== "sk") };
     const published = await publish(pubkey, next);
     if (!published.ok) return published;

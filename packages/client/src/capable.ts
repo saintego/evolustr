@@ -9,6 +9,8 @@ export interface SignerCapabilities {
   readonly signerId: string | null;
   readonly ready: boolean;
   readonly signerPasskey: boolean;
+  /** M can be recovered on another device (#42). Older signers don't send it: counts as false. */
+  readonly recoverable?: boolean;
 }
 
 export interface CapableSigner {

@@ -103,6 +103,8 @@ The prompt should say "<app> wants to change your Evolustr data keys".
 
 ## Custody
 
+`capabilities()` reports `recoverable`: true when the signer vault has an `sk` wrap or a passkey that was synced when enrolled. Apps use it for the backup check before strict (SPEC §3.2 rule 3a); a signer that doesn't report it counts as not recoverable.
+
 How your signer stores `M` decides who besides the user could derive app keys:
 
 | Your signer | `allowSkWrap` | Result |

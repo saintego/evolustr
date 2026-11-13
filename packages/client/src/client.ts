@@ -314,7 +314,11 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const s = session;
     let c = caps;
     if (c === null) return;
-    if (c.ready && c.signerId !== null && signerWrapFor(s.vault, c.signerId) !== undefined) return;
+    if (c.ready && c.signerId !== null && signerWrapFor(s.vault, c.signerId) !== undefined) {
+      // Refresh the record: the signer may have gained an sk wrap or a synced passkey (#42).
+      await rememberMethod(s.db, { id: `signer:${c.signerId}`, method: { kind: "signer", recoverable: c.recoverable === true } });
+      return;
+    }
     // A locked signer that needs a passkey click isn't asked here; the user adds it later.
     if (!c.ready && c.signerPasskey) return;
     if (s.r === undefined && hasRootKey(s.vault)) return; // nip44-only device: can't add (SPEC §3.1)
@@ -339,7 +343,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!added.ok) return;
     const published = await publishVault(s.ctx, added.value);
     if (!published.ok) return;
-    await rememberMethod(s.db, { id: `signer:${signerIdNow}`, method: { kind: "signer", recoverable: true } });
+    await rememberMethod(s.db, { id: `signer:${signerIdNow}`, method: { kind: "signer", recoverable: c.recoverable === true } });
     // Local copy source (#38): (a) made by this device: its signer wrap added.
     await becomeReady(s.ctx, published.value, s.s, r, s.unlockedWith, s.db);
   };
@@ -1049,6 +1053,11 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       }
       const c = await refreshCaps();
       if (c?.signerId != null) {
+        // The same backup check as for passkeys (SPEC §3.2 rule 3a, #42).
+        const method: StrongMethod = { kind: "signer", recoverable: c.recoverable === true };
+        if (backupRequirement([method], false) === "required" && !acceptDeviceLoss) {
+          return error("backupRequired", "This signer's key can't be recovered on another device: accept losing the data with this device, or set up a backup first");
+        }
         const r = random(ROOT_KEY_LENGTH);
         const s = random(DATA_SECRET_LENGTH);
         const vault = createStrictVault(ctx, { s, r, now: now(), rootWraps: [signerRootWrap(ctx, key, c.signerId, r)] });
@@ -1056,7 +1065,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         const published = await publishVault(ctx, vault.value);
         if (!published.ok) return published;
         const db = await deps.openDatabase(s);
-        await db.setMeta(META_STRONG_METHODS, JSON.stringify([{ id: `signer:${c.signerId}`, method: { kind: "signer", recoverable: true } }]));
+        await db.setMeta(META_STRONG_METHODS, JSON.stringify([{ id: `signer:${c.signerId}`, method }]));
         // Local copy source (#38): (a) made by this device (requireStrong).
         return becomeReady(ctx, published.value, s, r, "signer", db);
       }

@@ -1,4 +1,4 @@
-import { memoryRelays, unwrap } from "@evolustr/core";
+import { memoryRelays, randomBytes, unwrap } from "@evolustr/core";
 import { createEvolustrSigner, listenForIframeRequests } from "@evolustr/signer";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { secretKeySigner } from "@evolustr/core";
@@ -97,5 +97,50 @@ describe("client with a capable iframe signer", () => {
     expect(unwrap(await a.connect())).toEqual({ state: "needsUserAction", action: "setupStrong" });
     expect(unwrap(await a.unlock()).status).toMatchObject({ mode: "strict", unlockedWith: "signer" });
     expect((await ready(w.device("https://notes.example", { requireStrong: true }))).status.unlockedWith).toBe("signer");
+  });
+});
+
+describe("backup check with a capable signer (#42)", () => {
+  /** A capable signer that reports whatever `recoverable` the test wants. */
+  const fakeSigner = (recoverable: boolean | undefined) => {
+    const key = randomBytes(32);
+    return {
+      capabilities: async () => ({ identity: "verified" as const, appId: "https://notes.example", signerId: "0123456789abcdef", ready: true, signerPasskey: true, ...(recoverable === undefined ? {} : { recoverable }) }),
+      getWrapKey: async () => key,
+    };
+  };
+  const client = (recoverable: boolean | undefined, requireStrong = false) =>
+    createEvolustr(
+      {
+        signer: secretKeySigner(generateSecretKey()),
+        relays: memoryRelays().relays,
+        openDatabase: memoryDatabases(["notes"]).open,
+        cache: memoryCache(),
+        capableSigner: fakeSigner(recoverable),
+      },
+      { appId: "https://notes.example", relayUrls: ["wss://r1"], ...(requireStrong ? { requireStrong: true } : {}) },
+    );
+
+  it("a signer that isn't recoverable needs a backup before strict", async () => {
+    const c = client(false);
+    expect(unwrap(await c.connect()).state).toBe("ready");
+    expect(await c.makeStrict()).toMatchObject({ ok: false, error: { type: "backupRequired" } });
+    expect((await c.makeStrict({ acceptDeviceLoss: true })).ok).toBe(true);
+  });
+  it("a signer that doesn't report it counts as not recoverable", async () => {
+    const c = client(undefined);
+    unwrap(await c.connect());
+    expect(await c.makeStrict()).toMatchObject({ ok: false, error: { type: "backupRequired" } });
+  });
+  it("a recoverable signer only gets the reminder", async () => {
+    const c = client(true);
+    unwrap(await c.connect());
+    expect(unwrap(await c.makeStrict())).toMatchObject({ mode: "strict", backupRecommended: true });
+  });
+  it("requireStrong with a non-recoverable signer needs acceptDeviceLoss", async () => {
+    const c = client(false, true);
+    expect(unwrap(await c.connect())).toEqual({ state: "needsUserAction", action: "setupStrong" });
+    expect(await c.unlock()).toMatchObject({ ok: false, error: { type: "backupRequired" } });
+    expect(unwrap(await c.unlock({ acceptDeviceLoss: true })).status.mode).toBe("strict");
   });
 });

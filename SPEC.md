@@ -115,7 +115,8 @@ Rules:
 | The user's only strong method | Recoverable on its own? | Before `makeStrict()` |
 |---|---|---|
 | Synced passkey: the WebAuthn authenticator data has the **backup state** flag (BS) set, e.g. iCloud Keychain, Google Password Manager, a password manager | Yes, through the provider account | Nothing required. Show a skippable reminder: "Your data is protected by your passkey. Save your recovery phrase or add a second passkey in case you lose access to your passkey provider." |
-| Capable signer whose `M` can be recovered from the nsec (`sk` wrap), or by a synced signer passkey | Yes, through the signer | Nothing required. Same skippable reminder. |
+| Capable signer whose `M` can be recovered from the nsec (`sk` wrap), or by a synced signer passkey (it reports `recoverable: true`) | Yes, through the signer | Nothing required. Same skippable reminder. |
+| Capable signer whose `M` sits behind a device-bound signer passkey only, or that doesn't report `recoverable` | **No** | Same as a device-bound passkey: backup or explicit acceptance. |
 | Device-bound passkey (BS flag not set: a hardware key, a local-only platform authenticator) or a signer passkey that isn't synced | **No**: losing that one device loses the data | Confirm the recovery phrase, add a second strong method, **or** explicitly accept "I will lose this data if I lose this device". |
 
 The BS flag is what the authenticator reports at that moment; a user can still lose the provider account or turn sync off later. So the reminder stays visible (`status.backupRecommended`) until the user has a second strong method or has confirmed the phrase. The recovery phrase can be shown at any time later (`showRecoveryPhrase()`).
@@ -279,6 +280,7 @@ interface EvolustrSignerApi {
     signerId: string | null;       // null until M is unlocked
     ready: boolean;                // M is unlocked
     signerPasskey: boolean;        // M can be unlocked by a signer passkey
+    recoverable: boolean;          // M survives losing this device: sk wrap or a synced signer passkey
   }>;
   /** Wrap key for the caller's app vault. The signer computes appId itself.
    *  If M is locked (ready === false), the signer first shows its own Unlock UI
