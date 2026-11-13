@@ -198,6 +198,12 @@ $("connect").onclick = async () => {
       relays: poolRelays(),
       openDatabase: databases.open,
       cache: webSecretCache(),
+      // Non-secret hint that survives logout (#44).
+      hints: {
+        get: async (k) => localStorage.getItem(k),
+        set: async (k, v) => localStorage.setItem(k, v),
+        remove: async (k) => localStorage.removeItem(k),
+      },
       passkeys: webauthnPasskeys({ rpName: "Evolustr Notes" }),
       capableSigner: detectCapableSigner((window as unknown as { nostr?: unknown }).nostr),
     },
