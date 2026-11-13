@@ -110,7 +110,7 @@ How your signer stores `M` decides who besides the user could derive app keys:
 | Your signer | `allowSkWrap` | Result |
 |---|---|---|
 | Holds the nsec, and only the user can recover it | `true` | Keys without any passkey; a new device with the same nsec gets them silently. **But anyone who has the nsec can then open strict data too**: many users have pasted their nsec into several clients. Tell the user when they turn Evolustr on, and offer the passkey option below. `capabilities()` reports `nsecProtected`. |
-| Holds the nsec, but a third party can recover it (OAuth/MPC login, custodial bunker) | Offer the user a choice | With the `sk` wrap, that third party could derive the app keys. Offer a signer passkey and `allowSkWrap: false` instead. |
+| Holds the nsec, but a third party can recover it (OAuth/MPC login, custodial bunker) | Offer the user a choice: `allowSkWrap: () => userAgreed` | With the `sk` wrap, that third party could derive the app keys. Offer a signer passkey instead. A user who switches later calls `enrollPasskey()` with `allowSkWrap` now false: the passkey wraps the same master key and the `sk` wrap is dropped, but anything the third party could read before stays readable to them. Ask before first use. |
 | Passes requests to another signer (no nsec) | n/a | The API works after the user enrolls a signer passkey. |
 
 ## Passkeys in an iframe signer
@@ -128,10 +128,12 @@ How your signer stores `M` decides who besides the user could derive app keys:
 
 ## Example: nostr-shard-signer
 
-[nostr-shard-signer](https://github.com/saintego/nostr-shard-signer) is an iframe signer with an OAuth (Web3Auth) mode that holds the nsec, and a passthrough mode for extensions and bunkers. Integration plan, tracked in issue #15:
+[nostr-shard-signer](https://github.com/saintego/nostr-shard-signer) is an iframe signer with an OAuth (Web3Auth) mode that holds the nsec, and a passthrough mode for extensions and bunkers (issue #15):
 
-- **Iframe (`bunker/src/App.tsx`):** create the Evolustr signer once signed in, with `signerKey: location.origin`, `getSecretKey: () => privateKeyRef.current`, and `confirm` / `requestGesture` built on the existing `ConfirmView`. Route `type: "evolustr"` messages to `handleIframeMessage(evolustr, event, parentOrigin)` after the existing origin checks.
-- **Auto-approve list (PR #46 there):** skip events where `isProtectedEvent()` is true.
-- **`nostr-bridge.js`:** add `window.nostr.evolustr` forwarding to the iframe, and stop the 30 s RPC timeout for `evolustr_*` calls (the existing `CONFIRM_PENDING` message can be reused). `nostr-bridge.js` is a plain script, so either bundle `@evolustr/client` into it or inline the small iframe-client code.
-- **Custody:** in OAuth mode the Web3Auth `clientId` owner can recover the nsec, so the `sk` wrap needs the user's consent; offer a signer passkey instead. In passthrough mode a signer passkey is required.
+- **Iframe (`bunker/src/lib/evolustr.ts`, `App.tsx`):** one Evolustr signer per signed-in user, with `signerKey: location.origin`. `evolustr_*` requests use the iframe's existing RPC envelope (`{ id, method, params }` → `{ id, result, error }`) and go to `evolustr.handle()` with `origin: event.origin`, after the existing parent-origin and source checks. Prompts (`confirm`, `requestGesture`) share the signer's confirmation queue.
+- **Auto-approve list:** events where `isProtectedEvent()` is true always ask, even with kind 30078 auto-approved.
+- **`nostr-bridge.js`:** `window.nostr.evolustr` forwards to the iframe in every mode, without the 30 s RPC timeout. In passthrough mode the iframe asks the bridge to sign its own vault event (`EVOLUSTR_SIGN`), and checks the signature it gets back.
+- **Custody:** in OAuth mode the user chooses on first use between their login (`allowSkWrap: () => custody === "sk"`) and a signer passkey; Settings can switch to a passkey later. In passthrough mode a signer passkey is required.
+- **Passkeys:** in the iframe when its permissions policy allows them (`allow="publickey-credentials-get; publickey-credentials-create"`, set by the bridge), otherwise in a popup on the signer's origin, opened from the click on the signer's own button. The popup serves only an opener on its own origin.
+- **Storage:** the unlocked `M` in `sessionStorage` (this tab only), the signer vault copy in `localStorage`.
 - **Testing:** issue #22.

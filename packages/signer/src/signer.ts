@@ -75,8 +75,12 @@ export interface SignerHost {
   readonly getPublicKey: () => Promise<string>;
   /** The nsec, for signers that hold it; omit in passthrough mode. */
   readonly getSecretKey?: () => Bytes | null;
-  /** False when a third party can recover the nsec (SPEC §5.7). Default true. */
-  readonly allowSkWrap?: boolean;
+  /**
+   * False when a third party can recover the nsec (SPEC §5.7). Default true.
+   * A function is read on every use, so a host can ask the user and change it
+   * at runtime (e.g. OAuth signers, where the user decides).
+   */
+  readonly allowSkWrap?: boolean | (() => boolean);
   /** Passkeys on the signer's own origin. */
   readonly passkeys?: Passkeys;
   /** Optional device cache for the unlocked M. */
@@ -209,7 +213,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   const now = host.now ?? (() => Math.floor(Date.now() / 1000));
   const random = host.randomBytes ?? defaultRandomBytes;
   const timeoutMs = host.timeoutMs ?? 5000;
-  const allowSk = host.allowSkWrap !== false;
+  const allowSk = (): boolean => (typeof host.allowSkWrap === "function" ? host.allowSkWrap() : host.allowSkWrap !== false);
   let m: Bytes | null = null;
   let vault: SignerVault | null = null;
   /** True once the signer vault was read from the relays this session (#40). */
@@ -324,7 +328,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     const loaded = await loadVault(pubkey);
     if (!loaded.ok) return loaded;
     const sk = host.getSecretKey?.() ?? null;
-    if (sk !== null && allowSk) {
+    if (sk !== null && allowSk()) {
       const skWrap = vault?.wraps.find((w) => w.type === "sk");
       if (skWrap !== undefined) {
         const opened = openM(pubkey, skWrap, signerSkWrapKey(sk));
@@ -423,6 +427,16 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     const quiet = await unlockQuiet(pubkey, false);
     if (!quiet.ok) return quiet;
     if (!(await host.ui.confirm({ kind: "enrollPasskey" }))) return error("userRefused", "Cancelled");
+    // Moving from the nsec to a passkey: with the sk wrap no longer allowed, it
+    // may still open M once, so the passkey wraps the same M and app keys stay.
+    if (m === null && !allowSk()) {
+      const sk = host.getSecretKey?.() ?? null;
+      const skWrap = vault?.wraps.find((w) => w.type === "sk");
+      if (sk !== null && skWrap !== undefined) {
+        const opened = openM(pubkey, skWrap, signerSkWrapKey(sk));
+        if (opened.ok) await remember(pubkey, opened.value);
+      }
+    }
     // A signer vault already exists: unlock M first, never create a second one (#28).
     if (m === null && vault !== null) {
       const unlocked = await unlockWithPasskey(pubkey);
@@ -450,7 +464,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     // Only when no signer vault exists at all: create M now.
     const secret = m ?? random(MASTER_SECRET_LENGTH);
     let next = withWrap(vault, sealM(pubkey, signerPasskeyWrapKey(prfOutput), { type: "passkey", rpId: passkeys.rpId, credId: created.credId, synced: created.synced }, secret));
-    if (!allowSk) next = { v: 1, wraps: next.wraps.filter((w) => w.type !== "sk") };
+    if (!allowSk()) next = { v: 1, wraps: next.wraps.filter((w) => w.type !== "sk") };
     const published = await publish(pubkey, next);
     if (!published.ok) return published;
     await remember(pubkey, secret);
