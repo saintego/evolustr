@@ -52,6 +52,18 @@ const evolustr = createEvolustrSigner({
 });
 ```
 
+### Keep a local copy of the signer vault
+
+Give `cache` the optional `getVault` / `setVault` methods (any device-local storage). The signer then keeps the last good list of its wraps and merges it with the relay version. Without them, anyone who can sign for the user can replace the signer vault on the relays and lock out every device that doesn't have `M` cached.
+
+```ts
+cache: {
+  get, set, remove,                         // the unlocked M, device-local
+  getVault: (pubkey) => store.get(`signer-vault:${pubkey}`),
+  setVault: (pubkey, json) => store.set(`signer-vault:${pubkey}`, json),
+},
+```
+
 ## 2. Route `evolustr_*` requests
 
 Pass requests to `evolustr.handle()` with the caller **your platform** reports:
@@ -91,11 +103,13 @@ The prompt should say "<app> wants to change your Evolustr data keys".
 
 ## Custody
 
+`capabilities()` reports `recoverable`: true when the signer vault has an `sk` wrap or a passkey that was synced when enrolled. Apps use it for the backup check before strict (SPEC §3.2 rule 3a); a signer that doesn't report it counts as not recoverable.
+
 How your signer stores `M` decides who besides the user could derive app keys:
 
 | Your signer | `allowSkWrap` | Result |
 |---|---|---|
-| Holds the nsec, and only the user can recover it | `true` | Keys without any passkey; a new device with the same nsec gets them silently. |
+| Holds the nsec, and only the user can recover it | `true` | Keys without any passkey; a new device with the same nsec gets them silently. **But anyone who has the nsec can then open strict data too**: many users have pasted their nsec into several clients. Tell the user when they turn Evolustr on, and offer the passkey option below. `capabilities()` reports `nsecProtected`. |
 | Holds the nsec, but a third party can recover it (OAuth/MPC login, custodial bunker) | Offer the user a choice | With the `sk` wrap, that third party could derive the app keys. Offer a signer passkey and `allowSkWrap: false` instead. |
 | Passes requests to another signer (no nsec) | n/a | The API works after the user enrolls a signer passkey. |
 

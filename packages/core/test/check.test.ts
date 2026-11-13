@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  type Vault,
   addRootKey,
   createCompatibleVault,
   decideVault,
@@ -74,10 +75,16 @@ describe("decideVault (SPEC §6.3)", () => {
     const d = decideVault(ctx, { kind: "found", vault: strict }, { sHash: sHash(s), copy: compat });
     expect(d).toEqual({ type: "needsStrongUnlock", vault: strict });
   });
-  it("device without R and a different compatible vault: user decides", () => {
+  it("device without R, copy with a root key, different compatible vault: replaced (#38)", () => {
     const { s, compat } = world();
     const other = unwrap(createCompatibleVault(ctx, { s: randomBytes(16), nip44Ct: "y", now: 300 }));
-    const d = decideVault(ctx, { kind: "found", vault: other }, { sHash: sHash(s), copy: compat });
+    expect(decideVault(ctx, { kind: "found", vault: other }, { sHash: sHash(s), copy: compat })).toMatchObject({ type: "choose", reason: "replaced" });
+  });
+  it("device without R, copy without a root key, different compatible vault: user decides", () => {
+    const s = randomBytes(16);
+    const copy = unwrap(createCompatibleVault(ctx, { s, nip44Ct: "x", now: 100 }));
+    const other = unwrap(createCompatibleVault(ctx, { s: randomBytes(16), nip44Ct: "y", now: 300 }));
+    const d = decideVault(ctx, { kind: "found", vault: other }, { sHash: sHash(s), copy });
     expect(d).toMatchObject({ type: "choose", reason: "ambiguous", options: ["followRelay", "republishCopy"] });
   });
   it("vault missing: republish the copy if this device has one", () => {
@@ -86,5 +93,56 @@ describe("decideVault (SPEC §6.3)", () => {
     expect(withCopy).toMatchObject({ type: "choose", reason: "missing", options: ["republishCopy", "restorePhrase", "startNew"] });
     const noCopy = decideVault(ctx, { kind: "none" }, { sHash: sHash(s) });
     expect(noCopy).toMatchObject({ options: ["restorePhrase", "startNew"] });
+  });
+
+  describe("same secret, the local copy as trust anchor (#38)", () => {
+    const forgedWeak = (v: Vault): Vault => ({ v: 1, mode: "compatible", created: 1, sHash: v.sHash, history: [], rootWraps: [], dataWraps: [{ type: "nip44", ct: "x" }] });
+    it("R + root wrap opens: same", () => {
+      const { s2, r, strict } = world();
+      expect(decideVault(ctx, { kind: "found", vault: strict }, { sHash: sHash(s2), r, copy: strict })).toEqual({ type: "same" });
+    });
+    it("R + root wrap doesn't open: replaced", () => {
+      const { s2, strict } = world();
+      expect(decideVault(ctx, { kind: "found", vault: strict }, { sHash: sHash(s2), r: randomBytes(16), copy: strict })).toMatchObject({ reason: "replaced" });
+    });
+    it("R + no root wrap while the copy has one: replaced", () => {
+      const { s2, r, strict } = world();
+      expect(decideVault(ctx, { kind: "found", vault: forgedWeak(strict) }, { sHash: sHash(s2), r, copy: strict })).toMatchObject({ reason: "replaced" });
+    });
+    it("R + no root wrap anywhere: same", () => {
+      const s = randomBytes(16);
+      const v = unwrap(createCompatibleVault(ctx, { s, nip44Ct: "x", now: 1 }));
+      expect(decideVault(ctx, { kind: "found", vault: v }, { sHash: sHash(s), r: randomBytes(16), copy: v })).toEqual({ type: "same" });
+    });
+    it("no R, no copy: same", () => {
+      const { s2, strict } = world();
+      expect(decideVault(ctx, { kind: "found", vault: strict }, { sHash: sHash(s2) })).toEqual({ type: "same" });
+    });
+    it("no R, identical core: same", () => {
+      const { s2, strict } = world();
+      expect(decideVault(ctx, { kind: "found", vault: { ...strict, rootWraps: [] } }, { sHash: sHash(s2), copy: strict })).toEqual({ type: "same" });
+    });
+    it("no R, copy without root key, relay added R with the same header and nip44: same", () => {
+      const s = randomBytes(16);
+      const copy = unwrap(createCompatibleVault(ctx, { s, nip44Ct: "x", now: 1 }));
+      const withR = unwrap(addRootKey(ctx, copy, randomBytes(16), s));
+      expect(decideVault(ctx, { kind: "found", vault: withR }, { sHash: sHash(s), copy })).toEqual({ type: "same" });
+    });
+    it("no R, copy with root key, anything else: needs a strong unlock", () => {
+      const { s2, strict } = world();
+      expect(decideVault(ctx, { kind: "found", vault: forgedWeak(strict) }, { sHash: sHash(s2), copy: strict })).toMatchObject({ type: "needsStrongUnlock" });
+    });
+    it("no R, copy without root key, anything else: user decides", () => {
+      const s = randomBytes(16);
+      const copy = unwrap(createCompatibleVault(ctx, { s, nip44Ct: "x", now: 1 }));
+      const other = { ...copy, created: 999 };
+      expect(decideVault(ctx, { kind: "found", vault: other }, { sHash: sHash(s), copy })).toMatchObject({ type: "choose", reason: "ambiguous" });
+    });
+  });
+
+  it("a vault whose secret is only in the device's seen list is a rollback (#44)", () => {
+    const s = randomBytes(16);
+    const old = unwrap(createCompatibleVault(ctx, { s: randomBytes(16), nip44Ct: "x", now: 1 }));
+    expect(decideVault(ctx, { kind: "found", vault: old }, { sHash: sHash(s), seen: [old.sHash] })).toMatchObject({ type: "choose", reason: "replaced" });
   });
 });

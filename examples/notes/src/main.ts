@@ -141,6 +141,9 @@ const becameReady = async () => {
   renderNotes();
 };
 
+/** After an unlock proved the vault on the relays isn't the user's (#39). */
+const replacedChoices: ConnectResult = { state: "vaultChanged", reason: "replaced", options: ["republishCopy", "restorePhrase", "startNew"] };
+
 const handle = async (result: ConnectResult) => {
   if (result.state === "ready") return becameReady();
   show("actions", true);
@@ -195,6 +198,12 @@ $("connect").onclick = async () => {
       relays: poolRelays(),
       openDatabase: databases.open,
       cache: webSecretCache(),
+      // Non-secret hint that survives logout (#44).
+      hints: {
+        get: async (k) => localStorage.getItem(k),
+        set: async (k, v) => localStorage.setItem(k, v),
+        remove: async (k) => localStorage.removeItem(k),
+      },
       passkeys: webauthnPasskeys({ rpName: "Evolustr Notes" }),
       capableSigner: detectCapableSigner((window as unknown as { nostr?: unknown }).nostr),
     },
@@ -221,6 +230,7 @@ $("connect").onclick = async () => {
 $("unlock").onclick = async () => {
   if (client === null) return;
   const r = await client.unlock();
+  if (!r.ok && r.error.type === "vaultReplaced") return handle(replacedChoices);
   if (!r.ok) return fail(`${r.error.message} — you can use your recovery phrase instead.`);
   await becameReady();
 };
@@ -230,6 +240,7 @@ $("usePhrase").onclick = async () => {
   const phrase = prompt("Recovery phrase (12 words)");
   if (phrase === null) return;
   const r = await client.unlock({ recoveryPhrase: phrase });
+  if (!r.ok && r.error.type === "vaultReplaced") return handle(replacedChoices);
   if (!r.ok) return fail(r.error.message);
   await becameReady();
 };

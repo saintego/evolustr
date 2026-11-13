@@ -3,6 +3,9 @@ import {
   type Vault,
   addRootKey,
   addRootWrap,
+  headerBinding,
+  verifyRootWrap,
+  MAX_ROOT_WRAPS,
   backupRequirement,
   createCompatibleVault,
   createStrictVault,
@@ -208,5 +211,45 @@ describe("backup check (§3.2 rule 3a)", () => {
     expect(backupRequirement([{ kind: "passkey", synced: false }], true)).toBe("none");
     expect(backupRequirement([{ kind: "passkey", synced: false }, { kind: "passkey", synced: false }], false)).toBe("none");
     expect(backupRequirement([], false)).toBe("required");
+  });
+});
+
+describe("vault format v2 (#37)", () => {
+  const setup = () => {
+    const { s, r } = fresh();
+    let v = unwrap(addRootKey(ctx, compatible(s), r, s));
+    const pk = passkeyRootWrap(ctx, randomBytes(32), "app.example", "cred1", r);
+    v = unwrap(addRootWrap(v, pk));
+    return { s, r, v, pk };
+  };
+  it("binds the full 64-character history hash", () => {
+    const { v } = setup();
+    expect(headerBinding(v).split("|")[3]).toHaveLength(64);
+  });
+  it("verifies root-wrap tags and rejects any change", () => {
+    const { r, pk } = setup();
+    expect(verifyRootWrap(ctx, r, pk)).toBe(true);
+    expect(verifyRootWrap(ctx, r, { ...pk, ct: pk.ct.slice(0, -2) + "AA" })).toBe(false);
+    expect(verifyRootWrap(ctx, r, { ...pk, iv: "AAAAAAAAAAAAAAAA" })).toBe(false);
+    expect(verifyRootWrap(ctx, r, { ...pk, rpId: "evil.example" } as typeof pk)).toBe(false);
+    expect(verifyRootWrap(ctx, randomBytes(16), pk)).toBe(false);
+  });
+  it("merge: the local version wins on the same id; with R, bad tags are dropped from both sides", () => {
+    const { r, v, pk } = setup();
+    const forged = { ...pk, ct: "AAAA" };
+    const remote: Vault = { ...v, rootWraps: [forged] };
+    expect(unwrap(mergeVaults(v, remote)).rootWraps[0]).toEqual(pk);
+    const junk = { ...passkeyRootWrap(ctx, randomBytes(32), "app.example", "junk", randomBytes(16)) };
+    const withJunk: Vault = { ...v, rootWraps: [pk, junk] };
+    expect(unwrap(mergeVaults(withJunk, withJunk, { ctx, r })).rootWraps).toEqual([pk]);
+    expect(unwrap(mergeVaults(v, { ...v, rootWraps: [forged] }, { ctx, r })).rootWraps).toEqual([pk]);
+  });
+  it("rejects more than 32 root wraps, and wraps without a tag", () => {
+    const { r, v } = setup();
+    const many = Array.from({ length: MAX_ROOT_WRAPS + 1 }, (_, i) => passkeyRootWrap(ctx, randomBytes(32), "rp", `c${i}`, r));
+    expect(validateVault({ ...v, rootWraps: many }).ok).toBe(false);
+    const json = JSON.parse(serializeVault(v));
+    delete json.rootWraps[0].tag;
+    expect(parseVault(JSON.stringify(json)).ok).toBe(false);
   });
 });

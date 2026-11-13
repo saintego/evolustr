@@ -5,14 +5,25 @@
  * produced by the caller (it needs the user's signer) and passed in as a string.
  */
 import { appWrapAad } from "./aad.ts";
-import { type Bytes } from "./bytes.ts";
+import { type Bytes, bytesEqual, fromHex, toHex, utf8 } from "./bytes.ts";
+import { hmac } from "@noble/hashes/hmac.js";
+import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 import { type Sealed, open, seal, sha256Hex } from "./crypto.ts";
-import { DATA_SECRET_LENGTH, ROOT_KEY_LENGTH, rootDataKey, sHash } from "./keys.ts";
+import { DATA_SECRET_LENGTH, ROOT_KEY_LENGTH, rootDataKey, sHash, wrapAuthKey } from "./keys.ts";
 import { type EvolustrError, type Result, error, flatMap, ok } from "./result.ts";
 
 export type Mode = "compatible" | "strict";
 
+/**
+ * A wrap of R. `tag` is an HMAC under a key derived from R over the wrap's
+ * fields (#37): only someone holding R can add or change a root wrap.
+ */
 export type RootWrap =
+  | ({ readonly type: "signer"; readonly signerId: string; readonly tag: string } & Sealed)
+  | ({ readonly type: "passkey"; readonly rpId: string; readonly credId: string; readonly tag: string } & Sealed);
+
+/** A root wrap before its tag is computed. */
+export type UntaggedRootWrap =
   | ({ readonly type: "signer"; readonly signerId: string } & Sealed)
   | ({ readonly type: "passkey"; readonly rpId: string; readonly credId: string } & Sealed);
 
@@ -44,6 +55,7 @@ export interface VaultContext {
 }
 
 export const HISTORY_LIMIT = 10;
+export const MAX_ROOT_WRAPS = 32;
 
 // ── Queries ─────────────────────────────────────────────────────────────────
 
@@ -92,6 +104,7 @@ export const validateVault = (vault: Vault): Result<Vault, EvolustrError> => {
   if (vault.rootWraps.length > 0 && rootCount === 0) {
     return error("invalidVault", "Root wraps without a root data wrap");
   }
+  if (vault.rootWraps.length > MAX_ROOT_WRAPS) return error("invalidVault", "Too many root wraps");
   const ids = vault.rootWraps.map((w) => `${w.type}:${rootWrapKeyId(w)}`);
   if (new Set(ids).size !== ids.length) return error("invalidVault", "Duplicate root wrap");
   if (vault.history.length > HISTORY_LIMIT) return error("invalidVault", "History too long");
@@ -109,12 +122,13 @@ const parseSealed = (x: Record<string, unknown>): Sealed | null =>
 const parseRootWrap = (x: unknown): RootWrap | null => {
   if (!isRecord(x)) return null;
   const sealed = parseSealed(x);
-  if (sealed === null) return null;
+  if (sealed === null || !isString(x["tag"])) return null;
+  const tag = x["tag"];
   if (x["type"] === "signer" && isString(x["signerId"])) {
-    return { type: "signer", signerId: x["signerId"], ...sealed };
+    return { type: "signer", signerId: x["signerId"], tag, ...sealed };
   }
   if (x["type"] === "passkey" && isString(x["rpId"]) && isString(x["credId"])) {
-    return { type: "passkey", rpId: x["rpId"], credId: x["credId"], ...sealed };
+    return { type: "passkey", rpId: x["rpId"], credId: x["credId"], tag, ...sealed };
   }
   return null;
 };
@@ -196,7 +210,7 @@ export interface VaultHeader {
  * replayed from an older vault with a newer history, no longer opens with R.
  */
 export const headerBinding = (h: VaultHeader): string =>
-  `${h.sHash}|${h.mode}|${h.created}|${sha256Hex(JSON.stringify(h.history.map((e) => [e.sHash, e.created]))).slice(0, 16)}`;
+  `${h.sHash}|${h.mode}|${h.created}|${sha256Hex(JSON.stringify(h.history.map((e) => [e.sHash, e.created])))}`;
 
 const sealRootData = (ctx: VaultContext, r: Bytes, s: Bytes, header: VaultHeader): DataWrap => ({
   type: "root",
@@ -211,11 +225,12 @@ export const signerRootWrap = (
   signerAppKey: Bytes,
   signerId: string,
   r: Bytes,
-): RootWrap => ({
-  type: "signer",
-  signerId,
-  ...seal(signerAppKey, r, appWrapAad(ctx.pubkey, ctx.appId, "signer", signerId)),
-});
+): RootWrap =>
+  withTag(ctx, r, {
+    type: "signer",
+    signerId,
+    ...seal(signerAppKey, r, appWrapAad(ctx.pubkey, ctx.appId, "signer", signerId)),
+  });
 
 /** Wraps R for a client passkey, keyed by its PRF-derived wrap key (SPEC §4.2). */
 export const passkeyRootWrap = (
@@ -224,12 +239,32 @@ export const passkeyRootWrap = (
   rpId: string,
   credId: string,
   r: Bytes,
-): RootWrap => ({
-  type: "passkey",
-  rpId,
-  credId,
-  ...seal(wrapKey, r, appWrapAad(ctx.pubkey, ctx.appId, "passkey", credId)),
-});
+): RootWrap =>
+  withTag(ctx, r, {
+    type: "passkey",
+    rpId,
+    credId,
+    ...seal(wrapKey, r, appWrapAad(ctx.pubkey, ctx.appId, "passkey", credId)),
+  });
+
+/** HMAC tag of a root wrap under {@link wrapAuthKey} (SPEC §3.1, #37). */
+export const rootWrapTag = (ctx: VaultContext, r: Bytes, wrap: UntaggedRootWrap): string => {
+  const keyId = wrap.type === "signer" ? wrap.signerId : wrap.credId;
+  const rpId = wrap.type === "passkey" ? wrap.rpId : "";
+  const message = `${appWrapAad(ctx.pubkey, ctx.appId, wrap.type, keyId)}|${rpId}|${wrap.iv}|${wrap.ct}`;
+  return toHex(hmac(nobleSha256, wrapAuthKey(r, ctx.appId), utf8(message)));
+};
+
+/** True when the wrap's tag was made with this R. */
+export const verifyRootWrap = (ctx: VaultContext, r: Bytes, wrap: RootWrap): boolean => {
+  const { tag, ...rest } = wrap;
+  const expected = fromHex(rootWrapTag(ctx, r, rest as UntaggedRootWrap));
+  const given = fromHex(tag);
+  return expected !== null && given !== null && bytesEqual(expected, given);
+};
+
+const withTag = (ctx: VaultContext, r: Bytes, wrap: UntaggedRootWrap): RootWrap =>
+  ({ ...wrap, tag: rootWrapTag(ctx, r, wrap) }) as RootWrap;
 
 /** Opens one root wrap with its key, giving R. */
 export const openRootWrap = (
@@ -257,6 +292,13 @@ export const openRootData = (
         : error("invalidVault", "Data secret doesn't match the vault"),
   );
 };
+
+/** Same header and same data wraps (root: iv+ct, nip44: ct). Root wraps are not compared (#38). */
+export const sameVaultCore = (a: Vault, b: Vault): boolean =>
+  headerBinding(a) === headerBinding(b) &&
+  JSON.stringify(a.dataWraps.map(dataWrapKey).sort()) === JSON.stringify(b.dataWraps.map(dataWrapKey).sort());
+
+const dataWrapKey = (w: DataWrap): string => (w.type === "root" ? `root|${w.iv}|${w.ct}` : `nip44|${w.ct}`);
 
 /** Checks a decrypted nip44 payload against the vault's `sHash`. */
 export const checkDataSecret = (vault: Vault, s: Bytes): Result<Bytes, EvolustrError> =>
@@ -329,7 +371,11 @@ export const addRootWrap = (vault: Vault, wrap: RootWrap): Result<Vault, Evolust
   return validateVault({ ...vault, rootWraps: [...others, wrap] });
 };
 
-/** Removes one root wrap; only on an explicit user action (SPEC §6.2 rule 3). */
+/**
+ * Removes one root wrap; only on an explicit user action (SPEC §6.2 rule 3).
+ * TODO(#37): the client never calls this. With "never drop a wrap", a removal
+ * would need a tombstone authenticated with R.
+ */
 export const removeRootWrap = (vault: Vault, type: RootWrap["type"], keyId: string): Vault => ({
   ...vault,
   rootWraps: vault.rootWraps.filter((w) => !(w.type === type && rootWrapKeyId(w) === keyId)),
@@ -396,10 +442,23 @@ export const downgrade = (ctx: VaultContext, vault: Vault, input: DowngradeInput
  * the union of root wraps, keyed by `signerId` / `credId` (SPEC §6.2 rule 3).
  * Never adds a nip44 wrap to a strict result (SPEC §3.2 rule 5).
  */
-export const mergeVaults = (a: Vault, b: Vault): Result<Vault, EvolustrError> => {
+export const mergeVaults = (
+  a: Vault,
+  b: Vault,
+  opts?: { readonly ctx: VaultContext; readonly r?: Bytes | undefined },
+): Result<Vault, EvolustrError> => {
   if (a.sHash !== b.sHash) return error("differentSecrets", "The vaults hold different data secrets");
+  // `a` is the local version and wins on the same id; with R, wraps with a bad
+  // tag are dropped from both sides (#37). Without R, the union is kept, and if
+  // it's too long, a's wraps come first.
+  const r = opts?.r;
+  const keep = (w: RootWrap) => r === undefined || opts === undefined || verifyRootWrap(opts.ctx, r, w);
   const byKey = new Map<string, RootWrap>();
-  for (const w of [...a.rootWraps, ...b.rootWraps]) byKey.set(`${w.type}:${rootWrapKeyId(w)}`, w);
+  for (const w of a.rootWraps) if (keep(w)) byKey.set(`${w.type}:${rootWrapKeyId(w)}`, w);
+  for (const w of b.rootWraps) {
+    const k = `${w.type}:${rootWrapKeyId(w)}`;
+    if (!byKey.has(k) && keep(w) && byKey.size < MAX_ROOT_WRAPS) byKey.set(k, w);
+  }
   // The mode and data wraps come from one version, since the mode is part of
   // the root data wrap's AAD; strict wins, never re-adding nip44 (rule 5).
   const base = a.mode === "strict" || b.mode !== "strict" ? a : b;

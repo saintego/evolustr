@@ -48,7 +48,13 @@ export type Caller =
 
 export type SignerWrap =
   | ({ readonly type: "sk" } & Sealed)
-  | ({ readonly type: "passkey"; readonly rpId: string; readonly credId: string } & Sealed);
+  | ({
+      readonly type: "passkey";
+      readonly rpId: string;
+      readonly credId: string;
+      /** The passkey was synced (BS flag) when enrolled (#42). */
+      readonly synced?: boolean;
+    } & Sealed);
 
 export interface SignerVault {
   readonly v: 1;
@@ -78,6 +84,12 @@ export interface SignerHost {
     readonly get: (pubkey: string) => Promise<Bytes | null>;
     readonly set: (pubkey: string, m: Bytes) => Promise<void>;
     readonly remove: (pubkey: string) => Promise<void>;
+    /**
+     * The last good signer vault (JSON), kept on the device (#41). Without these,
+     * a replaced signer vault on the relays locks out devices that don't have M cached.
+     */
+    readonly getVault?: (pubkey: string) => Promise<string | null>;
+    readonly setVault?: (pubkey: string, json: string) => Promise<void>;
   };
   readonly ui: {
     /** Show a prompt with the verified caller; the host may remember answers. */
@@ -97,6 +109,10 @@ export interface Capabilities {
   readonly signerId: string | null;
   readonly ready: boolean;
   readonly signerPasskey: boolean;
+  /** M can be recovered on another device: an `sk` wrap, or a synced signer passkey (#42). */
+  readonly recoverable: boolean;
+  /** M is protected by the nsec (an `sk` wrap): anyone with the nsec can derive app keys (#43). */
+  readonly nsecProtected: boolean;
 }
 
 export const METHODS = ["evolustr_capabilities", "evolustr_get_wrap_key", "evolustr_enroll_passkey"] as const;
@@ -140,15 +156,35 @@ export const parseSignerVault = (json: string): Result<SignerVault, EvolustrErro
     const sealed = { iv: w["iv"], ct: w["ct"] };
     if (w["type"] === "sk") wraps.push({ type: "sk", ...sealed });
     else if (w["type"] === "passkey" && typeof w["rpId"] === "string" && typeof w["credId"] === "string") {
-      wraps.push({ type: "passkey", rpId: w["rpId"], credId: w["credId"], ...sealed });
+      wraps.push({
+        type: "passkey",
+        rpId: w["rpId"],
+        credId: w["credId"],
+        ...(typeof w["synced"] === "boolean" ? { synced: w["synced"] } : {}),
+        ...sealed,
+      });
     } else return error("invalidSignerVault", "Unknown wrap type");
   }
   // A vault that exists but has no wraps isn't "first use" (#28).
   if (wraps.length === 0) return error("invalidSignerVault", "The signer vault has no wraps");
+  if (wraps.length > MAX_SIGNER_WRAPS) return error("invalidSignerVault", "Too many wraps");
   return ok({ v: 1, wraps });
 };
 
 const wrapId = (w: SignerWrap): string => (w.type === "sk" ? "sk" : w.credId);
+
+export const MAX_SIGNER_WRAPS = 32;
+
+/** Union of two signer vaults by wrap id; `local` wins on the same id (#41). */
+export const mergeSignerVaults = (local: SignerVault, fetched: SignerVault): SignerVault => {
+  const byId = new Map<string, SignerWrap>();
+  for (const w of local.wraps) byId.set(`${w.type}:${wrapId(w)}`, w);
+  for (const w of fetched.wraps) {
+    const k = `${w.type}:${wrapId(w)}`;
+    if (!byId.has(k) && byId.size < MAX_SIGNER_WRAPS) byId.set(k, w);
+  }
+  return { v: 1, wraps: [...byId.values()] };
+};
 
 const PACKAGE_NAME = /^[A-Za-z][\w]*(\.[A-Za-z][\w]*)+$/;
 const HEX_PUBKEY = /^[0-9a-f]{64}$/;
@@ -176,6 +212,10 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   const allowSk = host.allowSkWrap !== false;
   let m: Bytes | null = null;
   let vault: SignerVault | null = null;
+  /** True once the signer vault was read from the relays this session (#40). */
+  let vaultLoaded = false;
+  /** The relays lack wraps the local copy has (#41); fixed after an approved key request. */
+  let needsHeal = false;
   let lastEventAt = 0;
 
   const appIdFor = (caller: Caller) => appIdForCaller(caller, host.knownNsiteGateways);
@@ -193,7 +233,36 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     return parseSignerVault(f.event.content);
   };
 
+  /**
+   * Loads the signer vault once per session; null when none exists (#40). With a
+   * local copy (#41), it's merged with the relay version, or used instead of a
+   * missing or invalid one; `needsHeal` marks wraps the relays lack.
+   */
+  const loadVault = async (pubkey: string): Promise<Result<SignerVault | null>> => {
+    if (vaultLoaded) return ok(vault);
+    const fetched = await fetchVault(pubkey);
+    if (!fetched.ok && fetched.error.type !== "invalidSignerVault") return fetched;
+    const copyText = (await host.cache?.getVault?.(pubkey)) ?? null;
+    const copy = copyText === null ? null : parseSignerVault(copyText);
+    const local = copy?.ok ? copy.value : null;
+    if (local === null) {
+      if (!fetched.ok) return fetched;
+      vault = fetched.value;
+    } else if (!fetched.ok || fetched.value === null) {
+      vault = local;
+      needsHeal = true;
+    } else {
+      vault = mergeSignerVaults(local, fetched.value);
+      const onRelays = new Set(fetched.value.wraps.map((w) => JSON.stringify(w)));
+      needsHeal = vault.wraps.some((w) => !onRelays.has(JSON.stringify(w)));
+    }
+    vaultLoaded = true;
+    return ok(vault);
+  };
+
   const publish = async (pubkey: string, next: SignerVault): Promise<Result<SignerVault>> => {
+    // Never publish from an unknown state: it would drop wraps added elsewhere (#40).
+    if (!vaultLoaded) return error("signerVaultUnknown", "Load the signer vault before changing it");
     const at = Math.max(now(), lastEventAt + 1);
     const signer: Signer = {
       getPublicKey: host.getPublicKey,
@@ -214,10 +283,12 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     }
     lastEventAt = at;
     vault = next;
+    needsHeal = false;
+    await host.cache?.setVault?.(pubkey, JSON.stringify(next));
     return ok(next);
   };
 
-  const sealM = (pubkey: string, key: Bytes, w: { type: "sk" } | { type: "passkey"; rpId: string; credId: string }, secret: Bytes): SignerWrap => {
+  const sealM = (pubkey: string, key: Bytes, w: { type: "sk" } | { type: "passkey"; rpId: string; credId: string; synced?: boolean }, secret: Bytes): SignerWrap => {
     const id = w.type === "sk" ? "sk" : w.credId;
     return { ...w, ...seal(key, secret, signerWrapAad(pubkey, host.signerKey, w.type, id)) } as SignerWrap;
   };
@@ -232,9 +303,11 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     wraps: [...(v?.wraps ?? []).filter((x) => !(x.type === w.type && wrapId(x) === wrapId(w))), w],
   });
 
+  /** Called after a wrap opened to M, or after creating M: the vault is good (#41). */
   const remember = async (pubkey: string, secret: Bytes) => {
     m = secret;
     await host.cache?.set(pubkey, secret);
+    if (vault !== null) await host.cache?.setVault?.(pubkey, JSON.stringify(vault));
   };
 
   /**
@@ -248,9 +321,8 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
       m = cached;
       return ok(true);
     }
-    const fetched = await fetchVault(pubkey);
-    if (!fetched.ok) return fetched;
-    vault = fetched.value;
+    const loaded = await loadVault(pubkey);
+    if (!loaded.ok) return loaded;
     const sk = host.getSecretKey?.() ?? null;
     if (sk !== null && allowSk) {
       const skWrap = vault?.wraps.find((w) => w.type === "sk");
@@ -313,12 +385,17 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     if (!appId.ok) return appId;
     const pubkey = await host.getPublicKey();
     if (m === null) await unlockQuiet(pubkey, false);
+    // M may come from the cache without the vault being read: read it, ignoring
+    // failures (still never creates or publishes anything, #29).
+    if (!vaultLoaded) await loadVault(pubkey);
     return ok({
       identity: caller.identity,
       appId: appId.value,
       signerId: m === null ? null : computeSignerId(m, appId.value),
       ready: m !== null,
       signerPasskey: (vault?.wraps ?? []).some((w) => w.type === "passkey"),
+      recoverable: (vault?.wraps ?? []).some((w) => w.type === "sk" || (w.type === "passkey" && w.synced === true)),
+      nsecProtected: (vault?.wraps ?? []).some((w) => w.type === "sk"),
     });
   };
 
@@ -329,6 +406,10 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     if (!allowed) return error("userRefused", "The user didn't allow this app");
     const unlocked = await ensureM();
     if (!unlocked.ok) return unlocked;
+    // Self-heal (#41): the user just approved this app and M is unlocked. With M
+    // from the cache the vault may not be loaded yet; a failure here doesn't block.
+    if (!vaultLoaded) await loadVault(unlocked.value.pubkey);
+    if (needsHeal && vault !== null) await publish(unlocked.value.pubkey, vault);
     return ok(signerAppKey(unlocked.value.m, appId.value));
   };
 
@@ -336,6 +417,9 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     const passkeys = host.passkeys;
     if (passkeys === undefined) return error("noPasskeys", "This signer has no passkey support");
     const pubkey = await host.getPublicKey();
+    // The current wrap list must be known before adding to it (#40).
+    const loaded = await loadVault(pubkey);
+    if (!loaded.ok) return loaded;
     const quiet = await unlockQuiet(pubkey, false);
     if (!quiet.ok) return quiet;
     if (!(await host.ui.confirm({ kind: "enrollPasskey" }))) return error("userRefused", "Cancelled");
@@ -365,7 +449,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     if (prfOutput === null) return error("prfUnsupported", "The passkey gave no PRF output");
     // Only when no signer vault exists at all: create M now.
     const secret = m ?? random(MASTER_SECRET_LENGTH);
-    let next = withWrap(vault, sealM(pubkey, signerPasskeyWrapKey(prfOutput), { type: "passkey", rpId: passkeys.rpId, credId: created.credId }, secret));
+    let next = withWrap(vault, sealM(pubkey, signerPasskeyWrapKey(prfOutput), { type: "passkey", rpId: passkeys.rpId, credId: created.credId, synced: created.synced }, secret));
     if (!allowSk) next = { v: 1, wraps: next.wraps.filter((w) => w.type !== "sk") };
     const published = await publish(pubkey, next);
     if (!published.ok) return published;
@@ -391,6 +475,9 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   const lock: EvolustrSigner["lock"] = async () => {
     const pubkey = await host.getPublicKey().catch(() => null);
     m = null;
+    vault = null;
+    vaultLoaded = false;
+    needsHeal = false;
     if (pubkey !== null) await host.cache?.remove(pubkey);
   };
 

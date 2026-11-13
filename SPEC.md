@@ -1,6 +1,6 @@
 # Evolustr Specification
 
-**Status:** Draft v0.13
+**Status:** Draft v0.15 (v0.15 changed the vault format: root-wrap tags and the full history hash. Early alpha, so there is no migration.)
 **Scope:** Nostr identity → one Evolu (local-first, E2E-encrypted SQLite) database per app, synced across devices, with **no backend and no storage other than Nostr relays and Evolu**.
 
 ---
@@ -87,7 +87,9 @@ Why two levels: the strong methods protect `R`, and `R` protects `S`. When `S` i
 **`R` is never reachable through NIP-44, even in `compatible` mode.** If it were, anyone who read the `nip44` wrap while the vault was weak would still know `R` after `makeStrict()`. The cost: a device that opened a `compatible` vault through `nip44` has `S` but not `R`. Once `R` exists, that device can read and write the data, but it **can't add a strong method** (passkey or signer wrap) until the user unlocks `R` there once, with a synced passkey, a capable signer that already has a wrap, or the recovery phrase. The client says so plainly instead of failing (`status.canAddStrongMethod`).
 
 `signer`, `passkey` and `root` wraps use **AES-256-GCM** with a random 12-byte IV and
-`AAD = "evolustr/v1|" + pubkey + "|" + appId + "|" + wrapType + "|" + keyId`, where `keyId` is the `signerId` or `credId` for root wraps. For the `root` data wrap, `keyId` is the **vault header**: `sHash + "|" + mode + "|" + created + "|" + first 16 hex characters of SHA-256(history)`.
+`AAD = "evolustr/v1|" + pubkey + "|" + appId + "|" + wrapType + "|" + keyId`, where `keyId` is the `signerId` or `credId` for root wraps. For the `root` data wrap, `keyId` is the **vault header**: `sHash + "|" + mode + "|" + created + "|" + SHA-256(history)` (all 64 hex characters).
+
+Each root wrap also carries a **`tag`**: `hex(HMAC-SHA256(HKDF(R, "evolustr/v1/wrap-auth|" + appId), AAD + "|" + (rpId or "") + "|" + iv + "|" + ct))`. Only someone holding `R` can add or change a root wrap. A device that knows `R` drops wraps whose tag doesn't verify; one that doesn't keeps the union with its own copy winning (§6.2). At most 32 root wraps per vault.
 Binding each wrap to its own key identifier means concurrent additions never collide and a wrap can't be moved to another vault. Binding the header into the `root` data wrap means nobody without `R` can change the mode, the creation time or the history: an edited header no longer opens with `R`. `downgrade()` therefore needs `R`, to seal the wrap again with the new mode.
 
 A vault may hold several `signer` wraps (one per capable signer, each with its own `M`, §5.3) and several `passkey` wraps.
@@ -113,7 +115,8 @@ Rules:
 | The user's only strong method | Recoverable on its own? | Before `makeStrict()` |
 |---|---|---|
 | Synced passkey: the WebAuthn authenticator data has the **backup state** flag (BS) set, e.g. iCloud Keychain, Google Password Manager, a password manager | Yes, through the provider account | Nothing required. Show a skippable reminder: "Your data is protected by your passkey. Save your recovery phrase or add a second passkey in case you lose access to your passkey provider." |
-| Capable signer whose `M` can be recovered from the nsec (`sk` wrap), or by a synced signer passkey | Yes, through the signer | Nothing required. Same skippable reminder. |
+| Capable signer whose `M` can be recovered from the nsec (`sk` wrap), or by a synced signer passkey (it reports `recoverable: true`) | Yes, through the signer | Nothing required. Same skippable reminder. |
+| Capable signer whose `M` sits behind a device-bound signer passkey only, or that doesn't report `recoverable` | **No** | Same as a device-bound passkey: backup or explicit acceptance. |
 | Device-bound passkey (BS flag not set: a hardware key, a local-only platform authenticator) or a signer passkey that isn't synced | **No**: losing that one device loses the data | Confirm the recovery phrase, add a second strong method, **or** explicitly accept "I will lose this data if I lose this device". |
 
 The BS flag is what the authenticator reports at that moment; a user can still lose the provider account or turn sync off later. So the reminder stays visible (`status.backupRecommended`) until the user has a second strong method or has confirmed the phrase. The recovery phrase can be shown at any time later (`showRecoveryPhrase()`).
@@ -277,6 +280,7 @@ interface EvolustrSignerApi {
     signerId: string | null;       // null until M is unlocked
     ready: boolean;                // M is unlocked
     signerPasskey: boolean;        // M can be unlocked by a signer passkey
+    recoverable: boolean;          // M survives losing this device: sk wrap or a synced signer passkey
   }>;
   /** Wrap key for the caller's app vault. The signer computes appId itself.
    *  If M is locked (ready === false), the signer first shows its own Unlock UI
@@ -349,6 +353,7 @@ Thin adapters cover the common hosts: `adapters/iframe` (postMessage signers), `
 **nostr-shard-signer** (iframe signer, verified origin) embeds `@evolustr/signer` as the first host:
 
 - **Integration:** the iframe's message handler passes `evolustr_*` requests to `evolustr.handle()` with `origin: event.origin`. `nostr-bridge.js` adds `window.nostr.evolustr` and forwards its calls to the iframe, the same way it forwards `signEvent`. The auto-approve list calls `isProtectedEvent()`. `signerKey` is the signer's own origin.
+- **`sk` mode in general:** anyone with the nsec can derive `M` from the public signer vault, then every app key, `R` and `S`. So strict through a signer in `sk` mode is strong against apps with signer *permissions*, not against anyone who has the nsec. Capabilities report `nsecProtected`; the client's `status.dependsOnNsec` shows it.
 - **OAuth mode** holds the nsec, so `M` can use the `sk` wrap. The Web3Auth `clientId` owner can recover the nsec, and so `M` and every app key derived from it. For users who don't accept that, the signer offers a signer passkey and drops the `sk` wrap. If a looser version of the signer uses a shared `clientId`, that owner is whoever controls the shared project.
 - **Passthrough mode** (extension or bunker through the bridge) has no nsec, so the API is available only after the user enrolls a signer passkey. The signer's own vault event is then signed by the extension or bunker, through the bridge. The parent page sees only the AES-encrypted vault: it could block the publish, but not read or forge `M`.
 - Per-app separation relies on `event.origin`, not on the `clientId` allowlist, so it holds in the looser version too.
@@ -381,9 +386,9 @@ The pubkey is part of the hash, so two users of the same app have **different** 
     { "sHash": "<hex 8B>", "created": 1720000000 }
   ],
   "rootWraps": [                  // wraps of R
-    { "type": "signer", "signerId": "<hex 8B>", "iv": "…", "ct": "…" },
+    { "type": "signer", "signerId": "<hex 8B>", "iv": "…", "ct": "…", "tag": "<hex 32B>" },
     { "type": "signer", "signerId": "<another signer>", "iv": "…", "ct": "…" },
-    { "type": "passkey", "rpId": "app.example.com", "credId": "<base64url>", "iv": "…", "ct": "…" }
+    { "type": "passkey", "rpId": "app.example.com", "credId": "<base64url>", "iv": "…", "ct": "…", "tag": "<hex 32B>" }
   ],
   "dataWraps": [                  // wraps of S
     { "type": "root", "iv": "…", "ct": "…" }
@@ -398,9 +403,9 @@ A `compatible` vault that has no `R` yet has empty `rootWraps` and only the `nip
 
 1. **Lookup:** query all configured relays and wait for EOSE from each, or a timeout. Never decide "no vault exists" from a single relay.
 2. **Create** only when every relay answered and none has the vault. After publishing, fetch again. If a vault with a different `sHash` and an earlier `created` appears, keep the earlier one (moving any rows already written is open question §11.3).
-3. **Adding a wrap:** fetch, add the wrap (wraps are keyed by `signerId` / `credId`, so concurrent additions merge), publish, fetch again to check. Never drop a wrap without an explicit user action. `makeStrict()` and `downgrade()` are such actions.
-4. **Self-healing:** after unlocking, re-add your own wrap if a concurrent update dropped it. Never re-add `nip44` to a `strict` vault (§3.2 rule 5).
-5. **Keep a copy in Evolu:** after a successful unlock, store the vault event in the app database itself (table `evolustr_meta`, key `vault`). It lives in that `(pubkey, appId)` database only (§2), and Evolu syncs it, so every device that has the database also has the last good vault (§6.3).
+3. **Adding a wrap:** fetch, add the wrap (wraps are keyed by `signerId` / `credId`, so concurrent additions merge), publish, fetch again to check. When merging, the **local** version wins on the same id, and with `R` known, wraps whose tag doesn't verify are dropped from both sides. Never drop a wrap without an explicit user action. `makeStrict()` and `downgrade()` are such actions.
+4. **Self-healing:** after connecting, if the relays lack or altered a wrap the local copy has, publish the merged vault in the background. After unlocking with `R`, prune wraps with a bad tag and publish. Never re-add `nip44` to a `strict` vault (§3.2 rule 5).
+5. **Keep a copy in Evolu:** after a successful unlock, store the vault event in the app database itself (table `evolustr_meta`, key `vault`). It lives in that `(pubkey, appId)` database only (§2), and Evolu syncs it, so every device that has the database also has the last good vault (§6.3). The copy is the **trust anchor** of §6.3, so it is only ever written from a vault this device made, opened with `R`, opened through NIP-44 after the user chose or confirmed it, or merged from the copy itself; never from relay data as it came.
 6. **Device cache:** Evolu needs `S` every time the app starts (§2), so a device caches the unlocked `S` for its `(pubkey, appId)`: on the web encrypted with a non-extractable WebCrypto key kept in IndexedDB, on mobile in secure storage. `R` is the recovery phrase and survives every rotation, so it stays **in memory** for the session unless the app opts in (`cacheRootKey`). Without a cached `R`, a device still recognises replays and strict-to-weak swaps from its local vault copy (§6.3). `logout()` removes both; `logout({ deleteLocalData: true })` also deletes the local database.
 
 ### 6.3 Checking a fetched vault
@@ -409,8 +414,12 @@ Any app the user lets sign can publish a replacement vault event. Capable signer
 
 | Situation | What the client does |
 |---|---|
-| No local database for this `(pubkey, appId)` | First use on this device. If a capable signer or a cached `R` opens the vault, its header is verified: unlock normally. If the vault is `compatible` and only NIP-44 can open it, ask the user to confirm first (`needsUserAction: "confirmWeak"`), saying not to continue if they made the database strict elsewhere. |
-| Same `sHash` as the local database | Normal, unless the device has `R` and the vault's `root` wrap no longer opens with it (an edited header, e.g. strict flipped to compatible): then **replaced**. |
+| No local database for this `(pubkey, appId)` | If a non-secret hint kept across logout says this device last saw the database **strict** and the vault is now `compatible`: **replaced**. Otherwise first use on this device. If a capable signer or a cached `R` opens the vault, its header is verified: unlock normally. If the vault is `compatible` and only NIP-44 can open it, ask the user to confirm first (`needsUserAction: "confirmWeak"`), saying not to continue if they made the database strict elsewhere. |
+| Same `sHash`, device has `R` | The vault's `root` wrap opens with `R`: normal. It doesn't open, or the vault lost the root data wrap the copy has: **replaced**. No root key on either side: normal. |
+| Same `sHash`, no `R`, no copy | Normal. |
+| Same `sHash`, no `R`, copy | Header and data wraps equal the copy's: normal (only root wraps may differ; the copy's win). The copy has no root key and the vault only added one, with the same header and `nip44` wrap: normal. The copy **has** a root key and the vault differs: ask for a **strong unlock** (a legitimate downgrade looks like this; only `R` can tell). Otherwise: ask the user. |
+| Different `sHash`, no `R`, the copy has a root key, the vault is `compatible` | **Replaced.** A database protected by a root key never follows a vault that only NIP-44 opens; `followRelay` refuses it too (`unsafeFollow`). |
+| A strong unlock gives an `R` that opens the copy but not the fetched vault | **Replaced** (`vaultReplaced`): the passkey or phrase is real, the vault is foreign. Restore the copy. Strong unlocks also try the root wraps in the copy. |
 | Different `sHash`, its `root` wrap opens with `R`, and its `history` contains the local `sHash` | A rotation moving forward (§3.4). Follow it and migrate local rows. |
 | Different `sHash`, its `root` wrap opens with `R`, and the vault's `sHash` is in the local copy's `history` | **Replaced (rollback).** Someone who can sign for the user re-signed an older vault; it opens with `R` because `R` never changes. Never follow it on its own: offer to republish the copy from Evolu. |
 | Different `sHash`, its `root` wrap opens with `R`, no history relation either way | Ask the user (a restore or a resolved create race looks like this, but so does a replay to a device without a copy). Following copies only missing rows and keeps the old local database. |
@@ -436,7 +445,7 @@ Shared settings are always ⚠️ by design (§9). The level shown is the **high
 
 | Signer ↓ / Hosting → | Own domain (web) | nsite (gateway subdomain) | Mobile app |
 |---|---|---|---|
-| **Capable signer, verified identity** (extension, iframe signer, NIP-55) | ✅ | ✅ same data on every known gateway | ✅ (Android, NIP-55) |
+| **Capable signer, verified identity** (extension, iframe signer, NIP-55) | ✅ (with the `sk` wrap: strong against permissions, **not against nsec holders**) | ✅ same data on every known gateway (same caveat) | ✅ (Android, NIP-55; same caveat) |
 | **Capable signer, NIP-46 bunker** | 🔶 | 🔶 | 🔶 |
 | **Standard signer + client passkey** | ✅ | ✅ on one gateway; other gateways via the recovery phrase | ✅ (associated domain) |
 | **Standard signer, no passkey (or no PRF)** | ⚠️ (✅ with the recovery phrase typed on each new device) | ⚠️ (same) | ⚠️ (same) |

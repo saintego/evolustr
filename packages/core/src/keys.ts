@@ -15,6 +15,9 @@ export const sHash = (s: Bytes): string => short(sha256(s));
 export const rootDataKey = (r: Bytes, appId: string): Bytes =>
   hkdf(r, `evolustr/v1/data|${appId}`);
 
+/** Key for root-wrap tags (SPEC §3.1, #37): only holders of R can make a valid tag. */
+export const wrapAuthKey = (r: Bytes, appId: string): Bytes => hkdf(r, `evolustr/v1/wrap-auth|${appId}`);
+
 /** PRF input shared by all client passkeys of one vault (SPEC §4.1). */
 export const clientPrfInput = (pubkey: string, appId: string): Bytes =>
   sha256(utf8(`evolustr/v1/prf|${pubkey}|${appId}`));

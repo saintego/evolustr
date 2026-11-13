@@ -187,4 +187,43 @@ describe("client, compatible mode", () => {
     expect(words).not.toBe(unwrap(await c.showRecoveryPhrase()));
     expect(createAppOwner(OwnerSecret.orThrow(s)).mnemonic).toBe(words);
   });
+
+  it("a vault that appears right after this device created one gets the weak confirmation (#44)", async () => {
+    const w = world();
+    let injected = false;
+    const sneaky = {
+      ...w.mem.relays,
+      publish: async (urls: ReadonlyArray<string>, event: Parameters<typeof w.mem.relays.publish>[1], t: number) => {
+        const r = await w.mem.relays.publish(urls, event, t);
+        if (!injected && event.kind === VAULT_KIND) {
+          injected = true;
+          const pubkey = event.pubkey;
+          const ctx = { pubkey, appId: APP };
+          const otherS = randomBytes(16);
+          const other = unwrap(createCompatibleVault(ctx, { s: otherS, nip44Ct: await nip44SealSecret(w.signer, pubkey, otherS), now: 0 }));
+          await w.mem.relays.publish(URLS, await w.signer.signEvent(vaultEvent(ctx, other, event.created_at + 1)), t);
+        }
+        return r;
+      },
+    };
+    const c = createEvolustr(
+      { signer: w.signer, relays: sneaky, openDatabase: memoryDatabases(["notes"]).open, cache: memoryCache(), now: () => w.tick() },
+      { appId: APP, relayUrls: URLS },
+    );
+    expect(unwrap(await c.connect())).toEqual({ state: "needsUserAction", action: "confirmWeak" });
+  });
+
+  it("a forged vault that leads to a choice isn't spread to other relays (#44)", async () => {
+    const w = world();
+    const d = w.device();
+    const ra = await ready(d.make());
+    const ctx = { pubkey: ra.pubkey, appId: APP };
+    const otherS = randomBytes(16);
+    const forged = unwrap(createCompatibleVault(ctx, { s: otherS, nip44Ct: await nip44SealSecret(w.signer, ra.pubkey, otherS), now: 5000 }));
+    const event = await w.signer.signEvent(vaultEvent(ctx, forged, 5000));
+    w.mem.put("wss://r1", event);
+    expect(unwrap(await d.make().connect())).toMatchObject({ state: "vaultChanged" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(w.mem.store("wss://r2").some((e) => e.id === event.id)).toBe(false);
+  });
 });
