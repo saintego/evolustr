@@ -95,7 +95,7 @@ R is the recovery phrase, which never changes, so it's deliberately **not** cach
 ```
 
 - A **wrap** is one sealed copy of a secret. `ct` is the sealed bytes; `iv` is a random number that makes every sealing different, even of the same secret.
-- **`rootWraps`**: R sealed with each strong method's key. The `tag` proves the entry was made by someone who had R, so nobody can quietly remove a passkey or add a fake one.
+- **`rootWraps`**: R sealed with each strong method's key. The `tag` proves the entry was made by someone who had R, so nobody without R can add a fake one. Devices also merge the wraps they've seen and never drop one, so deleting a passkey's entry from the event doesn't stick: the next device that connects puts it back.
 - **`dataWraps`**: S sealed with a key derived from R, and in compatible mode also with NIP-44.
 - The `root` data wrap's label covers `mode`, `created`, `sHash` and `history`. So nobody without R can, for example, flip `"strict"` to `"compatible"` or fake the history: the envelope would no longer open.
 
