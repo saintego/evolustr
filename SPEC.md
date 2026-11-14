@@ -1,6 +1,6 @@
 # Evolustr Specification
 
-**Status:** Draft v0.15 (v0.15 changed the vault format: root-wrap tags and the full history hash. Early alpha, so there is no migration.)
+**Status:** Draft v0.16 (v0.16 added signer-vault wrap tags and `skDroppedAt`, and going strict with a new root key; v0.15 changed the vault format: root-wrap tags and the full history hash. Early alpha, so there is no migration.)
 **Scope:** Nostr identity → one Evolu (local-first, E2E-encrypted SQLite) database per app, synced across devices, with **no backend and no storage other than Nostr relays and Evolu**.
 
 ---
