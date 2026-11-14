@@ -14,9 +14,21 @@ const world = () => {
   const mem = memoryRelays();
   let clock = 1000;
   const synced = new Map<string, Bytes>(); // one passkey provider account shared by devices
-  const device = (o: { passkeys?: "synced" | "local" | "none"; prfAtCreate?: boolean; options?: Partial<ClientOptions> } = {}) => {
-    const dbs = memoryDatabases(["notes"], () => clock * 1000);
+  const device = (
+    o: {
+      passkeys?: "synced" | "local" | "none";
+      prfAtCreate?: boolean;
+      options?: Partial<ClientOptions>;
+      /** A device-local store that survives reloads (`hints`). */
+      hints?: Map<string, string>;
+      /** Share another device's databases, as Evolu sync would. */
+      dbs?: ReturnType<typeof memoryDatabases>;
+    } = {},
+  ) => {
+    const dbs = o.dbs ?? memoryDatabases(["notes"], () => clock * 1000);
     const cache = memoryCache();
+    const store = o.hints;
+    const hints = store === undefined ? undefined : { get: async (k: string) => store.get(k) ?? null, set: async (k: string, v: string) => void store.set(k, v) };
     const kind = o.passkeys ?? "synced";
     const passkeys =
       kind === "none"
@@ -24,7 +36,7 @@ const world = () => {
         : memoryPasskeys({ rpId: RP, store: kind === "synced" ? synced : new Map(), synced: kind === "synced", prfAtCreate: o.prfAtCreate ?? true });
     const make = () =>
       createEvolustr(
-        { signer, relays: mem.relays, openDatabase: dbs.open, cache, now: () => ++clock, ...(passkeys ? { passkeys } : {}) },
+        { signer, relays: mem.relays, openDatabase: dbs.open, cache, now: () => ++clock, ...(passkeys ? { passkeys } : {}), ...(hints ? { hints } : {}) },
         { appId: APP, relayUrls: URLS, ...o.options },
       );
     return { dbs, cache, make };
@@ -482,6 +494,55 @@ describe("client passkeys and strict mode", () => {
     expect(unwrap(await a.enrollPasskey())).toEqual({ done: true });
     const fresh = w.device({ passkeys: "none" }).make();
     expect(unwrap(await fresh.restoreFromPhrase(phrase)).status.mode).toBe("compatible");
+  });
+
+
+  it("forged backup facts in the app database don't skip the backup check (#53)", async () => {
+    const w = world();
+    const a = w.device({ passkeys: "local" }).make();
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    // An app that decrypted the nip44 wrap writes these through Evolu sync.
+    await ra.db.setMeta("phraseConfirmed", "1");
+    await ra.db.setMeta("strongMethods", JSON.stringify([
+      { id: "passkey:x", method: { kind: "passkey", synced: true } },
+      { id: "passkey:y", method: { kind: "passkey", synced: true } },
+    ]));
+    await connectReady(a); // a reload reads whatever is there
+    unwrap(await a.unlockRoot());
+    expect(await a.makeStrict()).toMatchObject({ ok: false, error: { type: "backupRequired" } });
+  });
+
+  it("a confirmed phrase is remembered on the device through hints, not elsewhere (#53)", async () => {
+    const w = world();
+    const hints = new Map<string, string>();
+    const d = w.device({ passkeys: "local", hints });
+    const a = d.make();
+    await connectReady(a);
+    await a.enrollPasskey();
+    unwrap(await a.confirmRecoveryPhrase(unwrap(await a.showRecoveryPhrase())));
+    expect(unwrap(await a.makeStrict())).toMatchObject({ mode: "strict", backupRecommended: false });
+    // A reload on the same device still knows.
+    expect((await connectReady(d.make())).status.backupRecommended).toBe(false);
+    // Another device doesn't (its own hints are empty).
+    hints.clear();
+    expect((await connectReady(d.make())).status.backupRecommended).toBe(true);
+  });
+
+  it("two verified passkey wraps need no backup, without any stored record (#53)", async () => {
+    const w = world();
+    const a = w.device({ passkeys: "local" }).make();
+    await connectReady(a);
+    await a.enrollPasskey();
+    // Device B, with its own device-bound passkey, joins through the phrase (not confirmed).
+    const phrase = unwrap(await a.showRecoveryPhrase());
+    const b = w.device({ passkeys: "local" }).make();
+    unwrap(await b.restoreFromPhrase(phrase));
+    unwrap(await b.enrollPasskey());
+    // A has no record of B's passkey, but its wrap verifies with R: two methods.
+    await connectReady(a);
+    unwrap(await a.unlockRoot({ recoveryPhrase: phrase }));
+    expect(unwrap(await a.makeStrict())).toMatchObject({ mode: "strict" });
   });
 
 });

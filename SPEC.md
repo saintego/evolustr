@@ -120,6 +120,13 @@ Rules:
 | Device-bound passkey (BS flag not set: a hardware key, a local-only platform authenticator) or a signer passkey that isn't synced | **No**: losing that one device loses the data | Confirm the recovery phrase, add a second strong method, **or** explicitly accept "I will lose this data if I lose this device". |
 
 The BS flag is what the authenticator reports at that moment; a user can still lose the provider account or turn sync off later. So the reminder stays visible (`status.backupRecommended`) until the user has a second strong method or has confirmed the phrase. The recovery phrase can be shown at any time later (`showRecoveryPhrase()`).
+
+**Where the backup facts live (#53).** Before `strict`, anyone who can decrypt the `nip44` wrap can write to the app database through Evolu sync, so the check never reads facts from there:
+
+- **Which methods exist** comes from the vault: with `R` known (it always is in `makeStrict()`), every root wrap whose tag verifies is a method. Without `R`, only methods this device recorded that still have a wrap count.
+- **Whether a method recovers on its own** (`synced`, `recoverable`) is recorded on the device that added it, in the device-local `hints` store. A wrap without such a record counts as **not** recoverable.
+- **The phrase confirmation** is a device-local marker `hex(HKDF(R, "evolustr/v1/phrase-confirmed", 8))`, so a marker for another root key doesn't count.
+- Without a `hints` store, both last for the session only. A user who confirmed the phrase on one device isn't remembered as confirmed on another: that device shows the reminder until they confirm there too, or have two methods.
 4. **Making a vault strict replaces `S`.** Dropping the `nip44` wrap doesn't make the old `S` secret again, because relays and other apps may have kept copies. The client creates a new `S'` (§3.4). `R` and all strong wraps stay as they are, so the recovery phrase doesn't change either. **Strict protects future writes only.** Everything stored under the old `S` stays as readable as it was: older vault events with its `nip44` wrap can survive on relays or in someone's copy, and Evolu's relay keeps the old owner's data. Clients say so before `makeStrict()`, and docs never claim more.
 5. **Clients never add a `nip44` wrap to a `strict` vault**, whatever the app's code or configuration says.
 6. **A `strict` vault ignores `nip44`.** A client reading a `strict` vault never tries a `nip44` wrap, even if one appears on a relay.

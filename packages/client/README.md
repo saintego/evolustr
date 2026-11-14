@@ -18,7 +18,7 @@ Every method returns a `Result`: `{ ok: true, value }` or `{ ok: false, error: {
 
 ## Optional dependencies
 
-- `hints`: a small non-secret store that survives logout (for example `localStorage`). It keeps the last mode and secret hash per user and app, so after a logout the device still notices a strict database swapped for a weak one. Removed by `logout({ deleteLocalData: true })`.
+- `hints`: a small non-secret store that survives logout (for example `localStorage`). It keeps the last mode and secret hash per user and app, so after a logout the device still notices a strict database swapped for a weak one. It also holds the facts for the backup check before strict: which of the user's passkeys and signers recover on their own, and whether the recovery phrase was confirmed. They're kept on the device because other apps with decrypt permission can write to a compatible database. Without `hints`, they last for the session only, and the user may be asked to confirm the phrase again after a reload. The mode hint is removed by `logout({ deleteLocalData: true })`.
 - `cache`: `webSecretCache()` on the web. Its entries are bound to their slot; entries written by earlier versions don't decrypt anymore and act as an empty cache (the user unlocks once).
 
 ## States from `connect()`

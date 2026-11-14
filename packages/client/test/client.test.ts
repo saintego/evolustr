@@ -92,7 +92,8 @@ describe("client, compatible mode", () => {
     const phrase = unwrap(await a.showRecoveryPhrase());
     expect((await a.confirmRecoveryPhrase("abandon ".repeat(11) + "about")).ok).toBe(false);
     expect((await a.confirmRecoveryPhrase(phrase.toUpperCase())).ok).toBe(true);
-    expect(await r.db.getMeta("phraseConfirmed")).toBe("1");
+    // Kept on the device, not in the app database others can write to (#53).
+    expect(await r.db.getMeta("phraseConfirmed")).toBeNull();
   });
 
   it("restoreFromPhrase opens the data on a new device", async () => {

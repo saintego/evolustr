@@ -30,6 +30,10 @@ import {
   addRootWrap,
   backupRequirement,
   canOpenOwnVault,
+  hkdf,
+  rootWrapKeyId,
+  toHex,
+  verifyRootWrap,
   clientPrfInput,
   createStrictVault,
   makeStrict as makeStrictVault,
@@ -96,7 +100,9 @@ export interface ClientDeps {
   /**
    * A small non-secret store that survives logout (e.g. localStorage): the last
    * mode and secret hash per (pubkey, appId). After a logout it still tells a
-   * strict vault swapped for a weak one (#44).
+   * strict vault swapped for a weak one (#44). It also holds the facts for the
+   * backup check (#53): which strong methods recover on their own, and whether
+   * the phrase was confirmed. Without it, those last for the session only.
    */
   readonly hints?: {
     readonly get: (key: string) => Promise<string | null>;
@@ -265,12 +271,13 @@ interface Pending {
 
 type Session = { readonly kind: "none" } | Unlocked | Pending;
 
+/** @deprecated No longer read or written: backup facts live on the device (`hints`, #53). */
 export const META_PHRASE_CONFIRMED = "phraseConfirmed";
 export const META_APP_SETTINGS = "appSettings";
 /** Data secrets this device moved past, for rollback detection beyond the vault's history (#44). */
 export const META_SEEN_SECRETS = "seenSecrets";
 const SEEN_LIMIT = 200;
-/** Strong methods known for this database, for the backup check (SPEC §3.2 rule 3a). */
+/** @deprecated No longer read or written: backup facts live on the device (`hints`, #53). */
 export const META_STRONG_METHODS = "strongMethods";
 
 interface KnownMethod {
@@ -336,7 +343,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (c === null) return;
     if (c.ready && c.signerId !== null && signerWrapFor(s.vault, c.signerId) !== undefined) {
       // Refresh the record: the signer may have gained an sk wrap or a synced passkey (#42).
-      await rememberMethod(s.db, { id: `signer:${c.signerId}`, method: { kind: "signer", recoverable: c.recoverable === true } });
+      await rememberMethod(s.ctx, { id: `signer:${c.signerId}`, method: { kind: "signer", recoverable: c.recoverable === true } });
+      backupState = await readBackupState(s.ctx, s.vault, s.r);
       return;
     }
     // A locked signer that needs a passkey click isn't asked here; the user adds it later.
@@ -363,20 +371,9 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!added.ok) return;
     const published = await publishVault(s.ctx, added.value);
     if (!published.ok) return;
-    await rememberMethod(s.db, { id: `signer:${signerIdNow}`, method: { kind: "signer", recoverable: c.recoverable === true } });
+    await rememberMethod(s.ctx, { id: `signer:${signerIdNow}`, method: { kind: "signer", recoverable: c.recoverable === true } });
     // Local copy source (#38): (a) made by this device: its signer wrap added.
     await becomeReady(s.ctx, published.value, s.s, r, s.unlockedWith, s.db);
-  };
-
-  const readMethods = async (db: AppDatabase): Promise<ReadonlyArray<KnownMethod>> => {
-    const text = await db.getMeta(META_STRONG_METHODS);
-    if (text === null) return [];
-    try {
-      const list = JSON.parse(text) as unknown;
-      return Array.isArray(list) ? (list as KnownMethod[]) : [];
-    } catch {
-      return [];
-    }
   };
 
   const readDoc = async (db: AppDatabase, key: string): Promise<SettingsDoc> => {
@@ -411,6 +408,52 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     } catch {
       return null;
     }
+  };
+
+  // ── Backup facts (SPEC §3.2 rule 3a, #53) ──
+  // Kept on the device, never in the app database: before strict, anyone who
+  // can decrypt the nip44 wrap can write there through Evolu sync.
+  const sessionStore = new Map<string, string>();
+  const localGet = async (key: string): Promise<string | null> =>
+    deps.hints === undefined ? (sessionStore.get(key) ?? null) : await deps.hints.get(key).catch(() => null);
+  const localSet = async (key: string, value: string): Promise<void> =>
+    deps.hints === undefined ? void sessionStore.set(key, value) : await deps.hints.set(key, value).catch(() => undefined);
+  const backupKey = (kind: "methods" | "phrase", ctx: VaultContext) =>
+    `evolustr:${kind}:${sha256Hex(`${ctx.pubkey}|${ctx.appId}`)}`;
+  /** Which root key a phrase confirmation was for; a marker for another R doesn't count. */
+  const phraseMarker = (r: Bytes) => toHex(hkdf(r, "evolustr/v1/phrase-confirmed", 8));
+
+  const readMethodRecords = async (ctx: VaultContext): Promise<ReadonlyArray<KnownMethod>> => {
+    try {
+      const list = JSON.parse((await localGet(backupKey("methods", ctx))) ?? "[]") as unknown;
+      return Array.isArray(list) ? (list as KnownMethod[]) : [];
+    } catch {
+      return [];
+    }
+  };
+  const writeMethodRecords = (ctx: VaultContext, list: ReadonlyArray<KnownMethod>) =>
+    localSet(backupKey("methods", ctx), JSON.stringify(list));
+
+  /**
+   * The backup facts for this vault. With R, every root wrap whose tag verifies
+   * is a method; whether it recovers on its own comes from this device's record,
+   * else it counts as not recoverable. Without R, only recorded methods that
+   * still have a wrap count.
+   */
+  const readBackupState = async (ctx: VaultContext, vault: Vault, r: Bytes | undefined): Promise<typeof backupState> => {
+    const records = await readMethodRecords(ctx);
+    const recordFor = (id: string) => records.find((m) => m.id === id);
+    const wrapIds = vault.rootWraps.filter((w) => r === undefined || verifyRootWrap(ctx, r, w)).map((w) => ({ id: `${w.type}:${rootWrapKeyId(w)}`, type: w.type }));
+    const methods: KnownMethod[] =
+      r === undefined
+        ? wrapIds.flatMap(({ id }) => {
+            const rec = recordFor(id);
+            return rec === undefined ? [] : [rec];
+          })
+        : wrapIds.map(({ id, type }) => recordFor(id) ?? { id, method: type === "passkey" ? { kind: "passkey", synced: false } : { kind: "signer", recoverable: false } });
+    const marker = await localGet(backupKey("phrase", ctx));
+    const phraseConfirmed = marker !== null && (r === undefined || marker === phraseMarker(r));
+    return { methods, phraseConfirmed };
   };
 
   /** Secrets this device has moved past, from its local database (#44). */
@@ -562,10 +605,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const next: Unlocked = { kind: "ready", ctx, vault, s, db: database, unlockedWith, ...(r === undefined ? {} : { r }) };
     session = next;
     settingsState = { app: await readDoc(database, META_APP_SETTINGS), shared: await readDoc(database, META_SHARED_SETTINGS) };
-    backupState = {
-      methods: await readMethods(database),
-      phraseConfirmed: (await database.getMeta(META_PHRASE_CONFIRMED)) === "1",
-    };
+    backupState = await readBackupState(ctx, vault, r);
     return ok({ pubkey: ctx.pubkey, db: database, status: statusOf(next) });
   };
 
@@ -951,6 +991,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     }
     const next: Unlocked = { ...s.value, vault, r: r.value };
     session = next;
+    backupState = await readBackupState(next.ctx, vault, r.value);
     return ok(statusOf(next));
   };
 
@@ -978,7 +1019,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!r.ok || s.value.r === undefined || rootKeyToPhrase(r.value) !== rootKeyToPhrase(s.value.r)) {
       return error("wrongPhrase", "The words don't match the recovery phrase");
     }
-    await s.value.db.setMeta(META_PHRASE_CONFIRMED, "1");
+    await localSet(backupKey("phrase", s.value.ctx), phraseMarker(s.value.r));
     backupState = { ...backupState, phraseConfirmed: true };
     return ok(undefined);
   };
@@ -1029,10 +1070,10 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     }
   };
 
-  const rememberMethod = async (db: AppDatabase, known: KnownMethod) => {
-    const methods = [...backupState.methods.filter((m) => m.id !== known.id), known];
-    await db.setMeta(META_STRONG_METHODS, JSON.stringify(methods));
-    backupState = { ...backupState, methods };
+  /** Records on this device whether a method recovers on its own (#53). */
+  const rememberMethod = async (ctx: VaultContext, known: KnownMethod) => {
+    const records = await readMethodRecords(ctx);
+    await writeMethodRecords(ctx, [...records.filter((m) => m.id !== known.id), known]);
   };
 
   /** Adds a passkey wrap of R once the PRF output is known. */
@@ -1052,7 +1093,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!added.ok) return added;
     const published = await publishVault(s.ctx, added.value);
     if (!published.ok) return published;
-    await rememberMethod(s.db, { id: `passkey:${created.credId}`, method: { kind: "passkey", synced: created.synced } });
+    await rememberMethod(s.ctx, { id: `passkey:${created.credId}`, method: { kind: "passkey", synced: created.synced } });
     // Local copy source (#38): (a) made by this device (passkey added).
     const ready = await becomeReady(s.ctx, published.value, s.s, r, s.unlockedWith, s.db);
     return ready.ok ? ok(ready.value.status) : ready;
@@ -1094,6 +1135,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const s = requireReady();
     if (!s.ok) return s;
     if (s.value.r === undefined) return error("rootLocked", "Unlock the root key on this device first");
+    // Read fresh, checked against the vault with R (#53).
+    backupState = await readBackupState(s.value.ctx, s.value.vault, s.value.r);
     const need = backupRequirement(backupState.methods.map((m) => m.method), backupState.phraseConfirmed);
     if (need === "required" && opts?.acceptDeviceLoss !== true) {
       return error("backupRequired", "Save the recovery phrase or add a second passkey first, or accept losing the data with this device");
@@ -1103,7 +1146,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!next.ok) return next;
     const db = await deps.openDatabase(newS);
     await migrateRows(s.value.db, db, { kind: "all" });
-    for (const key of [META_APP_SETTINGS, META_SHARED_SETTINGS, META_STRONG_METHODS, META_PHRASE_CONFIRMED, META_SEEN_SECRETS]) {
+    for (const key of [META_APP_SETTINGS, META_SHARED_SETTINGS, META_SEEN_SECRETS]) {
       const v = await s.value.db.getMeta(key);
       if (v !== null) await db.setMeta(key, v);
     }
@@ -1148,7 +1191,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         const published = await publishVault(ctx, vault.value);
         if (!published.ok) return published;
         const db = await deps.openDatabase(s);
-        await db.setMeta(META_STRONG_METHODS, JSON.stringify([{ id: `signer:${c.signerId}`, method }]));
+        await rememberMethod(ctx, { id: `signer:${c.signerId}`, method });
         // Local copy source (#38): (a) made by this device (requireStrong).
         return becomeReady(ctx, published.value, s, r, "signer", db);
       }
@@ -1176,7 +1219,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const published = await publishVault(ctx, vault.value);
     if (!published.ok) return published;
     const db = await deps.openDatabase(s);
-    await db.setMeta(META_STRONG_METHODS, JSON.stringify([{ id: `passkey:${created.value.credId}`, method }]));
+    await rememberMethod(ctx, { id: `passkey:${created.value.credId}`, method });
     // Local copy source (#38): (a) made by this device (requireStrong).
     return becomeReady(ctx, published.value, s, r, "passkey", db);
   };
