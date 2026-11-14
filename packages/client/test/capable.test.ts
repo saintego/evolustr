@@ -145,4 +145,21 @@ describe("backup check with a capable signer (#42)", () => {
     expect(await c.unlock()).toMatchObject({ ok: false, error: { type: "backupRequired" } });
     expect(unwrap(await c.unlock({ acceptDeviceLoss: true })).status.mode).toBe("strict");
   });
+
+  it("dependsOnNsec also counts a signer whose nsec could open its key before (#52)", async () => {
+    const mem = memoryRelays();
+    let clock = 1000;
+    const key = randomBytes(32);
+    const capableSigner = {
+      capabilities: async () => ({ identity: "verified" as const, appId: "https://notes.example", signerId: "abcd", ready: true, signerPasskey: true, recoverable: true, nsecProtected: false, nsecExposed: true }),
+      getWrapKey: async () => key,
+    };
+    const c = createEvolustr(
+      { signer: secretKeySigner(generateSecretKey()), relays: mem.relays, openDatabase: memoryDatabases(["notes"]).open, cache: memoryCache(), now: () => ++clock, capableSigner },
+      { appId: "https://notes.example", relayUrls: URLS },
+    );
+    await ready(c);
+    expect(unwrap(await c.makeStrict())).toMatchObject({ mode: "strict", dependsOnNsec: true });
+  });
+
 });

@@ -267,14 +267,16 @@ For nsites, a signer with verified identity maps known gateways to `nsite:<npub>
   {
     "v": 1,
     "wraps": [
-      { "type": "sk", "iv": "…", "ct": "…" },
-      { "type": "passkey", "rpId": "signer.example.com", "credId": "<base64url>", "iv": "…", "ct": "…" }
-    ]
+      { "type": "sk", "iv": "…", "ct": "…", "tag": "…" },
+      { "type": "passkey", "rpId": "signer.example.com", "credId": "<base64url>", "synced": true, "iv": "…", "ct": "…", "tag": "…" }
+    ],
+    "skDroppedAt": 1730000000   // optional: when an sk wrap was removed for this M (§5.7)
   }
   ```
 
   `AAD = "evolustr/v1|signer|" + pubkey + "|" + signerKey + "|" + wrapType + "|" + (credId | "sk")`.
   The `signer` marker keeps signer-vault wraps and app-vault wraps (§3.1) from ever being valid in each other's place.
+- **Wrap tags (#54):** `tag = hex(HMAC-SHA256(HKDF(M, "evolustr/v1/signer-wrap-auth"), AAD + "|" + (rpId + "|" + synced, or "|" for sk) + "|" + iv + "|" + ct))`. Only a holder of `M` can tag a wrap, and `synced` can't be flipped to make a device-bound passkey look recoverable. Wraps without a tag (older versions) are accepted. Once `M` is unlocked, the signer drops wraps whose tag is wrong; untagged ones are kept, unless the vault has more than 16 wraps, when only the untagged wrap just opened stays. The result is published after the next approved request. Adding a wrap to a vault that already has 32 fails with `signerVaultFull`.
 - `signerId = hex(SHA-256("evolustr/v1/signer-id|" + M))`, first 8 bytes. It is computed **after** unlocking `M`, and only labels this signer's wraps inside **app** vaults, so clients know which `signer` wrap the current signer can open. Two capable signers have different `M` and different `signerId`.
 - Wrap key for a caller: `K = HKDF-SHA256(M, "evolustr/v1|app|" + appId)`. HKDF is one-way, so one app's key reveals nothing about another's or about `M`.
 - A signer may cache the unlocked `M` on the device, as it caches its keys. It stores nothing else for Evolustr.
@@ -291,6 +293,8 @@ interface EvolustrSignerApi {
     ready: boolean;                // M is unlocked
     signerPasskey: boolean;        // M can be unlocked by a signer passkey
     recoverable: boolean;          // M survives losing this device: sk wrap or a synced signer passkey
+    nsecProtected: boolean;        // M has an sk wrap now
+    nsecExposed: boolean;          // an sk wrap exists or existed for this M (§5.7)
   }>;
   /** Wrap key for the caller's app vault. The signer computes appId itself.
    *  If M is locked (ready === false), the signer first shows its own Unlock UI
@@ -365,6 +369,7 @@ Thin adapters cover the common hosts: `adapters/iframe` (postMessage signers), `
 - **Integration:** the iframe's message handler passes `evolustr_*` requests to `evolustr.handle()` with `origin: event.origin`. `nostr-bridge.js` adds `window.nostr.evolustr` and forwards its calls to the iframe, the same way it forwards `signEvent`. The auto-approve list calls `isProtectedEvent()`. `signerKey` is the signer's own origin.
 - **`sk` mode in general:** anyone with the nsec can derive `M` from the public signer vault, then every app key, `R` and `S`. So strict through a signer in `sk` mode is strong against apps with signer *permissions*, not against anyone who has the nsec. Capabilities report `nsecProtected`; the client's `status.dependsOnNsec` shows it.
 - **OAuth mode** holds the nsec, so `M` can use the `sk` wrap. The Web3Auth `clientId` owner can recover the nsec, and so `M` and every app key derived from it. For users who don't accept that, the signer offers a signer passkey and drops the `sk` wrap. If a looser version of the signer uses a shared `clientId`, that owner is whoever controls the shared project.
+- **Moving from the nsec to a passkey (#52)** stops **new devices** from unlocking with the nsec. It does **not** take access away from someone who can recover the nsec: `M` stays the same, and older signer vault events with the `sk` wrap stay on relays and in anyone's copy. With `M` they get every app key, so `R` of every app vault with this signer's wrap, and `S`. The signer records the move (`skDroppedAt`) and reports `nsecExposed`; the client's `status.dependsOnNsec` includes it. A device that may no longer use the `sk` wrap never merges one back into a relay vault that has none. Removing the access needs a new `M` and new app keys, then a new `R` and `S` per app: not implemented yet.
 - **Passthrough mode** (extension or bunker through the bridge) has no nsec, so the API is available only after the user enrolls a signer passkey. The signer's own vault event is then signed by the extension or bunker, through the bridge. The parent page sees only the AES-encrypted vault: it could block the publish, but not read or forge `M`.
 - Per-app separation relies on `event.origin`, not on the `clientId` allowlist, so it holds in the looser version too.
 

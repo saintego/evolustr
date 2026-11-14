@@ -173,7 +173,8 @@ export interface Status {
   readonly backupRecommended: boolean;
   /**
    * The vault is strict and this session's capable signer protects its key with
-   * the nsec: anyone who has the user's nsec can open this data (#43).
+   * the nsec, or did before without changing the key: anyone who has the
+   * user's nsec can open this data (#43, #52).
    */
   readonly dependsOnNsec: boolean;
 }
@@ -598,7 +599,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     passkeySupported,
     dependsOnNsec:
       s.vault.mode === "strict" &&
-      caps?.nsecProtected === true &&
+      (caps?.nsecProtected === true || caps?.nsecExposed === true) &&
       caps.signerId !== null &&
       signerWrapFor(s.vault, caps.signerId) !== undefined,
     backupRecommended:

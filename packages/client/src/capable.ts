@@ -13,6 +13,11 @@ export interface SignerCapabilities {
   readonly recoverable?: boolean;
   /** The signer's key is protected by the nsec, so nsec holders can open strict data (#43). */
   readonly nsecProtected?: boolean;
+  /**
+   * The nsec could open the signer's key now or did before, e.g. it moved to a
+   * passkey without a new key: nsec holders may still open strict data (#52).
+   */
+  readonly nsecExposed?: boolean;
 }
 
 export interface CapableSigner {

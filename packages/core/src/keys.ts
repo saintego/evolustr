@@ -38,6 +38,9 @@ export const signerPasskeyWrapKey = (prfOutput: Bytes): Bytes =>
 export const signerSkWrapKey = (secretKey: Bytes): Bytes =>
   hkdf(secretKey, "evolustr/v1/signer-wrap");
 
+/** HMAC key for signer-vault wrap tags (#54): only a holder of M can tag a wrap. */
+export const signerWrapAuthKey = (m: Bytes): Bytes => hkdf(m, "evolustr/v1/signer-wrap-auth");
+
 /** Per-app key a capable signer gives the caller (SPEC §5.3). */
 export const signerAppKey = (m: Bytes, appId: string): Bytes =>
   hkdf(m, `evolustr/v1|app|${appId}`);
