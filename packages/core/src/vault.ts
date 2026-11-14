@@ -9,7 +9,7 @@ import { type Bytes, bytesEqual, fromHex, toHex, utf8 } from "./bytes.ts";
 import { hmac } from "@noble/hashes/hmac.js";
 import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 import { type Sealed, open, seal, sha256Hex } from "./crypto.ts";
-import { DATA_SECRET_LENGTH, ROOT_KEY_LENGTH, rootDataKey, sHash, wrapAuthKey } from "./keys.ts";
+import { DATA_SECRET_LENGTH, ROOT_KEY_LENGTH, rootDataKey, rootRotateKey, sHash, wrapAuthKey } from "./keys.ts";
 import { type EvolustrError, type Result, error, flatMap, ok } from "./result.ts";
 
 export type Mode = "compatible" | "strict";
@@ -46,6 +46,12 @@ export interface Vault {
   readonly history: ReadonlyArray<HistoryEntry>;
   readonly rootWraps: ReadonlyArray<RootWrap>;
   readonly dataWraps: ReadonlyArray<DataWrap>;
+  /**
+   * Set by {@link rotateRoot}: an HMAC by the previous root key over this
+   * vault's `sHash` and `created`. A device holding the old R sees a rotation
+   * it can check, instead of a vault R doesn't open (#52 phase C).
+   */
+  readonly rootRotation?: { readonly proof: string };
 }
 
 /** Who and which app a vault belongs to; part of every AAD. */
@@ -182,6 +188,10 @@ export const parseVault = (json: string): Result<Vault, EvolustrError> => {
   ) {
     return error("invalidVault", "Vault fields are missing or malformed");
   }
+  const rotation = data["rootRotation"];
+  if (rotation !== undefined && !(isRecord(rotation) && isString(rotation["proof"]))) {
+    return error("invalidVault", "Malformed rootRotation");
+  }
   return validateVault({
     v: 1,
     mode,
@@ -190,6 +200,7 @@ export const parseVault = (json: string): Result<Vault, EvolustrError> => {
     history,
     rootWraps,
     dataWraps,
+    ...(rotation === undefined ? {} : { rootRotation: { proof: rotation["proof"] as string } }),
   });
 };
 
@@ -447,6 +458,62 @@ export const makeStrictWithNewRoot = (
   const history = [...vault.history, { sHash: vault.sHash, created: vault.created }].slice(-HISTORY_LIMIT);
   const header: VaultHeader = { mode: "strict", created: input.now, sHash: sHash(input.newS), history };
   return validateVault({ v: 1, ...header, rootWraps: input.rootWraps, dataWraps: [sealRootData(ctx, input.newR, input.newS, header)] });
+};
+
+export interface RotateRootInput {
+  /** The current root key: it must open the vault, and it signs the rotation. */
+  readonly r: Bytes;
+  readonly newR: Bytes;
+  readonly newS: Bytes;
+  readonly now: number;
+  /** At least one, each made with `newR`. */
+  readonly rootWraps: ReadonlyArray<RootWrap>;
+  /** NIP-44 self-encryption of `newS`; required for a compatible vault. */
+  readonly nip44Ct?: string;
+}
+
+const rotationMessage = (sHashValue: string, created: number) => utf8(`${sHashValue}|${created}`);
+
+/**
+ * Replaces both R and S, keeping the mode (#52 phase C): for when R may be
+ * known to someone else (a signer key exposed through the nsec, or a recovery
+ * phrase that leaked). Every old root wrap is dropped, the old S goes into
+ * history, and the old R signs the result (`rootRotation`).
+ */
+export const rotateRoot = (
+  ctx: VaultContext,
+  vault: Vault,
+  input: RotateRootInput,
+): Result<Vault, EvolustrError> => {
+  if (!openRootData(ctx, vault, input.r).ok) return error("wrongRootKey", "The root key doesn't belong to this vault");
+  if (input.rootWraps.length === 0) return error("noRootWraps", "A new root key needs at least one strong method");
+  if (!input.rootWraps.every((w) => verifyRootWrap(ctx, input.newR, w))) {
+    return error("invalidVault", "Every root wrap must be made with the new root key");
+  }
+  if (vault.mode === "compatible" && input.nip44Ct === undefined) {
+    return error("invalidVault", "A compatible vault needs a nip44 wrap of the new secret");
+  }
+  const history = [...vault.history, { sHash: vault.sHash, created: vault.created }].slice(-HISTORY_LIMIT);
+  const header: VaultHeader = { mode: vault.mode, created: input.now, sHash: sHash(input.newS), history };
+  const proof = toHex(hmac(nobleSha256, rootRotateKey(input.r, ctx.appId), rotationMessage(header.sHash, header.created)));
+  return validateVault({
+    v: 1,
+    ...header,
+    rootWraps: input.rootWraps,
+    dataWraps: [
+      sealRootData(ctx, input.newR, input.newS, header),
+      ...(vault.mode === "compatible" && input.nip44Ct !== undefined ? [{ type: "nip44" as const, ct: input.nip44Ct }] : []),
+    ],
+    rootRotation: { proof },
+  });
+};
+
+/** True when `r` (an earlier root key) signed this vault's rotation (#52 phase C). */
+export const verifyRootRotation = (ctx: VaultContext, vault: Vault, r: Bytes): boolean => {
+  if (vault.rootRotation === undefined) return false;
+  const expected = hmac(nobleSha256, rootRotateKey(r, ctx.appId), rotationMessage(vault.sHash, vault.created));
+  const given = fromHex(vault.rootRotation.proof);
+  return given !== null && bytesEqual(expected, given);
 };
 
 export interface DowngradeInput {

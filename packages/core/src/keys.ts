@@ -18,6 +18,9 @@ export const rootDataKey = (r: Bytes, appId: string): Bytes =>
 /** Key for root-wrap tags (SPEC §3.1, #37): only holders of R can make a valid tag. */
 export const wrapAuthKey = (r: Bytes, appId: string): Bytes => hkdf(r, `evolustr/v1/wrap-auth|${appId}`);
 
+/** HMAC key the old R uses to authorise a root rotation (#52 phase C). */
+export const rootRotateKey = (r: Bytes, appId: string): Bytes => hkdf(r, `evolustr/v1/root-rotate|${appId}`);
+
 /** PRF input shared by all client passkeys of one vault (SPEC §4.1). */
 export const clientPrfInput = (pubkey: string, appId: string): Bytes =>
   sha256(utf8(`evolustr/v1/prf|${pubkey}|${appId}`));
@@ -40,6 +43,15 @@ export const signerSkWrapKey = (secretKey: Bytes): Bytes =>
 
 /** HMAC key for signer-vault wrap tags (#54): only a holder of M can tag a wrap. */
 export const signerWrapAuthKey = (m: Bytes): Bytes => hkdf(m, "evolustr/v1/signer-wrap-auth");
+
+/** Public id of a signer master secret, kept in the signer vault (#52 phase B). */
+export const signerMId = (m: Bytes): string => toHex(hkdf(m, "evolustr/v1/signer-mid", 8));
+
+/** HMAC key the old M uses to authorise its successor (#52 phase B). */
+export const signerRotateKey = (m: Bytes): Bytes => hkdf(m, "evolustr/v1/signer-rotate");
+
+/** Key the new M seals the previous M with, so old app keys stay available (#52 phase B). */
+export const signerPreviousKey = (m: Bytes): Bytes => hkdf(m, "evolustr/v1/signer-previous");
 
 /** Per-app key a capable signer gives the caller (SPEC §5.3). */
 export const signerAppKey = (m: Bytes, appId: string): Bytes =>
