@@ -412,6 +412,66 @@ describe("@evolustr/signer", () => {
       expect((await afterUnlock(t, junkWraps(31, false))).map((w) => w.type)).toEqual(["sk"]);
     });
 
+    describe("rotating M (#52 phase B)", () => {
+      /** Signer that moved from the nsec to a passkey; returns its old app key. */
+      const moved = async (t: ReturnType<typeof setup>, cache = deviceCache()) => {
+        const oldKey = unwrap(await createEvolustrSigner(t.host()).getWrapKey(web("https://a.example")));
+        const s = createEvolustrSigner(t.host({ cache, allowSkWrap: false, passkeys: passkeys(t) }));
+        unwrap(await s.enrollPasskey());
+        return { s, oldKey, cache };
+      };
+
+      it("gives a new key, keeps the old one available, and drops the nsec exposure", async () => {
+        const t = setup();
+        const { s, oldKey } = await moved(t);
+        const before = unwrap(await s.capabilities(web("https://a.example")));
+        expect(unwrap(await s.rotateMaster())).toEqual({ droppedWraps: 0 });
+        const after = unwrap(await s.capabilities(web("https://a.example")));
+        expect(after).toMatchObject({ nsecExposed: false, previousSignerId: before.signerId });
+        expect(after.signerId).not.toBe(before.signerId);
+        expect(unwrap(await s.getWrapKey(web("https://a.example")))).not.toEqual(oldKey);
+        expect(unwrap(await s.getPreviousWrapKey(web("https://a.example")))).toEqual(oldKey);
+        const onRelay = JSON.parse((await latest(t)).content) as { wraps: Array<{ type: string }>; rotatedFrom?: unknown; skDroppedAt?: number };
+        expect(onRelay.wraps.map((w) => w.type)).toEqual(["passkey"]);
+        expect(onRelay.rotatedFrom).toBeDefined();
+        expect(onRelay.skDroppedAt).toBeUndefined();
+      });
+
+      it("another device with the old M cached follows the rotation", async () => {
+        const t = setup();
+        const { s } = await moved(t);
+        const deviceB = deviceCache();
+        const b1 = createEvolustrSigner(t.host({ cache: deviceB, allowSkWrap: false, passkeys: passkeys(t) }));
+        unwrap(await b1.getWrapKey(web("https://a.example"))); // B now has the old M and a copy
+        unwrap(await s.rotateMaster());
+        const newKey = unwrap(await s.getWrapKey(web("https://a.example")));
+        const b2 = createEvolustrSigner(t.host({ cache: deviceB, allowSkWrap: false, passkeys: passkeys(t) }));
+        expect(unwrap(await b2.getWrapKey(web("https://a.example")))).toEqual(newKey);
+        expect(t.gestures.at(-1)).toBe("unlock"); // the new M needs the passkey once
+      });
+
+      it("a forged rotation isn't followed and doesn't change the key", async () => {
+        const t = setup();
+        const deviceB = deviceCache();
+        await moved(t);
+        const b1 = createEvolustrSigner(t.host({ cache: deviceB, allowSkWrap: false, passkeys: passkeys(t) }));
+        const key = unwrap(await b1.getWrapKey(web("https://a.example")));
+        const real = JSON.parse((await latest(t)).content) as Record<string, unknown>;
+        await republish(t, { ...real, mId: "ff".repeat(8), rotatedFrom: { mId: real["mId"], proof: "00".repeat(32) } });
+        const b2 = createEvolustrSigner(t.host({ cache: deviceB, allowSkWrap: false, passkeys: passkeys(t) }));
+        expect(unwrap(await b2.getWrapKey(web("https://a.example")))).toEqual(key);
+        expect(unwrap(await b2.capabilities(web("https://a.example"))).previousSignerId).toBeNull();
+      });
+
+      it("is refused while the nsec may still unlock the key", async () => {
+        const t = setup();
+        unwrap(await createEvolustrSigner(t.host()).getWrapKey(web("https://a.example")));
+        const s = createEvolustrSigner(t.host({ passkeys: passkeys(t) }));
+        unwrap(await s.enrollPasskey());
+        expect(await s.rotateMaster()).toMatchObject({ ok: false, error: { type: "nsecAllowed" } });
+      });
+    });
+
     it("enrolling into a full signer vault is refused (#54)", async () => {
       const t = setup();
       const cache = deviceCache();

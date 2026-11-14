@@ -10,7 +10,7 @@ export const appWrapAad = (
 ): string => `evolustr/v1|${pubkey}|${appId}|${wrapType}|${keyId}`;
 
 /** Wrap types inside a signer's own vault (SPEC §5.3). */
-export type SignerWrapType = "sk" | "passkey";
+export type SignerWrapType = "sk" | "passkey" | "previous";
 
 /** AAD for signer-vault wraps; `keyId` is the credId, or "sk". */
 export const signerWrapAad = (

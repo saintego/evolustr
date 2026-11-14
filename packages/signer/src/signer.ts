@@ -21,6 +21,9 @@ import {
   fromHex,
   hmacSha256,
   signerWrapAuthKey,
+  signerMId,
+  signerPreviousKey,
+  signerRotateKey,
   toHex,
   fetchReplaceable,
   isProtectedDTag,
@@ -74,11 +77,18 @@ export interface SignerVault {
    * change, so anyone who can recover the nsec may still open an older copy.
    */
   readonly skDroppedAt?: number;
+  /** Public id of the M this vault holds (#52 phase B); missing in older vaults. */
+  readonly mId?: string;
+  /** Set after {@link EvolustrSigner.rotateMaster}: the previous M authorises this one. */
+  readonly rotatedFrom?: { readonly mId: string; readonly proof: string };
+  /** The previous M, sealed with a key from this M, so apps can still open their old wrap. */
+  readonly previous?: { readonly mId: string } & Sealed;
 }
 
 export type ConfirmRequest =
   | { readonly kind: "appKey"; readonly appId: string; readonly identity: Caller["identity"] }
-  | { readonly kind: "enrollPasskey" };
+  | { readonly kind: "enrollPasskey" }
+  | { readonly kind: "rotateMaster" };
 
 export interface SignerHost {
   readonly relays: Relays;
@@ -114,7 +124,7 @@ export interface SignerHost {
     /** Show a prompt with the verified caller; the host may remember answers. */
     readonly confirm: (request: ConfirmRequest) => Promise<boolean>;
     /** Resolve after the user clicks inside the signer (needed before passkeys and popups). */
-    readonly requestGesture: (reason: "unlock" | "enrollPasskey") => Promise<void>;
+    readonly requestGesture: (reason: "unlock" | "enrollPasskey" | "rotateMaster") => Promise<void>;
   };
   readonly knownNsiteGateways?: ReadonlyArray<string>;
   readonly now?: () => number;
@@ -137,9 +147,14 @@ export interface Capabilities {
    * this M): anyone who can recover the nsec may have M and every app key (#52).
    */
   readonly nsecExposed: boolean;
+  /**
+   * After a key rotation (#52 phase B): this app's signer id under the previous
+   * M, so the client can open its old wrap and then replace its root key.
+   */
+  readonly previousSignerId: string | null;
 }
 
-export const METHODS = ["evolustr_capabilities", "evolustr_get_wrap_key", "evolustr_enroll_passkey"] as const;
+export const METHODS = ["evolustr_capabilities", "evolustr_get_wrap_key", "evolustr_get_previous_wrap_key", "evolustr_enroll_passkey"] as const;
 export type Method = (typeof METHODS)[number];
 
 export interface EvolustrSigner {
@@ -150,6 +165,14 @@ export interface EvolustrSigner {
   /** 32-byte key for the caller's app vault (SPEC §5.3). */
   readonly getWrapKey: (caller: Caller) => Promise<Result<Bytes>>;
   readonly enrollPasskey: () => Promise<Result<void>>;
+  /** The caller's key under the previous M, after {@link rotateMaster} (#52 phase B). */
+  readonly getPreviousWrapKey: (caller: Caller) => Promise<Result<Bytes>>;
+  /**
+   * Replaces M with a new one, from a click in the signer's own UI (#52 phase
+   * B). Needs a signer passkey and `allowSkWrap` false. Only the passkey used
+   * here wraps the new M: other signer passkeys must be enrolled again.
+   */
+  readonly rotateMaster: () => Promise<Result<{ readonly droppedWraps: number }>>;
   /** For the host's auto-approve list (SPEC §5.5 rule 2). */
   readonly isProtectedEvent: (event: { readonly kind: number; readonly tags: ReadonlyArray<ReadonlyArray<string>> }) => boolean;
   readonly appIdFor: (caller: Caller) => Result<string>;
@@ -194,10 +217,25 @@ export const parseSignerVault = (json: string): Result<SignerVault, EvolustrErro
   if (dropped !== undefined && (typeof dropped !== "number" || !Number.isFinite(dropped))) {
     return error("invalidSignerVault", "Malformed skDroppedAt");
   }
+  const mId = data["mId"];
+  const rotatedFrom = data["rotatedFrom"];
+  const previous = data["previous"];
+  if (mId !== undefined && typeof mId !== "string") return error("invalidSignerVault", "Malformed mId");
+  if (rotatedFrom !== undefined && !(isRecord(rotatedFrom) && typeof rotatedFrom["mId"] === "string" && typeof rotatedFrom["proof"] === "string")) {
+    return error("invalidSignerVault", "Malformed rotatedFrom");
+  }
+  if (previous !== undefined && !(isRecord(previous) && typeof previous["mId"] === "string" && typeof previous["iv"] === "string" && typeof previous["ct"] === "string")) {
+    return error("invalidSignerVault", "Malformed previous");
+  }
+  const extra = {
+    ...(typeof mId === "string" ? { mId } : {}),
+    ...(isRecord(rotatedFrom) ? { rotatedFrom: { mId: rotatedFrom["mId"] as string, proof: rotatedFrom["proof"] as string } } : {}),
+    ...(isRecord(previous) ? { previous: { mId: previous["mId"] as string, iv: previous["iv"] as string, ct: previous["ct"] as string } } : {}),
+  };
   // A vault that exists but has no wraps isn't "first use" (#28).
   if (wraps.length === 0) return error("invalidSignerVault", "The signer vault has no wraps");
   if (wraps.length > MAX_SIGNER_WRAPS) return error("invalidSignerVault", "Too many wraps");
-  return ok({ v: 1, wraps, ...(typeof dropped === "number" ? { skDroppedAt: dropped } : {}) });
+  return ok({ v: 1, wraps, ...(typeof dropped === "number" ? { skDroppedAt: dropped } : {}), ...extra });
 };
 
 const wrapId = (w: SignerWrap): string => (w.type === "sk" ? "sk" : w.credId);
@@ -224,7 +262,33 @@ export const mergeSignerVaults = (
     if (keep(w) && !byId.has(k) && byId.size < MAX_SIGNER_WRAPS) byId.set(k, w);
   }
   const dropped = Math.max(local.skDroppedAt ?? -1, fetched.skDroppedAt ?? -1);
-  return { v: 1, wraps: [...byId.values()], ...(dropped >= 0 ? { skDroppedAt: dropped } : {}) };
+  const mId = local.mId ?? fetched.mId;
+  const rotatedFrom = local.rotatedFrom ?? fetched.rotatedFrom;
+  const previous = local.previous ?? fetched.previous;
+  return {
+    v: 1,
+    wraps: [...byId.values()],
+    ...(dropped >= 0 ? { skDroppedAt: dropped } : {}),
+    ...(mId === undefined ? {} : { mId }),
+    ...(rotatedFrom === undefined ? {} : { rotatedFrom }),
+    ...(previous === undefined ? {} : { previous }),
+  };
+};
+
+/** Two versions of the signer vault hold different master secrets: never merge them (#52 phase B). */
+export const differentMaster = (a: SignerVault, b: SignerVault): boolean =>
+  (a.mId !== undefined && b.mId !== undefined && a.mId !== b.mId) ||
+  (b.rotatedFrom !== undefined && a.mId !== b.mId) ||
+  (a.rotatedFrom !== undefined && a.mId !== b.mId);
+
+/** Proof that the M behind `oldMId` authorised `newMId` (#52 phase B). */
+export const masterRotationProof = (oldM: Bytes, newMId: string): string => toHex(hmacSha256(signerRotateKey(oldM), utf8(newMId)));
+
+const rotationValid = (v: SignerVault, oldM: Bytes): boolean => {
+  if (v.rotatedFrom === undefined || v.mId === undefined || v.rotatedFrom.mId !== signerMId(oldM)) return false;
+  const expected = fromHex(masterRotationProof(oldM, v.mId));
+  const given = fromHex(v.rotatedFrom.proof);
+  return expected !== null && given !== null && bytesEqual(expected, given);
 };
 
 type UntaggedSignerWrap = { readonly type: "sk"; readonly iv: string; readonly ct: string } | {
@@ -303,6 +367,10 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   /** The relays lack wraps the local copy has (#41); fixed after an approved key request. */
   let needsHeal = false;
   let lastEventAt = 0;
+  /** A relay vault with another M than the local copy, checked once M is known (#52 phase B). */
+  let candidate: SignerVault | null = null;
+  /** The previous M after a rotation, for old app keys. */
+  let previousM: Bytes | null = null;
 
   const appIdFor = (caller: Caller) => appIdForCaller(caller, host.knownNsiteGateways);
 
@@ -337,6 +405,12 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     } else if (!fetched.ok || fetched.value === null) {
       vault = local;
       needsHeal = true;
+    } else if (differentMaster(local, fetched.value)) {
+      // Another M on the relays (a rotation, or a forgery): keep the local copy
+      // until M is unlocked and can check it; never heal over it (#52 phase B).
+      vault = local;
+      candidate = fetched.value;
+      needsHeal = false;
     } else {
       // The relay vault has no sk wrap and this device may not use one: keep it that way (#52).
       const dropSk = !allowSk() && !fetched.value.wraps.some((w) => w.type === "sk");
@@ -395,7 +469,8 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
 
   /** With M known, drops forged wraps; a change is published on the next approved request (#54). */
   const prune = (pubkey: string, secret: Bytes, openedId?: string) => {
-    if (vault === null) return;
+    // Never touch a vault that holds another M (#52 phase B).
+    if (vault === null || (vault.mId !== undefined && vault.mId !== signerMId(secret))) return;
     const pruned = pruneSignerVault(vault, pubkey, host.signerKey, secret, openedId);
     if (pruned.wraps.length !== vault.wraps.length) {
       vault = pruned;
@@ -403,12 +478,49 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     }
   };
 
+  /**
+   * With M known: if the relays hold a rotation this M authorised, switch to it
+   * and forget this M (it must not make new app keys). "rotated" means M must
+   * now be unlocked again, from the new vault (#52 phase B).
+   */
+  const reconcile = async (pubkey: string): Promise<"same" | "rotated" | "foreign"> => {
+    if (m === null) return "same";
+    const myId = signerMId(m);
+    const other = candidate ?? (vault?.mId !== undefined && vault.mId !== myId ? vault : null);
+    if (other === null) return "same";
+    candidate = null;
+    if (!rotationValid(other, m)) return "foreign";
+    previousM = m;
+    vault = other;
+    m = null;
+    needsHeal = false;
+    await host.cache?.remove(pubkey);
+    await host.cache?.setVault?.(pubkey, JSON.stringify(other));
+    return "rotated";
+  };
+
   /** Called after a wrap opened to M, or after creating M: the vault is good (#41). */
   const remember = async (pubkey: string, secret: Bytes, openedId?: string) => {
     m = secret;
+    if ((await reconcile(pubkey)) === "rotated") return;
     prune(pubkey, secret, openedId);
+    // Older vaults have no mId: add it, since a wrap of this vault just opened to M.
+    if (openedId !== undefined && vault !== null && vault.mId === undefined) {
+      vault = { ...vault, mId: signerMId(secret) };
+      needsHeal = true;
+    }
     await host.cache?.set(pubkey, secret);
     if (vault !== null) await host.cache?.setVault?.(pubkey, JSON.stringify(vault));
+  };
+
+  /** The previous M, opened from the vault with the current one. */
+  const previousOf = (pubkey: string): Bytes | null => {
+    if (previousM !== null) return previousM;
+    const p = vault?.previous;
+    if (m === null || p === undefined || vault?.mId !== signerMId(m)) return null;
+    const opened = open(signerPreviousKey(m), p, signerWrapAad(pubkey, host.signerKey, "previous", p.mId));
+    if (opened.ok && opened.value.length === MASTER_SECRET_LENGTH && signerMId(opened.value) === p.mId) previousM = opened.value;
+    return previousM;
   };
 
   /**
@@ -420,7 +532,9 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     const cached = await host.cache?.get(pubkey);
     if (cached != null && cached.length === MASTER_SECRET_LENGTH) {
       m = cached;
-      return ok(true);
+      // Relays down: keep using the cached M. A rotation it authorised: unlock the new one.
+      const read = await loadVault(pubkey);
+      if (!read.ok || (await reconcile(pubkey)) !== "rotated") return ok(true);
     }
     const loaded = await loadVault(pubkey);
     if (!loaded.ok) return loaded;
@@ -437,7 +551,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
       if (vault === null && create) {
         // First use: create M and protect it with the nsec.
         const fresh = random(MASTER_SECRET_LENGTH);
-        const published = await publish(pubkey, withWrap(vault, sealM(pubkey, signerSkWrapKey(sk), { type: "sk" }, fresh)));
+        const published = await publish(pubkey, { ...withWrap(vault, sealM(pubkey, signerSkWrapKey(sk), { type: "sk" }, fresh)), mId: signerMId(fresh) });
         if (!published.ok) return published;
         await remember(pubkey, fresh);
         return ok(true);
@@ -477,6 +591,11 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     if (!quiet.value) {
       const viaPasskey = await unlockWithPasskey(pubkey);
       if (!viaPasskey.ok) return viaPasskey;
+      // That opened the previous M, and the vault moved on to its successor (#52 phase B).
+      if (m === null && previousM !== null) {
+        const again = await unlockWithPasskey(pubkey);
+        if (!again.ok) return again;
+      }
     }
     return m === null ? error("signerLocked", "Locked") : ok({ pubkey, m });
   };
@@ -498,6 +617,10 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
       recoverable: (vault?.wraps ?? []).some((w) => w.type === "sk" || (w.type === "passkey" && w.synced === true)),
       nsecProtected: (vault?.wraps ?? []).some((w) => w.type === "sk"),
       nsecExposed: (vault?.wraps ?? []).some((w) => w.type === "sk") || vault?.skDroppedAt !== undefined,
+      previousSignerId: (() => {
+        const prev = previousOf(pubkey);
+        return prev === null ? null : computeSignerId(prev, appId.value);
+      })(),
     });
   };
 
@@ -568,10 +691,69 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
       next = { ...next, wraps: next.wraps.filter((w) => w.type !== "sk"), skDroppedAt: now() };
     }
     if (next.wraps.length > MAX_SIGNER_WRAPS) return error("signerVaultFull", "The signer vault has no room for another wrap");
+    next = { ...next, mId: signerMId(secret) };
     const published = await publish(pubkey, next);
     if (!published.ok) return published;
     await remember(pubkey, secret);
     return ok(undefined);
+  };
+
+  const getPreviousWrapKey: EvolustrSigner["getPreviousWrapKey"] = async (caller) => {
+    const appId = appIdFor(caller);
+    if (!appId.ok) return appId;
+    const allowed = await host.ui.confirm({ kind: "appKey", appId: appId.value, identity: caller.identity });
+    if (!allowed) return error("userRefused", "The user didn't allow this app");
+    const unlocked = await ensureM();
+    if (!unlocked.ok) return unlocked;
+    const prev = previousOf(unlocked.value.pubkey);
+    return prev === null ? error("noPreviousKey", "This signer hasn't replaced its key") : ok(signerAppKey(prev, appId.value));
+  };
+
+  const rotateMaster: EvolustrSigner["rotateMaster"] = async () => {
+    const passkeys = host.passkeys;
+    if (passkeys === undefined) return error("noPasskeys", "This signer has no passkey support");
+    // The point is to cut off whoever can recover the nsec: an sk wrap would bring it back.
+    if (allowSk()) return error("nsecAllowed", "Turn off the nsec protection (allowSkWrap) before replacing the key");
+    const pubkey = await host.getPublicKey();
+    const loaded = await loadVault(pubkey);
+    if (!loaded.ok) return loaded;
+    if (vault === null) return error("noSignerVault", "This signer has no key to replace yet");
+    const wraps = vault.wraps.filter(
+      (w): w is Extract<SignerWrap, { type: "passkey" }> => w.type === "passkey" && w.rpId === passkeys.rpId,
+    );
+    if (wraps.length === 0) return error("noSignerPasskey", "Enroll a signer passkey first");
+    if (!(await host.ui.confirm({ kind: "rotateMaster" }))) return error("userRefused", "Cancelled");
+    await host.ui.requestGesture("rotateMaster");
+    let result;
+    try {
+      result = await passkeys.get({ allowCredIds: wraps.map((w) => w.credId), prfInput: signerPrfInput(pubkey) });
+    } catch (e) {
+      return error("passkeyFailed", e instanceof Error ? e.message : String(e));
+    }
+    const wrap = wraps.find((w) => w.credId === result.credId);
+    if (wrap === undefined || result.prfOutput === null) return error("passkeyFailed", "The passkey gave no usable result");
+    const key = signerPasskeyWrapKey(result.prfOutput);
+    // The passkey in hand proves the user holds the current M.
+    const oldM = openM(pubkey, wrap, key);
+    if (!oldM.ok) return oldM;
+    const newM = random(MASTER_SECRET_LENGTH);
+    const oldMId = signerMId(oldM.value);
+    const newMId = signerMId(newM);
+    const next: SignerVault = {
+      v: 1,
+      wraps: [sealM(pubkey, key, { type: "passkey", rpId: wrap.rpId, credId: wrap.credId, ...(wrap.synced === undefined ? {} : { synced: wrap.synced }) }, newM)],
+      mId: newMId,
+      rotatedFrom: { mId: oldMId, proof: masterRotationProof(oldM.value, newMId) },
+      previous: { mId: oldMId, ...seal(signerPreviousKey(newM), oldM.value, signerWrapAad(pubkey, host.signerKey, "previous", oldMId)) },
+    };
+    const droppedWraps = vault.wraps.length - 1;
+    const published = await publish(pubkey, next);
+    if (!published.ok) return published;
+    candidate = null;
+    previousM = oldM.value;
+    m = newM;
+    await host.cache?.set(pubkey, newM);
+    return ok({ droppedWraps });
   };
 
   const handle: EvolustrSigner["handle"] = async (method, _params, caller) => {
@@ -580,6 +762,10 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
         return capabilities(caller);
       case "evolustr_get_wrap_key": {
         const key = await getWrapKey(caller);
+        return key.ok ? ok(toBase64Url(key.value)) : key;
+      }
+      case "evolustr_get_previous_wrap_key": {
+        const key = await getPreviousWrapKey(caller);
         return key.ok ? ok(toBase64Url(key.value)) : key;
       }
       case "evolustr_enroll_passkey":
@@ -595,8 +781,10 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     vault = null;
     vaultLoaded = false;
     needsHeal = false;
+    candidate = null;
+    previousM = null;
     if (pubkey !== null) await host.cache?.remove(pubkey);
   };
 
-  return { handle, capabilities, getWrapKey, enrollPasskey, isProtectedEvent, appIdFor, lock };
+  return { handle, capabilities, getWrapKey, getPreviousWrapKey, enrollPasskey, rotateMaster, isProtectedEvent, appIdFor, lock };
 };
