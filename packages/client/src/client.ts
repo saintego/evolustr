@@ -38,6 +38,8 @@ import {
   createStrictVault,
   makeStrict as makeStrictVault,
   makeStrictWithNewRoot,
+  rotateRoot as rotateRootVault,
+  verifyRootRotation,
   openRootWrap,
   passkeyRootWrap,
   passkeyWrapKey,
@@ -177,6 +179,12 @@ export interface Status {
    * user's nsec can open this data (#43, #52).
    */
   readonly dependsOnNsec: boolean;
+  /**
+   * The capable signer replaced its key because the old one was exposed (#52),
+   * and this vault still has a wrap made with the old key: whoever had it may
+   * know this app's root key and data secret. Offer `rotateRoot()`.
+   */
+  readonly rootExposed: boolean;
 }
 
 /** Steps of connect / unlock, for showing progress (`onProgress`). */
@@ -273,6 +281,15 @@ export interface Evolustr {
   readonly confirmRecoveryPhrase: (words: string) => Promise<Result<void>>;
   readonly restoreFromPhrase: (words: string) => Promise<Result<Ready>>;
   readonly downgrade: () => Promise<Result<Status>>;
+  /**
+   * Replaces the root key and the data secret, keeping the mode (#52 phase C),
+   * from a click: when `status.rootExposed`, or when the recovery phrase may
+   * have leaked. A new strong method seals the new root key (the capable
+   * signer, else a new passkey). Every other passkey and signer, and the old
+   * recovery phrase, stop working for this app; tell the user first. Data
+   * written before stays as readable as it was.
+   */
+  readonly rotateRoot: (opts?: { readonly acceptDeviceLoss?: boolean }) => Promise<Result<Status>>;
   readonly status: () => Status | null;
   readonly settings: {
     /** `app ?? shared ?? default` (SPEC §9.2). Reads cached values; no prompt. */
@@ -368,14 +385,28 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const c = await refreshCaps();
     if (c?.signerId == null) return error("noSignerWrap", "This signer has no wrap in the vault yet");
     // The fetched vault's wrap first, then the local copy's (#39).
-    const wraps = [signerWrapFor(vault, c.signerId), copy === undefined ? undefined : signerWrapFor(copy, c.signerId)].filter(
-      (w): w is RootWrap => w !== undefined,
-    );
-    if (wraps.length === 0) return error("noSignerWrap", "This signer has no wrap in the vault yet");
+    const wrapsFor = (id: string) =>
+      [signerWrapFor(vault, id), copy === undefined ? undefined : signerWrapFor(copy, id)].filter((w): w is RootWrap => w !== undefined);
+    const wraps = wrapsFor(c.signerId);
     for (const wrap of wraps) {
       const opened = openRootWrap(ctx, wrap, key);
       if (opened.ok) return opened;
     }
+    // After the signer replaced its key, the wrap made with the old one (#52 phase B).
+    const previous = c.previousSignerId == null ? [] : wrapsFor(c.previousSignerId);
+    if (previous.length > 0 && capable.getPreviousWrapKey !== undefined) {
+      let oldKey: Bytes;
+      try {
+        oldKey = await capable.getPreviousWrapKey();
+      } catch (e) {
+        return error("signerRefused", e instanceof Error ? e.message : String(e));
+      }
+      for (const wrap of previous) {
+        const opened = openRootWrap(ctx, wrap, oldKey);
+        if (opened.ok) return opened;
+      }
+    }
+    if (wraps.length === 0 && previous.length === 0) return error("noSignerWrap", "This signer has no wrap in the vault yet");
     return error("signerRefused", "The signer's key didn't open its wrap");
   };
 
@@ -602,6 +633,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       (caps?.nsecProtected === true || caps?.nsecExposed === true) &&
       caps.signerId !== null &&
       signerWrapFor(s.vault, caps.signerId) !== undefined,
+    rootExposed: caps?.previousSignerId != null && signerWrapFor(s.vault, caps.previousSignerId) !== undefined,
     backupRecommended:
       s.vault.mode === "strict" &&
       backupRequirement(backupState.methods.map((m) => m.method), backupState.phraseConfirmed) !== "none",
@@ -726,7 +758,11 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     local: Pending["local"],
     requireWeakConfirm = false,
   ): Promise<Result<ConnectResult>> => {
-    if (caps?.ready === true && caps.signerId !== null && signerWrapFor(vault, caps.signerId) !== undefined) {
+    const signerHasWrap =
+      caps !== null &&
+      ((caps.signerId !== null && signerWrapFor(vault, caps.signerId) !== undefined) ||
+        (caps.previousSignerId != null && signerWrapFor(vault, caps.previousSignerId) !== undefined));
+    if (caps?.ready === true && signerHasWrap) {
       const root = await rootFromSigner(ctx, vault);
       if (root.ok) {
         const s = openRootData(ctx, vault, root.value);
@@ -937,6 +973,10 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!s.ok) {
       // R is real (it opens this device's copy), so the fetched vault is foreign (#39).
       if (p.local?.copy !== undefined && openRootData(p.ctx, p.local.copy, r.value).ok) {
+        // The old R signed the vault: the user replaced the root key elsewhere (#52 phase C).
+        if (verifyRootRotation(p.ctx, vault, r.value)) {
+          return error("rootRotated", "The root key was replaced on another device: unlock with the new passkey, signer or recovery phrase");
+        }
         session = { kind: "pending", ctx: p.ctx, action: "choose", vault, local: { ...p.local, r: r.value } };
         return error("vaultReplaced", "The vault on the relays isn't yours; restore this device's copy with resolveVaultChange(\"republishCopy\")");
       }
@@ -1214,6 +1254,45 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     return rotateTo(s.value, next.value, newS, s.value.r);
   };
 
+  const rotateRoot: Evolustr["rotateRoot"] = async (opts) => {
+    const ready = requireReady();
+    if (!ready.ok) return ready;
+    let s = ready.value;
+    if (s.r === undefined) {
+      // The signer can open the vault, also through its previous key.
+      const viaSigner = capable === undefined ? null : await rootFromSigner(s.ctx, s.vault);
+      if (viaSigner === null || !viaSigner.ok) return error("rootLocked", "Unlock the root key on this device first (unlockRoot)");
+      if (!openRootData(s.ctx, s.vault, viaSigner.value).ok) return error("rootLocked", "Unlock the root key on this device first (unlockRoot)");
+      s = { ...s, r: viaSigner.value };
+    }
+    const oldR = s.r!;
+    const newR = random(ROOT_KEY_LENGTH);
+    const strong = await newStrongWrap(s.ctx, newR, opts?.acceptDeviceLoss === true);
+    if (!strong.ok) return strong;
+    const newS = random(DATA_SECRET_LENGTH);
+    let nip44Ct: string | undefined;
+    if (s.vault.mode === "compatible") {
+      try {
+        nip44Ct = await nip44SealSecret(deps.signer, s.ctx.pubkey, newS);
+      } catch (e) {
+        return error("signerRefused", e instanceof Error ? e.message : String(e));
+      }
+    }
+    const next = rotateRootVault(s.ctx, s.vault, {
+      r: oldR,
+      newR,
+      newS,
+      now: now(),
+      rootWraps: [strong.value.wrap],
+      ...(nip44Ct === undefined ? {} : { nip44Ct }),
+    });
+    if (!next.ok) return next;
+    // Backup facts start over: one method, phrase not confirmed (#53).
+    await writeMethodRecords(s.ctx, [strong.value.known]);
+    await localSet(backupKey("phrase", s.ctx), "");
+    return rotateTo(s, next.value, newS, newR);
+  };
+
   /** Strict with a new root key and a new strong method (#49). */
   const makeStrictNewRoot = async (s: Unlocked, acceptDeviceLoss: boolean): Promise<Result<Status>> => {
     const newR = random(ROOT_KEY_LENGTH);
@@ -1394,6 +1473,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     confirmRecoveryPhrase,
     restoreFromPhrase,
     downgrade,
+    rotateRoot,
     status,
     settings,
     logout,

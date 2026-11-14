@@ -660,4 +660,39 @@ describe("client passkeys and strict mode", () => {
     expect((await connectReady(bd.make())).status).toMatchObject({ mode: "compatible", level: "weak" });
   });
 
+
+  it("rotateRoot: a device with the old R cached asks for the new method, never offers to undo it (#52 phase C)", async () => {
+    const w = world();
+    const { d, phrase } = await strictDevice(w, { cacheRootKey: true });
+    const b = w.device().make();
+    await b.connect();
+    unwrap(await b.unlock());
+    expect(unwrap(await b.rotateRoot())).toMatchObject({ mode: "strict" });
+    expect(unwrap(await b.showRecoveryPhrase())).not.toBe(phrase);
+    const a = d.make();
+    expect(unwrap(await a.connect())).toEqual({ state: "needsUserAction", action: "passkey" });
+    expect(await a.unlock({ recoveryPhrase: phrase })).toMatchObject({ ok: false, error: { type: "rootRotated" } });
+    expect(unwrap(await a.unlock()).status.mode).toBe("strict");
+    expect(unwrap(a.exportEvoluMnemonic())).toBe(unwrap(b.exportEvoluMnemonic()));
+  });
+
+  it("rotateRoot keeps a compatible vault compatible, with a new secret (#52 phase C)", async () => {
+    const w = world();
+    const a = w.device().make();
+    const ra = await connectReady(a);
+    await ra.db.upsertRows("notes", [{ id: "n1", isDeleted: false, changedAt: 0, values: { text: "mine" } }]);
+    const before = unwrap(a.exportEvoluMnemonic());
+    const oldPhrase = unwrap(await a.showRecoveryPhrase());
+    expect(unwrap(await a.rotateRoot())).toMatchObject({ mode: "compatible" });
+    const after = unwrap(a.exportEvoluMnemonic());
+    expect(after).not.toBe(before);
+    const rows = await (await connectReady(a)).db.readRows("notes");
+    expect(rows.map((r) => r.values["text"])).toEqual(["mine"]);
+    const fresh = w.device({ passkeys: "none" }).make();
+    expect(await fresh.restoreFromPhrase(oldPhrase)).toMatchObject({ ok: false, error: { type: "wrongPhrase" } });
+    const other = w.device({ passkeys: "none" }).make();
+    expect((await connectReady(other)).status.mode).toBe("compatible");
+    expect(unwrap(other.exportEvoluMnemonic())).toBe(after);
+  });
+
 });

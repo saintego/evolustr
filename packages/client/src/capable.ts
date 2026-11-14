@@ -18,12 +18,19 @@ export interface SignerCapabilities {
    * passkey without a new key: nsec holders may still open strict data (#52).
    */
   readonly nsecExposed?: boolean;
+  /**
+   * The signer replaced its key (#52 phase B): this app's signer id under the
+   * previous key. Its wrap in the vault still opens R, which may be exposed.
+   */
+  readonly previousSignerId?: string | null;
 }
 
 export interface CapableSigner {
   readonly capabilities: () => Promise<SignerCapabilities>;
   /** May wait for the user to click inside the signer; don't use short timeouts. */
   readonly getWrapKey: () => Promise<Bytes>;
+  /** The app key under the signer's previous key, after a key rotation (#52 phase B). */
+  readonly getPreviousWrapKey?: () => Promise<Bytes>;
   readonly enrollPasskey?: () => Promise<void>;
 }
 
@@ -40,12 +47,14 @@ const toKey = (v: unknown): Bytes => {
 export interface Nip07Evolustr {
   readonly capabilities: () => Promise<SignerCapabilities>;
   readonly getWrapKey: () => Promise<string | Uint8Array>;
+  readonly getPreviousWrapKey?: () => Promise<string | Uint8Array>;
   readonly enrollPasskey?: () => Promise<void>;
 }
 
 export const nip07CapableSigner = (ns: Nip07Evolustr): CapableSigner => ({
   capabilities: () => ns.capabilities(),
   getWrapKey: async () => toKey(await ns.getWrapKey()),
+  ...(ns.getPreviousWrapKey === undefined ? {} : { getPreviousWrapKey: async () => toKey(await ns.getPreviousWrapKey!()) }),
   ...(ns.enrollPasskey === undefined ? {} : { enrollPasskey: () => ns.enrollPasskey!() }),
 });
 
@@ -83,6 +92,7 @@ export const iframeCapableSigner = (args: {
   return {
     capabilities: async () => (await call("evolustr_capabilities")) as SignerCapabilities,
     getWrapKey: async () => toKey(await call("evolustr_get_wrap_key")),
+    getPreviousWrapKey: async () => toKey(await call("evolustr_get_previous_wrap_key")),
     enrollPasskey: async () => void (await call("evolustr_enroll_passkey")),
   };
 };
@@ -92,6 +102,7 @@ export const exposeOnWindowNostr = (nostr: Record<string, unknown>, signer: Capa
   nostr["evolustr"] = {
     capabilities: () => signer.capabilities(),
     getWrapKey: async () => signer.getWrapKey(),
+    ...(signer.getPreviousWrapKey === undefined ? {} : { getPreviousWrapKey: () => signer.getPreviousWrapKey!() }),
     ...(signer.enrollPasskey === undefined ? {} : { enrollPasskey: () => signer.enrollPasskey!() }),
   };
 };
@@ -109,5 +120,6 @@ export interface Nip46RequestClient {
 export const nip46CapableSigner = (bunker: Nip46RequestClient): CapableSigner => ({
   capabilities: async () => JSON.parse(await bunker.sendRequest("evolustr_capabilities", [])) as SignerCapabilities,
   getWrapKey: async () => toKey(await bunker.sendRequest("evolustr_get_wrap_key", [])),
+  getPreviousWrapKey: async () => toKey(await bunker.sendRequest("evolustr_get_previous_wrap_key", [])),
   enrollPasskey: async () => void (await bunker.sendRequest("evolustr_enroll_passkey", [])),
 });

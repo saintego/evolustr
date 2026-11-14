@@ -1,4 +1,4 @@
-import { memoryRelays, randomBytes, unwrap } from "@evolustr/core";
+import { type Bytes, memoryPasskeys, memoryRelays, randomBytes, unwrap } from "@evolustr/core";
 import { createEvolustrSigner, listenForIframeRequests } from "@evolustr/signer";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { secretKeySigner } from "@evolustr/core";
@@ -29,8 +29,9 @@ const world = () => {
   const now = () => ++clock;
   const nostrSigner = secretKeySigner(sk);
 
+  const signerPasskeys = new Map<string, Bytes>(); // the signer's synced passkeys
   /** One device: an app page embedding the signer iframe. */
-  const device = (appOrigin: string, opts: { requireStrong?: boolean } = {}) => {
+  const deviceWith = (appOrigin: string, opts: { requireStrong?: boolean; nsecAllowed?: boolean } = {}) => {
     const appWin = fakeWindow(appOrigin);
     const signerWin = fakeWindow(SIGNER_ORIGIN);
     const signer = createEvolustrSigner({
@@ -40,6 +41,7 @@ const world = () => {
       sign: async (e) => finalizeEvent({ ...e, tags: e.tags.map((t) => [...t]) }, sk),
       getPublicKey: async () => pubkey,
       getSecretKey: () => sk,
+      ...(opts.nsecAllowed === false ? { allowSkWrap: false, passkeys: memoryPasskeys({ rpId: "signer.example", store: signerPasskeys }) } : {}),
       ui: { confirm: async () => true, requestGesture: async () => {} },
       now,
     });
@@ -50,12 +52,14 @@ const world = () => {
       self: appWin,
     });
     const dbs = memoryDatabases(["notes"]);
-    return createEvolustr(
+    const client = createEvolustr(
       { signer: nostrSigner, relays: mem.relays, openDatabase: dbs.open, cache: memoryCache(), now, capableSigner },
       { appId: appOrigin, relayUrls: URLS, ...(opts.requireStrong ? { requireStrong: true } : {}) },
     );
+    return { client, signer };
   };
-  return { device };
+  const device = (appOrigin: string, opts: { requireStrong?: boolean } = {}) => deviceWith(appOrigin, opts).client;
+  return { device, deviceWith, nostrSigner, mem, now };
 };
 
 const ready = async (c: ReturnType<ReturnType<typeof world>["device"]>) => {
@@ -160,6 +164,35 @@ describe("backup check with a capable signer (#42)", () => {
     );
     await ready(c);
     expect(unwrap(await c.makeStrict())).toMatchObject({ mode: "strict", dependsOnNsec: true });
+  });
+
+
+  it("after the signer replaces its key, the app replaces its root key (#52 phases B and C)", async () => {
+    const w = world();
+    const app = "https://notes.example";
+    // 1. The signer protects its key with the nsec; the app goes strict through it.
+    const a = w.device(app);
+    await ready(a);
+    unwrap(await a.makeStrict());
+    const oldPhrase = unwrap(await a.showRecoveryPhrase());
+    // 2. The user stops trusting the nsec: a signer passkey, then a new key.
+    const signerDevice = w.deviceWith(app, { nsecAllowed: false });
+    unwrap(await signerDevice.signer.enrollPasskey());
+    unwrap(await signerDevice.signer.rotateMaster());
+    // 3. A device opens the app through the signer's previous key, and sees the exposure.
+    const c = w.deviceWith(app, { nsecAllowed: false }).client;
+    expect(unwrap(await c.connect())).toEqual({ state: "needsUserAction", action: "signerUnlock" });
+    expect(unwrap(await c.unlock()).status).toMatchObject({ mode: "strict", rootExposed: true });
+    // 4. New root key and data secret, sealed with the signer's new key only.
+    expect(unwrap(await c.rotateRoot())).toMatchObject({ mode: "strict", rootExposed: false });
+    // The old phrase no longer opens the data; the signer's new key does.
+    const fresh = w.device(app);
+    expect(await fresh.restoreFromPhrase(oldPhrase)).toMatchObject({ ok: false, error: { type: "wrongPhrase" } });
+    const d = w.deviceWith(app, { nsecAllowed: false }).client;
+    expect(unwrap(await d.connect())).toEqual({ state: "needsUserAction", action: "signerUnlock" });
+    const rd = unwrap(await d.unlock());
+    expect(rd.status).toMatchObject({ mode: "strict", rootExposed: false });
+    expect(unwrap(d.exportEvoluMnemonic())).toBe(unwrap(c.exportEvoluMnemonic()));
   });
 
 });
