@@ -15,6 +15,7 @@ Every method returns a `Result`: `{ ok: true, value }` or `{ ok: false, error: {
 | `backupRequired` | `makeStrict`, `unlock` (setupStrong) | Ask the user to save the recovery phrase or add a second passkey, or pass `acceptDeviceLoss: true` after they agree. |
 | `partialPublish` | `makeStrict`, `downgrade` | Not every relay took the change; it completes on the next `connect()`. |
 | `rootLocked` | `enrollPasskey`, `showRecoveryPhrase`, `downgrade`, `makeStrict` | Call `unlockRoot()` first. If `status.canReplaceRoot` is true (this device can't open the root key of a compatible database), offer `makeStrict({ replaceRoot: true })` instead. |
+| `rootRotated` | `unlock` | The root key was replaced on another device (`rotateRoot()`); the old phrase or passkey no longer works. Unlock with the new method. |
 | `rootKnown` | `makeStrict({ replaceRoot: true })` | The root key is unlocked here; call `makeStrict()` without `replaceRoot`. |
 
 ## Going strict with a new recovery phrase
@@ -25,6 +26,10 @@ Every method returns a `Result`: `{ ok: true, value }` or `{ ok: false, error: {
 
 - `hints`: a small non-secret store that survives logout (for example `localStorage`). It keeps the last mode and secret hash per user and app, so after a logout the device still notices a strict database swapped for a weak one. It also holds the facts for the backup check before strict: which of the user's passkeys and signers recover on their own, and whether the recovery phrase was confirmed. They're kept on the device because other apps with decrypt permission can write to a compatible database. Without `hints`, they last for the session only, and the user may be asked to confirm the phrase again after a reload. The mode hint is removed by `logout({ deleteLocalData: true })`.
 - `cache`: `webSecretCache()` on the web. Its entries are bound to their slot; entries written by earlier versions don't decrypt anymore and act as an empty cache (the user unlocks once).
+
+## Replacing the root key
+
+`rotateRoot()`, from a click, replaces the root key and the data secret, keeping the mode. Offer it when `status.rootExposed` is true (the user's signer replaced its key because the old one was exposed), or when the user thinks their recovery phrase leaked. One new strong method seals the new key (the capable signer, else a new passkey). Tell the user first: their earlier recovery phrase, and other passkeys and signers for this app, stop working, and data written before stays as readable as it was.
 
 ## After a switch to strict elsewhere
 

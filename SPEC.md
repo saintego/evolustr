@@ -132,7 +132,8 @@ The BS flag is what the authenticator reports at that moment; a user can still l
 6. **A `strict` vault ignores `nip44`.** A client reading a `strict` vault never tries a `nip44` wrap, even if one appears on a relay.
 7. **Turning strict off is also the user's choice, on a device that can unlock.** `downgrade()` adds a `nip44` wrap of the current `S` and sets `mode: "compatible"`, after an explicit confirmation that names the risk.
 8. **A device that can't unlock a strict vault has no access.** For example a new device with a standard signer and no synced passkey. The user then uses the recovery phrase, a capable signer, or downgrades from a device that can unlock.
-9. **Going strict with a new root key (#49).** A device that holds `S` of a **compatible** vault but can't open its root key (the user lost every strong method and the phrase, or someone who can decrypt the `nip44` wrap added a root key of their own) may replace the root key while it moves to strict: `makeStrict({ replaceRoot: true })`. It creates a new `R'`, a new strong method sealing it (the capable signer, else a new passkey, in the same call, with the rule 3a check for a single method), and a new `S'`; every old root wrap is dropped and the old `S` goes into `history`. This is safe without the old `R`: `S'` is unrelated to `S`, so whoever held only `S` learns nothing. The earlier passkeys, signer wraps and recovery phrase of that database stop working, and the client says so before the call. A **strict** vault's root can't be replaced this way: that needs `R`.
+9. **Going strict with a new root key (#49).** A device that holds `S` of a **compatible** vault but can't open its root key (the user lost every strong method and the phrase, or someone who can decrypt the `nip44` wrap added a root key of their own) may replace the root key while it moves to strict: `makeStrict({ replaceRoot: true })`. It creates a new `R'`, a new strong method sealing it (the capable signer, else a new passkey, in the same call, with the rule 3a check for a single method), and a new `S'`; every old root wrap is dropped and the old `S` goes into `history`. This is safe without the old `R`: `S'` is unrelated to `S`, so whoever held only `S` learns nothing. The earlier passkeys, signer wraps and recovery phrase of that database stop working, and the client says so before the call. A **strict** vault's root can't be replaced this way: that needs `R` (rule 10).
+10. **Replacing `R` and `S` together (#52 phase C).** When `R` may be known to someone else (the capable signer's old key was exposed through the nsec, or the recovery phrase leaked), a device that holds `R` may replace both: `rotateRoot()`. It creates `R'`, one new strong method sealing it (the capable signer, else a new passkey, with the rule 3a check), and `S'`, keeping the mode (a `compatible` vault gets a new `nip44` wrap of `S'`). Every old root wrap is dropped, the old `S` goes into `history`, and the old `R` signs the result: `rootRotation.proof = hex(HMAC-SHA256(HKDF(R, "evolustr/v1/root-rotate|" + appId), sHash' + "|" + created'))`. Other passkeys and signers, and the old recovery phrase, stop working for this app; the client says so before the call. A device that still holds the old `R` sees a signed rotation moving forward from its secret and asks for a **strong unlock** (§6.3) instead of offering to undo it; unlocking with the old `R` reports `rootRotated`. Data written before stays as readable as it was (rule 4). `status.rootExposed` is true while the vault still has a wrap made with the signer's previous key (§5.7).
 
 ### 3.3 App identity (`appId`)
 
@@ -369,7 +370,13 @@ Thin adapters cover the common hosts: `adapters/iframe` (postMessage signers), `
 - **Integration:** the iframe's message handler passes `evolustr_*` requests to `evolustr.handle()` with `origin: event.origin`. `nostr-bridge.js` adds `window.nostr.evolustr` and forwards its calls to the iframe, the same way it forwards `signEvent`. The auto-approve list calls `isProtectedEvent()`. `signerKey` is the signer's own origin.
 - **`sk` mode in general:** anyone with the nsec can derive `M` from the public signer vault, then every app key, `R` and `S`. So strict through a signer in `sk` mode is strong against apps with signer *permissions*, not against anyone who has the nsec. Capabilities report `nsecProtected`; the client's `status.dependsOnNsec` shows it.
 - **OAuth mode** holds the nsec, so `M` can use the `sk` wrap. The Web3Auth `clientId` owner can recover the nsec, and so `M` and every app key derived from it. For users who don't accept that, the signer offers a signer passkey and drops the `sk` wrap. If a looser version of the signer uses a shared `clientId`, that owner is whoever controls the shared project.
-- **Moving from the nsec to a passkey (#52)** stops **new devices** from unlocking with the nsec. It does **not** take access away from someone who can recover the nsec: `M` stays the same, and older signer vault events with the `sk` wrap stay on relays and in anyone's copy. With `M` they get every app key, so `R` of every app vault with this signer's wrap, and `S`. The signer records the move (`skDroppedAt`) and reports `nsecExposed`; the client's `status.dependsOnNsec` includes it. A device that may no longer use the `sk` wrap never merges one back into a relay vault that has none. Removing the access needs a new `M` and new app keys, then a new `R` and `S` per app: not implemented yet.
+- **Moving from the nsec to a passkey (#52)** stops **new devices** from unlocking with the nsec. It does **not** take access away from someone who can recover the nsec: `M` stays the same, and older signer vault events with the `sk` wrap stay on relays and in anyone's copy. With `M` they get every app key, so `R` of every app vault with this signer's wrap, and `S`. The signer records the move (`skDroppedAt`) and reports `nsecExposed`; the client's `status.dependsOnNsec` includes it. A device that may no longer use the `sk` wrap never merges one back into a relay vault that has none.
+- **Replacing `M` (#52 phase B)** removes that access for what is written afterwards. `rotateMaster()`, from a click in the signer with a signer passkey and `allowSkWrap` false, creates `M'` sealed only with that passkey; other signer passkeys must be enrolled again. The signer vault then has:
+  - `mId = hex(HKDF(M', "evolustr/v1/signer-mid", 8))` (every vault gets its `mId` once a wrap opens);
+  - `rotatedFrom = { mId, proof: hex(HMAC-SHA256(HKDF(M, "evolustr/v1/signer-rotate"), mId')) }`;
+  - `previous`: `M` sealed with `HKDF(M', "evolustr/v1/signer-previous")`, AAD `"evolustr/v1|signer|" + pubkey + "|" + signerKey + "|previous|" + mId`, so apps can still get their old key (`evolustr_get_previous_wrap_key`) and open their old wrap. Only one previous `M` is kept.
+
+  Versions with different `mId` are never merged. A device holding the old `M` follows the new vault only when its `M` verifies `rotatedFrom`, then forgets the old `M` and unlocks `M'` with a passkey; otherwise it keeps its copy and its key. Someone who has the old `M` can forge a rotation too: that only locks the user's devices out of the signer (they can't open the forger's `M'`), it gives the forger nothing, and a device that still allows the `sk` wrap trusts the nsec anyway. Capabilities report `previousSignerId`; each app then replaces its `R` and `S` with `rotateRoot()` (§3.2 rule 10), because whoever had the old `M` could open its old wrap.
 - **Passthrough mode** (extension or bunker through the bridge) has no nsec, so the API is available only after the user enrolls a signer passkey. The signer's own vault event is then signed by the extension or bunker, through the bridge. The parent page sees only the AES-encrypted vault: it could block the publish, but not read or forge `M`.
 - Per-app separation relies on `event.origin`, not on the `clientId` allowlist, so it holds in the looser version too.
 
@@ -408,7 +415,8 @@ The pubkey is part of the hash, so two users of the same app have **different** 
   "dataWraps": [                  // wraps of S
     { "type": "root", "iv": "…", "ct": "…" }
     // a "compatible" vault also has: { "type": "nip44", "ct": "…" }
-  ]
+  ],
+  "rootRotation": { "proof": "<hex 32B>" }   // optional: set by rotateRoot() (§3.2 rule 10)
 }
 ```
 
@@ -442,6 +450,7 @@ Any app the user lets sign can publish a replacement vault event. Capable signer
 | Different `sHash`, the device has no `R` (it only used `nip44`), fetched vault is `strict` | Can't verify and can't unlock (§3.2 rule 8). Ask for a strong method or the recovery phrase. **Never** republish the local copy: it could undo a legitimate `makeStrict()`. Keep the local database; once the user unlocks `R` here, migrate its rows into the current one (§3.4) before deleting it. |
 | Different `sHash`, the device has no `R`, fetched vault is `compatible` | Can't tell a user change from an attack. Keep the local database, show both options to the user, and republish only on the user's choice. An attacker who can do this can already read the `nip44` wrap, so this is about availability, not secrecy. |
 | Vault missing or unreadable | Offer to republish the copy from Evolu, if this device has one. |
+| Different `sHash`, the `root` wrap doesn't open with the device's `R`, but `rootRotation` verifies with it and `history` contains the local `sHash` (§3.2 rule 10) | A root rotation the user made elsewhere: ask for a **strong unlock** with the new method; never offer to republish the copy. Without `R`, a compatible vault that claims a rotation from the local secret is treated the same way (only a strong unlock can check it). |
 | Different `sHash`, the device has the **old** `R` cached, after a root replacement elsewhere (§3.2 rule 9) | **Replaced.** The old `R` doesn't open the new vault, and the device can't tell the user's reset from an attack. The user unlocks with the new passkey, the signer or the new phrase. |
 
 `signer`, `passkey` and `root` wraps can't be forged without the key, AAD stops wraps being moved between vaults, and the header binding stops edited headers. Two attacks remain that a client can only answer by asking the user:
@@ -529,6 +538,7 @@ interface Evolustr<S> {
                                       // user's choice; backup check (§3.2 rule 3a), replaces S (§3.4).
                                       // replaceRoot: only when status.canReplaceRoot (§3.2 rule 9)
   downgrade(): Promise<void>;         // user's choice (§3.2 rule 7)
+  rotateRoot(opts?: { acceptDeviceLoss?: boolean }): Promise<Status>; // new R and S (§3.2 rule 10)
   showRecoveryPhrase(): Promise<string>; // R as 12 words; creates R if the vault has none
   exportEvoluMnemonic(): string;       // S as Evolu's own 12 words: the data without Nostr. Anyone
                                        // with it can read and write this database; it changes on makeStrict
@@ -660,7 +670,7 @@ interface SharedSettings {
 5. **Known nsite gateways:** who maintains the list, and how it is distributed (config or a Nostr list event).
 6. **NIP-46 method names:** agree on them with bunker developers, ideally as a NIP.
 7. **Adding a device without the phrase:** a way for a device that has `R` to hand it to a new device the user is holding (for example a QR code shown on one and scanned by the other), so users in `compatible` mode don't need the recovery phrase to add a strong method on a second device.
-8. **Rotating `M`:** a signer that replaces `M` gets a new `signerId`. Define how it re-adds its wraps to every app vault it knows, or whether old wraps are left to the recovery phrase.
+8. ~~**Rotating `M`**~~ Done (§5.7): apps open their old wrap through `previous`, then `rotateRoot()`. Open: only one previous `M` is kept, so an app that skipped a rotation needs another method or the phrase after the second one.
 
 ---
 
