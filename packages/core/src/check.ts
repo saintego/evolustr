@@ -3,7 +3,7 @@
  * Pure: the caller supplies what it fetched and what it already knows.
  */
 import type { Bytes } from "./bytes.ts";
-import { type Vault, type VaultContext, hasRootKey, headerBinding, migrationCutoff, nip44Wrap, openRootData, sameVaultCore } from "./vault.ts";
+import { type Vault, type VaultContext, hasRootKey, headerBinding, migrationCutoff, nip44Wrap, openRootData, sameVaultCore, verifyRootRotation } from "./vault.ts";
 
 export type Fetched =
   | { readonly kind: "found"; readonly vault: Vault }
@@ -64,7 +64,9 @@ const decideSameSecret = (
     // The relay version lost the root key the copy has: forged.
     return copy !== undefined && hasRootKey(copy) ? replaced : { type: "same" };
   }
-  if (copy === undefined || sameVaultCore(copy, vault)) return { type: "same" };
+  // No copy and no R: nothing to check a root key or strict header against (#54).
+  if (copy === undefined) return vault.mode === "strict" || hasRootKey(vault) ? { type: "needsStrongUnlock", vault } : { type: "same" };
+  if (sameVaultCore(copy, vault)) return { type: "same" };
   if (!hasRootKey(copy)) {
     // Another device added R: the header and the nip44 wrap are unchanged.
     const sameHeader = headerBinding(copy) === headerBinding(vault);
@@ -108,9 +110,13 @@ export const decideVault = (
 
   if (vault.sHash === local.sHash) return decideSameSecret(ctx, vault, local, replaced, canRepublish);
 
+  // A root rotation moving forward from this device's secret (#52 phase C).
+  const forward = vault.history.some((h) => h.sHash === local.sHash);
   if (local.r !== undefined) {
     const s = openRootData(ctx, vault, local.r);
-    if (!s.ok) return replaced;
+    // Signed by this device's R: the user replaced the root key elsewhere. The
+    // new R comes from a strong method; never offer to republish the old copy.
+    if (!s.ok) return forward && verifyRootRotation(ctx, vault, local.r) ? { type: "needsStrongUnlock", vault } : replaced;
     // Follow on its own only when moving forward: the vault's authenticated
     // history names the local secret (#25). An older vault replayed by someone
     // who can sign for the user opens with R too, so it must never be followed.
@@ -136,6 +142,10 @@ export const decideVault = (
     // Never republish here: it could undo a legitimate makeStrict().
     return { type: "needsStrongUnlock", vault };
   }
+
+  // Claims a root rotation from this device's secret: only R can check it, so
+  // ask for a strong unlock rather than offering to undo it (#52 phase C).
+  if (forward && vault.rootRotation !== undefined) return { type: "needsStrongUnlock", vault };
 
   // This device's database is protected by a root key: never offer to follow a
   // vault that only NIP-44 can open (#38).

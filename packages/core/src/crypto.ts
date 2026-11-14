@@ -1,5 +1,6 @@
 import { gcm } from "@noble/ciphers/aes.js";
 import { hkdf as nobleHkdf } from "@noble/hashes/hkdf.js";
+import { hmac as nobleHmac } from "@noble/hashes/hmac.js";
 import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 import {
   type Bytes,
@@ -15,6 +16,9 @@ export const sha256 = (data: Bytes): Bytes => nobleSha256(data);
 
 export const sha256Hex = (data: Bytes | string): string =>
   toHex(sha256(typeof data === "string" ? utf8(data) : data));
+
+/** HMAC-SHA256. */
+export const hmacSha256 = (key: Bytes, message: Bytes): Bytes => nobleHmac(nobleSha256, key, message);
 
 /** HKDF-SHA256 with an empty salt unless one is given. */
 export const hkdf = (ikm: Bytes, info: string, length = 32, salt?: Bytes): Bytes =>

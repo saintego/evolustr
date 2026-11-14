@@ -1,4 +1,4 @@
-import { type Bytes, VAULT_KIND, appVaultDTag, createCompatibleVault, createStrictVault, memoryRelays, nip44SealSecret, randomBytes, secretKeySigner, unwrap, vaultEvent } from "@evolustr/core";
+import { type Bytes, VAULT_KIND, addRootKey, appVaultDTag, parseVault, createCompatibleVault, createStrictVault, memoryRelays, nip44SealSecret, randomBytes, secretKeySigner, unwrap, vaultEvent } from "@evolustr/core";
 import { generateSecretKey } from "nostr-tools/pure";
 import { describe, expect, it } from "vitest";
 import { memoryPasskeys } from "@evolustr/core";
@@ -14,9 +14,21 @@ const world = () => {
   const mem = memoryRelays();
   let clock = 1000;
   const synced = new Map<string, Bytes>(); // one passkey provider account shared by devices
-  const device = (o: { passkeys?: "synced" | "local" | "none"; prfAtCreate?: boolean; options?: Partial<ClientOptions> } = {}) => {
-    const dbs = memoryDatabases(["notes"], () => clock * 1000);
+  const device = (
+    o: {
+      passkeys?: "synced" | "local" | "none";
+      prfAtCreate?: boolean;
+      options?: Partial<ClientOptions>;
+      /** A device-local store that survives reloads (`hints`). */
+      hints?: Map<string, string>;
+      /** Share another device's databases, as Evolu sync would. */
+      dbs?: ReturnType<typeof memoryDatabases>;
+    } = {},
+  ) => {
+    const dbs = o.dbs ?? memoryDatabases(["notes"], () => clock * 1000);
     const cache = memoryCache();
+    const store = o.hints;
+    const hints = store === undefined ? undefined : { get: async (k: string) => store.get(k) ?? null, set: async (k: string, v: string) => void store.set(k, v) };
     const kind = o.passkeys ?? "synced";
     const passkeys =
       kind === "none"
@@ -24,7 +36,7 @@ const world = () => {
         : memoryPasskeys({ rpId: RP, store: kind === "synced" ? synced : new Map(), synced: kind === "synced", prfAtCreate: o.prfAtCreate ?? true });
     const make = () =>
       createEvolustr(
-        { signer, relays: mem.relays, openDatabase: dbs.open, cache, now: () => ++clock, ...(passkeys ? { passkeys } : {}) },
+        { signer, relays: mem.relays, openDatabase: dbs.open, cache, now: () => ++clock, ...(passkeys ? { passkeys } : {}), ...(hints ? { hints } : {}) },
         { appId: APP, relayUrls: URLS, ...o.options },
       );
     return { dbs, cache, make };
@@ -442,8 +454,245 @@ describe("client passkeys and strict mode", () => {
     const evil = unwrap(createCompatibleVault(ctx, { s: evilS, nip44Ct: await nip44SealSecret(w.signer, ra.pubkey, evilS), now: w.now() + 500 }));
     w.tick(1000);
     await w.mem.relays.publish(URLS, await w.signer.signEvent(vaultEvent(ctx, evil, w.now())), 100);
-    expect(unwrap(await make(true).connect())).toMatchObject({ state: "vaultChanged", reason: "replaced" });
+    // The real phrase can't open the forged vault, so it isn't offered (#54).
+    expect(unwrap(await make(true).connect())).toEqual({ state: "vaultChanged", reason: "replaced", options: ["startNew"], advice: "useAnotherDevice" });
     // Without hints it's a first use, behind the weak-vault confirmation.
     expect(unwrap(await make(false).connect())).toEqual({ state: "needsUserAction", action: "confirmWeak" });
   });
+
+  /** A strict-looking forgery with the victim's sHash and a foreign header (#50). */
+  const foreignHeader = (w: ReturnType<typeof world>, pubkey: string) =>
+    tamper(w, pubkey, (v) => {
+      v["mode"] = "strict";
+      v["created"] = 1;
+      v["history"] = [{ sHash: "00", created: 1 }];
+      v["dataWraps"] = (v["dataWraps"] as Array<{ type: string }>).filter((x) => x.type === "root");
+    });
+
+  it("republishing the copy keeps this device's header, so R still opens it (#50)", async () => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    const original = JSON.parse((await ra.db.getMeta("vault"))!) as { created: number; history: unknown[] };
+    await foreignHeader(w, ra.pubkey);
+    const c = d.make();
+    expect(unwrap(await c.connect())).toMatchObject({ state: "needsUserAction" });
+    expect(await c.unlock()).toMatchObject({ ok: false, error: { type: "vaultReplaced" } });
+    unwrap(await c.resolveVaultChange("republishCopy"));
+    expect(unwrap(await c.unlockRoot()).canMakeStrict).toBe(true);
+    const onRelay = (await relayVault(w, ra.pubkey)) as unknown as { mode: string; created: number; history: unknown[] };
+    expect(onRelay).toMatchObject({ mode: "compatible", created: original.created, history: original.history });
+  });
+
+  it("a forged header that appears mid-session isn't mixed into the next publish (#50)", async () => {
+    const w = world();
+    const a = w.device().make();
+    const ra = await connectReady(a);
+    const phrase = unwrap(await a.showRecoveryPhrase());
+    await foreignHeader(w, ra.pubkey);
+    expect(unwrap(await a.enrollPasskey())).toEqual({ done: true });
+    const fresh = w.device({ passkeys: "none" }).make();
+    expect(unwrap(await fresh.restoreFromPhrase(phrase)).status.mode).toBe("compatible");
+  });
+
+
+  it("forged backup facts in the app database don't skip the backup check (#53)", async () => {
+    const w = world();
+    const a = w.device({ passkeys: "local" }).make();
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    // An app that decrypted the nip44 wrap writes these through Evolu sync.
+    await ra.db.setMeta("phraseConfirmed", "1");
+    await ra.db.setMeta("strongMethods", JSON.stringify([
+      { id: "passkey:x", method: { kind: "passkey", synced: true } },
+      { id: "passkey:y", method: { kind: "passkey", synced: true } },
+    ]));
+    await connectReady(a); // a reload reads whatever is there
+    unwrap(await a.unlockRoot());
+    expect(await a.makeStrict()).toMatchObject({ ok: false, error: { type: "backupRequired" } });
+  });
+
+  it("a confirmed phrase is remembered on the device through hints, not elsewhere (#53)", async () => {
+    const w = world();
+    const hints = new Map<string, string>();
+    const d = w.device({ passkeys: "local", hints });
+    const a = d.make();
+    await connectReady(a);
+    await a.enrollPasskey();
+    unwrap(await a.confirmRecoveryPhrase(unwrap(await a.showRecoveryPhrase())));
+    expect(unwrap(await a.makeStrict())).toMatchObject({ mode: "strict", backupRecommended: false });
+    // A reload on the same device still knows.
+    expect((await connectReady(d.make())).status.backupRecommended).toBe(false);
+    // Another device doesn't (its own hints are empty).
+    hints.clear();
+    expect((await connectReady(d.make())).status.backupRecommended).toBe(true);
+  });
+
+  it("two verified passkey wraps need no backup, without any stored record (#53)", async () => {
+    const w = world();
+    const a = w.device({ passkeys: "local" }).make();
+    await connectReady(a);
+    await a.enrollPasskey();
+    // Device B, with its own device-bound passkey, joins through the phrase (not confirmed).
+    const phrase = unwrap(await a.showRecoveryPhrase());
+    const b = w.device({ passkeys: "local" }).make();
+    unwrap(await b.restoreFromPhrase(phrase));
+    unwrap(await b.enrollPasskey());
+    // A has no record of B's passkey, but its wrap verifies with R: two methods.
+    await connectReady(a);
+    unwrap(await a.unlockRoot({ recoveryPhrase: phrase }));
+    expect(unwrap(await a.makeStrict())).toMatchObject({ mode: "strict" });
+  });
+
+
+  /** The attacker decrypts S through NIP-44 and adds a root key of its own (#49). */
+  const plantRoot = async (w: ReturnType<typeof world>, d: ReturnType<ReturnType<typeof world>["device"]>, pubkey: string) => {
+    const ctx = { pubkey, appId: APP };
+    const current = (await w.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [appVaultDTag(pubkey, APP)] }, 100)).events[0]!;
+    const s = (await d.cache.get(pubkey, APP))!.s;
+    const planted = unwrap(addRootKey(ctx, unwrap(parseVault(current.content)), randomBytes(16), s));
+    w.tick(100);
+    await w.mem.relays.publish(URLS, await w.signer.signEvent(vaultEvent(ctx, planted, w.now())), 100);
+  };
+
+  it("a planted root key: the device can still go strict with a new one (#49)", async () => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await ra.db.upsertRows("notes", [{ id: "n1", isDeleted: false, changedAt: 0, values: { text: "mine" } }]);
+    await plantRoot(w, d, ra.pubkey);
+    const again = d.make();
+    expect((await connectReady(again)).status).toMatchObject({ canAddStrongMethod: false, canReplaceRoot: true });
+    expect(await again.makeStrict()).toMatchObject({ ok: false, error: { type: "rootLocked" } });
+    expect(unwrap(await again.makeStrict({ replaceRoot: true }))).toMatchObject({ mode: "strict", canReplaceRoot: false });
+    const phrase = unwrap(await again.showRecoveryPhrase());
+    const fresh = w.device({ passkeys: "none", dbs: d.dbs }).make();
+    const restored = unwrap(await fresh.restoreFromPhrase(phrase));
+    expect(restored.status.mode).toBe("strict");
+    expect((await restored.db.readRows("notes")).map((r) => r.values["text"])).toEqual(["mine"]);
+  });
+
+  it("after a root reset, another device opens it with the new passkey (#49)", async () => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await ra.db.upsertRows("notes", [{ id: "n1", isDeleted: false, changedAt: 0, values: { text: "mine" } }]);
+    await plantRoot(w, d, ra.pubkey);
+    const again = d.make();
+    await connectReady(again);
+    unwrap(await again.makeStrict({ replaceRoot: true }));
+    const b = w.device({ dbs: d.dbs }).make();
+    expect(unwrap(await b.connect())).toEqual({ state: "needsUserAction", action: "passkey" });
+    const rb = unwrap(await b.unlock());
+    expect(rb.status.mode).toBe("strict");
+    expect((await rb.db.readRows("notes")).map((r) => r.values["text"])).toEqual(["mine"]);
+  });
+
+  it("replaceRoot is refused on a strict vault or while R is known (#49)", async () => {
+    const w = world();
+    const a = w.device().make();
+    await connectReady(a);
+    await a.enrollPasskey();
+    expect(await a.makeStrict({ replaceRoot: true })).toMatchObject({ ok: false, error: { type: "rootKnown" } });
+    unwrap(await a.makeStrict());
+    // A reload has only S cached: strict, and R not known here.
+    const d = w.device();
+    const c = d.make();
+    const first = unwrap(await c.connect());
+    if (first.state === "needsUserAction") unwrap(await c.unlock());
+    const reloaded = d.make();
+    expect((await connectReady(reloaded)).status).toMatchObject({ mode: "strict", canReplaceRoot: false });
+    expect(await reloaded.makeStrict({ replaceRoot: true })).toMatchObject({ ok: false, error: { type: "rootLocked" } });
+  });
+
+
+  /** A and B share a compatible database; A makes it strict while B is away (#51). */
+  const laggingDevice = async (opts: Partial<ClientOptions> = {}) => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await ra.db.upsertRows("notes", [{ id: "x", isDeleted: false, changedAt: 0, values: { text: "good" } }]);
+    // B uses the same Evolu data (as sync would) and its own secret cache.
+    const bd = w.device({ dbs: d.dbs, options: opts });
+    await connectReady(bd.make());
+    const s0 = (await d.cache.get(ra.pubkey, APP))!.s;
+    await a.enrollPasskey();
+    unwrap(await a.makeStrict());
+    // An app with the old secret writes into the old database; it syncs to B.
+    w.tick(100);
+    await d.dbs.write(s0, "notes", "x", { text: "evil" });
+    await d.dbs.write(s0, "notes", "y", { text: "new" });
+    const b = bd.make();
+    expect(unwrap(await b.connect())).toEqual({ state: "needsUserAction", action: "passkey" });
+    const rb = unwrap(await b.unlock());
+    const texts = Object.fromEntries((await rb.db.readRows("notes")).map((r) => [r.id, r.values["text"]]));
+    return { w, d, b, rb, texts, s0 };
+  };
+
+  it("a lagging device doesn't copy edits from the old database into the strict one (#51)", async () => {
+    const { d, b, rb, texts, s0 } = await laggingDevice();
+    expect(texts).toEqual({ x: "good", y: "new" });
+    expect(rb.migration).toEqual({ copied: 1, skippedChanged: 1 });
+    expect(d.dbs.has(s0)).toBe(true); // kept until the app lets the user decide
+    unwrap(await b.discardOldDatabase());
+    expect(d.dbs.has(s0)).toBe(false);
+  });
+
+  it("migrateChangedRows keeps the old behaviour (#51)", async () => {
+    const { texts } = await laggingDevice({ migrateChangedRows: true });
+    expect(texts).toEqual({ x: "evil", y: "new" });
+  });
+
+
+  it("with cacheRootKey, a downgrade elsewhere shows as compatible here (#54)", async () => {
+    const w = world();
+    const { a } = await strictDevice(w);
+    const bd = w.device({ options: { cacheRootKey: true } });
+    const b = bd.make();
+    await b.connect();
+    unwrap(await b.unlock());
+    unwrap(await a.downgrade());
+    expect((await connectReady(bd.make())).status).toMatchObject({ mode: "compatible", level: "weak" });
+  });
+
+
+  it("rotateRoot: a device with the old R cached asks for the new method, never offers to undo it (#52 phase C)", async () => {
+    const w = world();
+    const { d, phrase } = await strictDevice(w, { cacheRootKey: true });
+    const b = w.device().make();
+    await b.connect();
+    unwrap(await b.unlock());
+    expect(unwrap(await b.rotateRoot())).toMatchObject({ mode: "strict" });
+    expect(unwrap(await b.showRecoveryPhrase())).not.toBe(phrase);
+    const a = d.make();
+    expect(unwrap(await a.connect())).toEqual({ state: "needsUserAction", action: "passkey" });
+    expect(await a.unlock({ recoveryPhrase: phrase })).toMatchObject({ ok: false, error: { type: "rootRotated" } });
+    expect(unwrap(await a.unlock()).status.mode).toBe("strict");
+    expect(unwrap(a.exportEvoluMnemonic())).toBe(unwrap(b.exportEvoluMnemonic()));
+  });
+
+  it("rotateRoot keeps a compatible vault compatible, with a new secret (#52 phase C)", async () => {
+    const w = world();
+    const a = w.device().make();
+    const ra = await connectReady(a);
+    await ra.db.upsertRows("notes", [{ id: "n1", isDeleted: false, changedAt: 0, values: { text: "mine" } }]);
+    const before = unwrap(a.exportEvoluMnemonic());
+    const oldPhrase = unwrap(await a.showRecoveryPhrase());
+    expect(unwrap(await a.rotateRoot())).toMatchObject({ mode: "compatible" });
+    const after = unwrap(a.exportEvoluMnemonic());
+    expect(after).not.toBe(before);
+    const rows = await (await connectReady(a)).db.readRows("notes");
+    expect(rows.map((r) => r.values["text"])).toEqual(["mine"]);
+    const fresh = w.device({ passkeys: "none" }).make();
+    expect(await fresh.restoreFromPhrase(oldPhrase)).toMatchObject({ ok: false, error: { type: "wrongPhrase" } });
+    const other = w.device({ passkeys: "none" }).make();
+    expect((await connectReady(other)).status.mode).toBe("compatible");
+    expect(unwrap(other.exportEvoluMnemonic())).toBe(after);
+  });
+
 });

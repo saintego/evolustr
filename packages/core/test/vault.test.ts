@@ -7,12 +7,16 @@ import {
   verifyRootWrap,
   MAX_ROOT_WRAPS,
   backupRequirement,
+  canOpenOwnVault,
   createCompatibleVault,
   createStrictVault,
   downgrade,
   hasRootKey,
   level,
   makeStrict,
+  makeStrictWithNewRoot,
+  rotateRoot,
+  verifyRootRotation,
   mergeVaults,
   migrationCutoff,
   nip44Wrap,
@@ -251,5 +255,81 @@ describe("vault format v2 (#37)", () => {
     const json = JSON.parse(serializeVault(v));
     delete json.rootWraps[0].tag;
     expect(parseVault(JSON.stringify(json)).ok).toBe(false);
+  });
+});
+
+describe("canOpenOwnVault (#50)", () => {
+  it("is true without R or without a root key, and checks the header with R", () => {
+    const { s, r } = fresh();
+    const v = unwrap(addRootKey(ctx, compatible(s), r, s));
+    expect(canOpenOwnVault(ctx, compatible(), r)).toBe(true);
+    expect(canOpenOwnVault(ctx, v, undefined)).toBe(true);
+    expect(canOpenOwnVault(ctx, v, r)).toBe(true);
+    expect(canOpenOwnVault(ctx, { ...v, created: 1 }, r)).toBe(false);
+    expect(canOpenOwnVault(ctx, v, randomBytes(16))).toBe(false);
+  });
+});
+
+describe("makeStrictWithNewRoot (#49)", () => {
+  it("opens with the new R only, drops old root wraps, and records the old S", () => {
+    const { s, r, key } = fresh();
+    const v0 = unwrap(addRootWrap(unwrap(addRootKey(ctx, compatible(s), r, s)), signerRootWrap(ctx, key, "old", r)));
+    const newR = randomBytes(16);
+    const newS = randomBytes(16);
+    const wrap = signerRootWrap(ctx, randomBytes(32), "new", newR);
+    const v = unwrap(makeStrictWithNewRoot(ctx, v0, { newR, newS, now: 200, rootWraps: [wrap] }));
+    expect(v.mode).toBe("strict");
+    expect(nip44Wrap(v)).toBeUndefined();
+    expect(v.rootWraps).toEqual([wrap]);
+    expect(v.history.at(-1)).toEqual({ sHash: v0.sHash, created: v0.created });
+    expect(unwrap(openRootData(ctx, v, newR))).toEqual(newS);
+    expect(openRootData(ctx, v, r).ok).toBe(false);
+  });
+
+  it("refuses a strict vault, no wraps, or wraps made with another key", () => {
+    const { s, r } = fresh();
+    const strict = unwrap(createStrictVault(ctx, { s, r, now: 1, rootWraps: [] }));
+    const newR = randomBytes(16);
+    const wrap = signerRootWrap(ctx, randomBytes(32), "new", newR);
+    expect(makeStrictWithNewRoot(ctx, strict, { newR, newS: randomBytes(16), now: 2, rootWraps: [wrap] })).toMatchObject({ ok: false, error: { type: "alreadyStrict" } });
+    expect(makeStrictWithNewRoot(ctx, compatible(), { newR, newS: randomBytes(16), now: 2, rootWraps: [] }).ok).toBe(false);
+    const foreign = signerRootWrap(ctx, randomBytes(32), "x", randomBytes(16));
+    expect(makeStrictWithNewRoot(ctx, compatible(), { newR, newS: randomBytes(16), now: 2, rootWraps: [foreign] }).ok).toBe(false);
+  });
+});
+
+describe("rotateRoot (#52 phase C)", () => {
+  const strictWithSigner = () => {
+    const { s, r, key } = fresh();
+    const v = unwrap(createStrictVault(ctx, { s, r, now: 1, rootWraps: [signerRootWrap(ctx, key, "old", r)] }));
+    return { s, r, v };
+  };
+
+  it("replaces R and S, keeps the mode, and the old R signs it", () => {
+    const { r, v } = strictWithSigner();
+    const newR = randomBytes(16);
+    const newS = randomBytes(16);
+    const wrap = signerRootWrap(ctx, randomBytes(32), "new", newR);
+    const next = unwrap(rotateRoot(ctx, v, { r, newR, newS, now: 50, rootWraps: [wrap] }));
+    expect(next).toMatchObject({ mode: "strict", rootWraps: [wrap], created: 50 });
+    expect(next.history.at(-1)).toEqual({ sHash: v.sHash, created: v.created });
+    expect(unwrap(openRootData(ctx, next, newR))).toEqual(newS);
+    expect(openRootData(ctx, next, r).ok).toBe(false);
+    expect(verifyRootRotation(ctx, next, r)).toBe(true);
+    expect(verifyRootRotation(ctx, next, newR)).toBe(false);
+    expect(unwrap(parseVault(serializeVault(next)))).toEqual(next);
+  });
+
+  it("needs the current R, and a nip44 wrap for a compatible vault", () => {
+    const { v } = strictWithSigner();
+    const newR = randomBytes(16);
+    const wrap = signerRootWrap(ctx, randomBytes(32), "new", newR);
+    expect(rotateRoot(ctx, v, { r: randomBytes(16), newR, newS: randomBytes(16), now: 2, rootWraps: [wrap] })).toMatchObject({ ok: false, error: { type: "wrongRootKey" } });
+    const { s, r } = fresh();
+    const compat = unwrap(addRootKey(ctx, compatible(s), r, s));
+    expect(rotateRoot(ctx, compat, { r, newR, newS: randomBytes(16), now: 2, rootWraps: [wrap] }).ok).toBe(false);
+    const next = unwrap(rotateRoot(ctx, compat, { r, newR, newS: randomBytes(16), now: 2, rootWraps: [wrap], nip44Ct: "ct" }));
+    expect(next.mode).toBe("compatible");
+    expect(nip44Wrap(next)?.ct).toBe("ct");
   });
 });

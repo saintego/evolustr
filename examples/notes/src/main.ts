@@ -121,8 +121,9 @@ const renderStatus = () => {
   if (!st) return;
   $("level").textContent = st.level === "strong" ? "strong (strict)" : "weak (as private as your Nostr DMs)";
   $("level").className = `badge ${st.level}`;
-  $("detail").textContent = `opened with ${st.unlockedWith}${st.backupRecommended ? " · save your recovery phrase or add a second passkey" : ""}`;
-  ($("strict") as HTMLButtonElement).disabled = !st.canMakeStrict;
+  $("detail").textContent = `opened with ${st.unlockedWith}${st.backupRecommended ? " · save your recovery phrase or add a second passkey" : ""}${st.rootExposed ? " · your signer replaced its key: get a new recovery phrase" : ""}`;
+  ($("strict") as HTMLButtonElement).disabled = !st.canMakeStrict && !st.canReplaceRoot;
+  $("strict").textContent = st.canReplaceRoot ? "Make strict with a new recovery phrase" : "Make strict";
   ($("downgrade") as HTMLButtonElement).disabled = st.mode !== "strict";
   ($("passkey") as HTMLButtonElement).disabled = !st.passkeySupported || !st.canAddStrongMethod;
   document.documentElement.dataset["theme"] = client!.settings.get("theme") === "system" ? "" : client!.settings.get("theme");
@@ -284,14 +285,26 @@ $("passkey").onclick = async (e) => {
 };
 action("strict", async (c) => {
   if (!confirm("Strict protects notes you write from now on. Notes written before stay as private as they were (any app you let decrypt with your signer could have kept the old key). Continue?")) return { ok: true };
-  const r = await c.makeStrict();
+  // This device can't open the current root key (#49): start over with a new one.
+  const replaceRoot = c.status()?.canReplaceRoot === true;
+  if (replaceRoot && !confirm("This device can't unlock your current recovery phrase and passkeys for this app, so new ones are made. Your earlier recovery phrase and passkeys for this app will stop working. Continue?")) return { ok: true };
+  let r = await c.makeStrict({ replaceRoot });
   if (!r.ok && r.error.type === "backupRequired" && confirm(`${r.error.message}\n\nAccept losing these notes if you lose this device?`)) {
-    return c.makeStrict({ acceptDeviceLoss: true });
+    r = await c.makeStrict({ replaceRoot, acceptDeviceLoss: true });
   }
   if (r.ok) await becameReady();
   return r;
 });
 action("downgrade", (c) => c.downgrade());
+action("rotateRoot", async (c) => {
+  if (!confirm("This makes a new recovery phrase and a new key for your notes. Your earlier recovery phrase, and passkeys or signers other than the one you use now, stop working for this app. Notes written before stay as private as they were. Continue?")) return { ok: true };
+  let r = await c.rotateRoot();
+  if (!r.ok && r.error.type === "backupRequired" && confirm(`${r.error.message}\n\nAccept losing these notes if you lose this device?`)) {
+    r = await c.rotateRoot({ acceptDeviceLoss: true });
+  }
+  if (r.ok) await becameReady();
+  return r;
+});
 action("showPhrase", async (c) => {
   const r = await c.showRecoveryPhrase();
   if (r.ok) {

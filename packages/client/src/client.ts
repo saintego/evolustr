@@ -29,9 +29,17 @@ import {
   dataSecretToEvoluMnemonic,
   addRootWrap,
   backupRequirement,
+  canOpenOwnVault,
+  hkdf,
+  rootWrapKeyId,
+  toHex,
+  verifyRootWrap,
   clientPrfInput,
   createStrictVault,
   makeStrict as makeStrictVault,
+  makeStrictWithNewRoot,
+  rotateRoot as rotateRootVault,
+  verifyRootRotation,
   openRootWrap,
   passkeyRootWrap,
   passkeyWrapKey,
@@ -77,6 +85,7 @@ import { fetchSharedSettings, publishSharedSettings } from "./settings.ts";
 import {
   type AppDatabase,
   type MigrationMode,
+  type MigrationResult,
   type OpenDatabase,
   META_SHARED_SETTINGS,
   META_VAULT,
@@ -95,7 +104,9 @@ export interface ClientDeps {
   /**
    * A small non-secret store that survives logout (e.g. localStorage): the last
    * mode and secret hash per (pubkey, appId). After a logout it still tells a
-   * strict vault swapped for a weak one (#44).
+   * strict vault swapped for a weak one (#44). It also holds the facts for the
+   * backup check (#53): which strong methods recover on their own, and whether
+   * the phrase was confirmed. Without it, those last for the session only.
    */
   readonly hints?: {
     readonly get: (key: string) => Promise<string | null>;
@@ -131,6 +142,13 @@ export interface ClientOptions {
    * signer click. Default false: R stays in memory for the session (#27).
    */
   readonly cacheRootKey?: boolean;
+  /**
+   * After the database became strict elsewhere, also copy rows this device
+   * changed in the old database, overwriting the strict one. Default false:
+   * the old database could be written by any app that could decrypt its secret,
+   * so only rows missing in the strict database are copied (#51).
+   */
+  readonly migrateChangedRows?: boolean;
   /** Called as connect and unlock move through their steps; relays can be slow. */
   readonly onProgress?: (step: ProgressStep) => void;
 }
@@ -147,13 +165,26 @@ export interface Status {
   readonly canMakeStrict: boolean;
   /** False after a nip44-only unlock of a vault that has R (SPEC §3.1). */
   readonly canAddStrongMethod: boolean;
+  /**
+   * A compatible vault whose root key this device can't open: it can still go
+   * strict with a new root key, `makeStrict({ replaceRoot: true })` (#49).
+   * Earlier passkeys, signer wraps and the old recovery phrase stop working.
+   */
+  readonly canReplaceRoot: boolean;
   readonly passkeySupported: boolean;
   readonly backupRecommended: boolean;
   /**
    * The vault is strict and this session's capable signer protects its key with
-   * the nsec: anyone who has the user's nsec can open this data (#43).
+   * the nsec, or did before without changing the key: anyone who has the
+   * user's nsec can open this data (#43, #52).
    */
   readonly dependsOnNsec: boolean;
+  /**
+   * The capable signer replaced its key because the old one was exposed (#52),
+   * and this vault still has a wrap made with the old key: whoever had it may
+   * know this app's root key and data secret. Offer `rotateRoot()`.
+   */
+  readonly rootExposed: boolean;
 }
 
 /** Steps of connect / unlock, for showing progress (`onProgress`). */
@@ -164,10 +195,27 @@ export interface UnlockInput {
   readonly acceptDeviceLoss?: boolean;
 }
 
+export interface MakeStrictOptions {
+  readonly acceptDeviceLoss?: boolean;
+  /**
+   * Only when `status.canReplaceRoot`: go strict with a new root key and a new
+   * strong method created in the same call (the capable signer, else a new
+   * passkey; call from a click). Earlier passkeys, signer wraps and the old
+   * recovery phrase of this database stop working; tell the user first (#49).
+   */
+  readonly replaceRoot?: boolean;
+}
+
 export interface Ready {
   readonly pubkey: string;
   readonly db: AppDatabase;
   readonly status: Status;
+  /**
+   * Set when this unlock moved local rows to a new data secret. `skippedChanged`
+   * counts rows edited here that weren't carried over (#51); the old database
+   * is then kept until `discardOldDatabase()`.
+   */
+  readonly migration?: MigrationResult;
 }
 
 /**
@@ -184,6 +232,12 @@ export type ConnectResult =
       readonly state: "vaultChanged";
       readonly reason: "replaced" | "ambiguous" | "missing";
       readonly options: ReadonlyArray<VaultChoice>;
+      /**
+       * "useAnotherDevice": nothing on this device can restore the real vault.
+       * Connect a device that is still signed in: it restores the vault
+       * (`republishCopy`); then sign in here again (#54).
+       */
+      readonly advice?: "useAnotherDevice";
     };
 
 export interface Evolustr {
@@ -213,7 +267,7 @@ export interface Evolustr {
    * Protects what is written afterwards; data written before stays as readable
    * as it was. Tell the user before calling it (#31).
    */
-  readonly makeStrict: (opts?: { readonly acceptDeviceLoss?: boolean }) => Promise<Result<Status>>;
+  readonly makeStrict: (opts?: MakeStrictOptions) => Promise<Result<Status>>;
   /**
    * This database's Evolu mnemonic (12 words), to use the data with Evolu
    * directly, without Nostr. Anyone with it can read and write all of this
@@ -227,6 +281,15 @@ export interface Evolustr {
   readonly confirmRecoveryPhrase: (words: string) => Promise<Result<void>>;
   readonly restoreFromPhrase: (words: string) => Promise<Result<Ready>>;
   readonly downgrade: () => Promise<Result<Status>>;
+  /**
+   * Replaces the root key and the data secret, keeping the mode (#52 phase C),
+   * from a click: when `status.rootExposed`, or when the recovery phrase may
+   * have leaked. A new strong method seals the new root key (the capable
+   * signer, else a new passkey). Every other passkey and signer, and the old
+   * recovery phrase, stop working for this app; tell the user first. Data
+   * written before stays as readable as it was.
+   */
+  readonly rotateRoot: (opts?: { readonly acceptDeviceLoss?: boolean }) => Promise<Result<Status>>;
   readonly status: () => Status | null;
   readonly settings: {
     /** `app ?? shared ?? default` (SPEC §9.2). Reads cached values; no prompt. */
@@ -239,6 +302,11 @@ export interface Evolustr {
     readonly setApp: (key: string, value: unknown) => Promise<Result<void>>;
   };
   readonly logout: (opts?: { readonly deleteLocalData?: boolean }) => Promise<void>;
+  /**
+   * Deletes the old local database kept after a migration that skipped edited
+   * rows (`ready.migration.skippedChanged > 0`), once the user decided (#51).
+   */
+  readonly discardOldDatabase: () => Promise<Result<void>>;
 }
 
 // ── Session state ───────────────────────────────────────────────────────────
@@ -264,12 +332,13 @@ interface Pending {
 
 type Session = { readonly kind: "none" } | Unlocked | Pending;
 
+/** @deprecated No longer read or written: backup facts live on the device (`hints`, #53). */
 export const META_PHRASE_CONFIRMED = "phraseConfirmed";
 export const META_APP_SETTINGS = "appSettings";
 /** Data secrets this device moved past, for rollback detection beyond the vault's history (#44). */
 export const META_SEEN_SECRETS = "seenSecrets";
 const SEEN_LIMIT = 200;
-/** Strong methods known for this database, for the backup check (SPEC §3.2 rule 3a). */
+/** @deprecated No longer read or written: backup facts live on the device (`hints`, #53). */
 export const META_STRONG_METHODS = "strongMethods";
 
 interface KnownMethod {
@@ -316,14 +385,28 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const c = await refreshCaps();
     if (c?.signerId == null) return error("noSignerWrap", "This signer has no wrap in the vault yet");
     // The fetched vault's wrap first, then the local copy's (#39).
-    const wraps = [signerWrapFor(vault, c.signerId), copy === undefined ? undefined : signerWrapFor(copy, c.signerId)].filter(
-      (w): w is RootWrap => w !== undefined,
-    );
-    if (wraps.length === 0) return error("noSignerWrap", "This signer has no wrap in the vault yet");
+    const wrapsFor = (id: string) =>
+      [signerWrapFor(vault, id), copy === undefined ? undefined : signerWrapFor(copy, id)].filter((w): w is RootWrap => w !== undefined);
+    const wraps = wrapsFor(c.signerId);
     for (const wrap of wraps) {
       const opened = openRootWrap(ctx, wrap, key);
       if (opened.ok) return opened;
     }
+    // After the signer replaced its key, the wrap made with the old one (#52 phase B).
+    const previous = c.previousSignerId == null ? [] : wrapsFor(c.previousSignerId);
+    if (previous.length > 0 && capable.getPreviousWrapKey !== undefined) {
+      let oldKey: Bytes;
+      try {
+        oldKey = await capable.getPreviousWrapKey();
+      } catch (e) {
+        return error("signerRefused", e instanceof Error ? e.message : String(e));
+      }
+      for (const wrap of previous) {
+        const opened = openRootWrap(ctx, wrap, oldKey);
+        if (opened.ok) return opened;
+      }
+    }
+    if (wraps.length === 0 && previous.length === 0) return error("noSignerWrap", "This signer has no wrap in the vault yet");
     return error("signerRefused", "The signer's key didn't open its wrap");
   };
 
@@ -335,7 +418,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (c === null) return;
     if (c.ready && c.signerId !== null && signerWrapFor(s.vault, c.signerId) !== undefined) {
       // Refresh the record: the signer may have gained an sk wrap or a synced passkey (#42).
-      await rememberMethod(s.db, { id: `signer:${c.signerId}`, method: { kind: "signer", recoverable: c.recoverable === true } });
+      await rememberMethod(s.ctx, { id: `signer:${c.signerId}`, method: { kind: "signer", recoverable: c.recoverable === true } });
+      backupState = await readBackupState(s.ctx, s.vault, s.r);
       return;
     }
     // A locked signer that needs a passkey click isn't asked here; the user adds it later.
@@ -362,20 +446,9 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!added.ok) return;
     const published = await publishVault(s.ctx, added.value);
     if (!published.ok) return;
-    await rememberMethod(s.db, { id: `signer:${signerIdNow}`, method: { kind: "signer", recoverable: c.recoverable === true } });
+    await rememberMethod(s.ctx, { id: `signer:${signerIdNow}`, method: { kind: "signer", recoverable: c.recoverable === true } });
     // Local copy source (#38): (a) made by this device: its signer wrap added.
     await becomeReady(s.ctx, published.value, s.s, r, s.unlockedWith, s.db);
-  };
-
-  const readMethods = async (db: AppDatabase): Promise<ReadonlyArray<KnownMethod>> => {
-    const text = await db.getMeta(META_STRONG_METHODS);
-    if (text === null) return [];
-    try {
-      const list = JSON.parse(text) as unknown;
-      return Array.isArray(list) ? (list as KnownMethod[]) : [];
-    } catch {
-      return [];
-    }
   };
 
   const readDoc = async (db: AppDatabase, key: string): Promise<SettingsDoc> => {
@@ -410,6 +483,52 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     } catch {
       return null;
     }
+  };
+
+  // ── Backup facts (SPEC §3.2 rule 3a, #53) ──
+  // Kept on the device, never in the app database: before strict, anyone who
+  // can decrypt the nip44 wrap can write there through Evolu sync.
+  const sessionStore = new Map<string, string>();
+  const localGet = async (key: string): Promise<string | null> =>
+    deps.hints === undefined ? (sessionStore.get(key) ?? null) : await deps.hints.get(key).catch(() => null);
+  const localSet = async (key: string, value: string): Promise<void> =>
+    deps.hints === undefined ? void sessionStore.set(key, value) : await deps.hints.set(key, value).catch(() => undefined);
+  const backupKey = (kind: "methods" | "phrase", ctx: VaultContext) =>
+    `evolustr:${kind}:${sha256Hex(`${ctx.pubkey}|${ctx.appId}`)}`;
+  /** Which root key a phrase confirmation was for; a marker for another R doesn't count. */
+  const phraseMarker = (r: Bytes) => toHex(hkdf(r, "evolustr/v1/phrase-confirmed", 8));
+
+  const readMethodRecords = async (ctx: VaultContext): Promise<ReadonlyArray<KnownMethod>> => {
+    try {
+      const list = JSON.parse((await localGet(backupKey("methods", ctx))) ?? "[]") as unknown;
+      return Array.isArray(list) ? (list as KnownMethod[]) : [];
+    } catch {
+      return [];
+    }
+  };
+  const writeMethodRecords = (ctx: VaultContext, list: ReadonlyArray<KnownMethod>) =>
+    localSet(backupKey("methods", ctx), JSON.stringify(list));
+
+  /**
+   * The backup facts for this vault. With R, every root wrap whose tag verifies
+   * is a method; whether it recovers on its own comes from this device's record,
+   * else it counts as not recoverable. Without R, only recorded methods that
+   * still have a wrap count.
+   */
+  const readBackupState = async (ctx: VaultContext, vault: Vault, r: Bytes | undefined): Promise<typeof backupState> => {
+    const records = await readMethodRecords(ctx);
+    const recordFor = (id: string) => records.find((m) => m.id === id);
+    const wrapIds = vault.rootWraps.filter((w) => r === undefined || verifyRootWrap(ctx, r, w)).map((w) => ({ id: `${w.type}:${rootWrapKeyId(w)}`, type: w.type }));
+    const methods: KnownMethod[] =
+      r === undefined
+        ? wrapIds.flatMap(({ id }) => {
+            const rec = recordFor(id);
+            return rec === undefined ? [] : [rec];
+          })
+        : wrapIds.map(({ id, type }) => recordFor(id) ?? { id, method: type === "passkey" ? { kind: "passkey", synced: false } : { kind: "signer", recoverable: false } });
+    const marker = await localGet(backupKey("phrase", ctx));
+    const phraseConfirmed = marker !== null && marker !== "" && (r === undefined || marker === phraseMarker(r));
+    return { methods, phraseConfirmed };
   };
 
   /** Secrets this device has moved past, from its local database (#44). */
@@ -466,14 +585,19 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   ): Promise<Result<Vault>> => {
     let toPublish = vault;
     progress("publishingVault");
+    const sessionR = rootKey ?? (session.kind === "ready" && session.ctx.appId === ctx.appId ? session.r : undefined);
     const current = known ?? (await fetchVault(ctx));
-    if (current.kind === "found" && current.vault.sHash === vault.sHash) {
+    // Only root wraps come from the relay version: `vault` is the one this
+    // device made or verified, and its header is part of the root data wrap's
+    // AAD (#50). Without a root key here, the relay's root wraps mean nothing.
+    if (current.kind === "found" && current.vault.sHash === vault.sHash && hasRootKey(vault)) {
       // The local version wins on the same wrap id; with R, forged wraps are dropped (#37).
-      const sessionR = rootKey ?? (session.kind === "ready" && session.ctx.appId === ctx.appId ? session.r : undefined);
       const merged = mergeVaults(vault, current.vault, { ctx, r: sessionR });
       if (!merged.ok) return merged;
-      // A local downgrade or upgrade decides the mode; merging only adds wraps.
-      toPublish = { ...merged.value, mode: vault.mode, dataWraps: vault.dataWraps };
+      toPublish = { ...vault, rootWraps: merged.value.rootWraps };
+    }
+    if (!canOpenOwnVault(ctx, toPublish, sessionR)) {
+      return error("invalidVault", "Refusing to publish a vault its own root key can't open");
     }
     const at = Math.max(now(), lastEventAt + 1);
     let failed: ReadonlyArray<string>;
@@ -502,12 +626,14 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     unlockedWith: s.unlockedWith,
     canMakeStrict: s.r !== undefined && s.vault.mode === "compatible",
     canAddStrongMethod: s.r !== undefined || !hasRootKey(s.vault),
+    canReplaceRoot: s.vault.mode === "compatible" && s.r === undefined && hasRootKey(s.vault),
     passkeySupported,
     dependsOnNsec:
       s.vault.mode === "strict" &&
-      caps?.nsecProtected === true &&
+      (caps?.nsecProtected === true || caps?.nsecExposed === true) &&
       caps.signerId !== null &&
       signerWrapFor(s.vault, caps.signerId) !== undefined,
+    rootExposed: caps?.previousSignerId != null && signerWrapFor(s.vault, caps.previousSignerId) !== undefined,
     backupRecommended:
       s.vault.mode === "strict" &&
       backupRequirement(backupState.methods.map((m) => m.method), backupState.phraseConfirmed) !== "none",
@@ -556,12 +682,16 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const next: Unlocked = { kind: "ready", ctx, vault, s, db: database, unlockedWith, ...(r === undefined ? {} : { r }) };
     session = next;
     settingsState = { app: await readDoc(database, META_APP_SETTINGS), shared: await readDoc(database, META_SHARED_SETTINGS) };
-    backupState = {
-      methods: await readMethods(database),
-      phraseConfirmed: (await database.getMeta(META_PHRASE_CONFIRMED)) === "1",
-    };
-    return ok({ pubkey: ctx.pubkey, db: database, status: statusOf(next) });
+    backupState = await readBackupState(ctx, vault, r);
+    const migration = lastMigration;
+    lastMigration = null;
+    return ok({ pubkey: ctx.pubkey, db: database, status: statusOf(next), ...(migration === null ? {} : { migration }) });
   };
+
+  /** The last migration, reported by the next becomeReady (#51). */
+  let lastMigration: MigrationResult | null = null;
+  /** An old local database kept because a migration skipped edited rows (#51). */
+  let leftBehind: AppDatabase | null = null;
 
   /** Moves to a new data secret, copying local rows (SPEC §3.4). */
   const switchDatabase = async (
@@ -570,16 +700,22 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     mode: MigrationMode,
   ): Promise<void> => {
     if (from === undefined || from.sHash === to.sHash) return;
-    await migrateRows(from, to, mode);
-    await from.deleteLocal();
+    const result = await migrateRows(from, to, mode);
+    lastMigration = result;
+    // Keep edits that weren't carried over until the app lets the user decide.
+    if (mode.kind === "missingOnly" && result.skippedChanged > 0) leftBehind = from;
+    else await from.deleteLocal();
   };
 
-  const migrationModeFor = (vault: Vault, localSHash: string): MigrationMode => {
+  /**
+   * How to copy local rows into the vault's database. Into a strict database
+   * from one any decrypting app could write to, only missing rows (#51).
+   */
+  const migrationModeFor = (vault: Vault, localSHash: string, localMode: Vault["mode"] | undefined): MigrationMode => {
+    if (vault.mode === "strict" && localMode !== "strict" && options.migrateChangedRows !== true) return { kind: "missingOnly" };
     const cutoff = migrationCutoff(vault, localSHash);
     // Not in history: copy only rows missing in the current database (never overwrites).
-    return cutoff === null
-      ? { kind: "since", cutoffMs: Number.POSITIVE_INFINITY, marginMs: 0 }
-      : { kind: "since", cutoffMs: cutoff * 1000, marginMs: clockMarginMs };
+    return cutoff === null ? { kind: "missingOnly" } : { kind: "since", cutoffMs: cutoff * 1000, marginMs: clockMarginMs };
   };
 
   const createVault = async (ctx: VaultContext): Promise<Result<ConnectResult>> => {
@@ -622,13 +758,17 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     local: Pending["local"],
     requireWeakConfirm = false,
   ): Promise<Result<ConnectResult>> => {
-    if (caps?.ready === true && caps.signerId !== null && signerWrapFor(vault, caps.signerId) !== undefined) {
+    const signerHasWrap =
+      caps !== null &&
+      ((caps.signerId !== null && signerWrapFor(vault, caps.signerId) !== undefined) ||
+        (caps.previousSignerId != null && signerWrapFor(vault, caps.previousSignerId) !== undefined));
+    if (caps?.ready === true && signerHasWrap) {
       const root = await rootFromSigner(ctx, vault);
       if (root.ok) {
         const s = openRootData(ctx, vault, root.value);
         if (s.ok) {
           const db = await deps.openDatabase(s.value);
-          if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
+          if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash, local.copy?.mode));
           // Local copy source (#38): (b) opened with R from the signer.
           return withReady(becomeReady(ctx, vault, s.value, root.value, "signer", db));
         }
@@ -638,7 +778,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       const s = openRootData(ctx, vault, local.r);
       if (s.ok) {
         const db = await deps.openDatabase(s.value);
-        await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
+        await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash, local.copy?.mode));
         // Local copy source (#38): (b) opened with the cached R.
         return withReady(becomeReady(ctx, vault, s.value, local.r, "cache", db));
       }
@@ -651,7 +791,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       const s = await nip44OpenSecret(deps.signer, ctx.pubkey, vault);
       if (s.ok) {
         const db = await deps.openDatabase(s.value);
-        if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
+        if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash, local.copy?.mode));
         // Keep a cached R only if it really opens this vault (#33).
         const r = local?.r !== undefined && openRootData(ctx, vault, local.r).ok ? local.r : undefined;
         // Local copy source (#38): (c) opened through NIP-44: a compatible vault, after confirmWeak on a new device.
@@ -754,7 +894,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       const hint = await readHint(ctx);
       if (hint?.mode === "strict") {
         session = { kind: "pending", ctx, action: "choose", vault: fetched.vault };
-        return ok({ state: "vaultChanged", reason: "replaced", options: ["restorePhrase", "startNew"] });
+        // The phrase can't open the fetched (forged) vault, so don't offer it (#54).
+        return ok({ state: "vaultChanged", reason: "replaced", options: ["startNew"], advice: "useAnotherDevice" });
       }
     }
 
@@ -779,8 +920,12 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       case "same": {
         // (d) merged from the checked copy: wraps from the copy are never dropped (#37, #38).
         const fetchedVault = fetched.kind === "found" ? fetched.vault : local!.copy!;
-        const merged = mergeVaults(local!.copy ?? fetchedVault, fetchedVault, { ctx, r: local!.r });
-        const vault = merged.ok ? merged.value : (local!.copy ?? fetchedVault);
+        const copy = local!.copy ?? fetchedVault;
+        const merged = mergeVaults(copy, fetchedVault, { ctx, r: local!.r });
+        // R verified the fetched vault: its header and data wraps win, e.g. after
+        // a downgrade elsewhere; the copy's wraps are still kept (#54).
+        const verified = local!.r !== undefined && fetched.kind === "found" && openRootData(ctx, fetchedVault, local!.r).ok;
+        const vault = !merged.ok ? copy : verified ? { ...fetchedVault, rootWraps: merged.value.rootWraps } : merged.value;
         // Self-heal (SPEC §6.2 rule 4): the relays lost or altered wraps this device still has.
         const onRelays = new Set(fetchedVault.rootWraps.map((w) => JSON.stringify(w)));
         if (vault.rootWraps.some((w) => !onRelays.has(JSON.stringify(w)))) healAfterConnect = vault;
@@ -790,7 +935,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       }
       case "follow": {
         const db = await deps.openDatabase(decision.s);
-        await switchDatabase(local?.db, db, migrationModeFor(decision.vault, local!.db.sHash));
+        await switchDatabase(local?.db, db, migrationModeFor(decision.vault, local!.db.sHash, local!.copy?.mode));
         // Local copy source (#38): (b) opened with R (decideVault "follow").
         return withReady(becomeReady(ctx, decision.vault, decision.s, local!.r, "cache", db));
       }
@@ -828,13 +973,17 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!s.ok) {
       // R is real (it opens this device's copy), so the fetched vault is foreign (#39).
       if (p.local?.copy !== undefined && openRootData(p.ctx, p.local.copy, r.value).ok) {
+        // The old R signed the vault: the user replaced the root key elsewhere (#52 phase C).
+        if (verifyRootRotation(p.ctx, vault, r.value)) {
+          return error("rootRotated", "The root key was replaced on another device: unlock with the new passkey, signer or recovery phrase");
+        }
         session = { kind: "pending", ctx: p.ctx, action: "choose", vault, local: { ...p.local, r: r.value } };
         return error("vaultReplaced", "The vault on the relays isn't yours; restore this device's copy with resolveVaultChange(\"republishCopy\")");
       }
       return error("wrongPhrase", "This recovery phrase doesn't open this app's data");
     }
     const db = await deps.openDatabase(s.value);
-    if (p.local !== undefined) await switchDatabase(p.local.db, db, migrationModeFor(vault, p.local.db.sHash));
+    if (p.local !== undefined) await switchDatabase(p.local.db, db, migrationModeFor(vault, p.local.db.sHash, p.local.copy?.mode));
     // Local copy source (#38): (b) opened with R from a passkey, signer or the phrase.
     return becomeReady(p.ctx, vault, s.value, r.value, how, db);
   };
@@ -869,9 +1018,9 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       if (p.vault === undefined) return error("noVault", "No vault to open");
       const r = await unlockFetched(p.ctx, p.vault, p.local, false);
       if (!r.ok) return r;
-      return r.value.state === "ready"
-        ? ok({ pubkey: r.value.pubkey, db: r.value.db, status: r.value.status })
-        : error("needsUserAction", `Still needs: ${r.value.state === "needsUserAction" ? r.value.action : r.value.state}`);
+      if (r.value.state !== "ready") return error("needsUserAction", `Still needs: ${r.value.state === "needsUserAction" ? r.value.action : r.value.state}`);
+      const { state: _state, ...ready } = r.value;
+      return ok(ready);
     }
     return error("unsupported", `Unlocking with "${p.action}" isn't available in this build`);
   };
@@ -884,7 +1033,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     switch (choice) {
       case "republishCopy": {
         if (p.local?.copy === undefined) return error("noCopy", "This device has no copy of the vault");
-        const published = await publishVault(p.ctx, p.local.copy);
+        // With R known, wraps with a bad tag are dropped (#50).
+        const published = await publishVault(p.ctx, p.local.copy, false, undefined, p.local.r);
         if (!published.ok) return published;
         // Local copy source (#38): (a) this device's own copy, republished.
         return becomeReady(p.ctx, published.value, p.local.s, p.local.r, "cache", p.local.db);
@@ -904,7 +1054,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         // Not verifiable: copy only rows missing there, never overwrite, and keep
         // the previous local database (it isn't deleted).
         if (p.local !== undefined && p.local.db.sHash !== db.sHash) {
-          await migrateRows(p.local.db, db, { kind: "since", cutoffMs: Number.POSITIVE_INFINITY, marginMs: 0 });
+          lastMigration = await migrateRows(p.local.db, db, { kind: "missingOnly" });
         }
         // Local copy source (#38): (b) opened with R, or (c) through NIP-44 after the user chose to follow.
         return becomeReady(p.ctx, p.vault, s.value, viaRoot?.ok ? p.local?.r : undefined, viaRoot?.ok ? "cache" : "nip44", db);
@@ -944,6 +1094,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     }
     const next: Unlocked = { ...s.value, vault, r: r.value };
     session = next;
+    backupState = await readBackupState(next.ctx, vault, r.value);
     return ok(statusOf(next));
   };
 
@@ -971,7 +1122,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!r.ok || s.value.r === undefined || rootKeyToPhrase(r.value) !== rootKeyToPhrase(s.value.r)) {
       return error("wrongPhrase", "The words don't match the recovery phrase");
     }
-    await s.value.db.setMeta(META_PHRASE_CONFIRMED, "1");
+    await localSet(backupKey("phrase", s.value.ctx), phraseMarker(s.value.r));
     backupState = { ...backupState, phraseConfirmed: true };
     return ok(undefined);
   };
@@ -1022,10 +1173,10 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     }
   };
 
-  const rememberMethod = async (db: AppDatabase, known: KnownMethod) => {
-    const methods = [...backupState.methods.filter((m) => m.id !== known.id), known];
-    await db.setMeta(META_STRONG_METHODS, JSON.stringify(methods));
-    backupState = { ...backupState, methods };
+  /** Records on this device whether a method recovers on its own (#53). */
+  const rememberMethod = async (ctx: VaultContext, known: KnownMethod) => {
+    const records = await readMethodRecords(ctx);
+    await writeMethodRecords(ctx, [...records.filter((m) => m.id !== known.id), known]);
   };
 
   /** Adds a passkey wrap of R once the PRF output is known. */
@@ -1045,7 +1196,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (!added.ok) return added;
     const published = await publishVault(s.ctx, added.value);
     if (!published.ok) return published;
-    await rememberMethod(s.db, { id: `passkey:${created.credId}`, method: { kind: "passkey", synced: created.synced } });
+    await rememberMethod(s.ctx, { id: `passkey:${created.credId}`, method: { kind: "passkey", synced: created.synced } });
     // Local copy source (#38): (a) made by this device (passkey added).
     const ready = await becomeReady(s.ctx, published.value, s.s, r, s.unlockedWith, s.db);
     return ready.ok ? ok(ready.value.status) : ready;
@@ -1086,7 +1237,13 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   const makeStrict: Evolustr["makeStrict"] = async (opts) => {
     const s = requireReady();
     if (!s.ok) return s;
-    if (s.value.r === undefined) return error("rootLocked", "Unlock the root key on this device first");
+    if (s.value.r === undefined) {
+      if (opts?.replaceRoot === true && s.value.vault.mode === "compatible") return makeStrictNewRoot(s.value, opts.acceptDeviceLoss === true);
+      return error("rootLocked", "Unlock the root key on this device first, or call makeStrict({ replaceRoot: true }) to start with a new recovery phrase");
+    }
+    if (opts?.replaceRoot === true) return error("rootKnown", "The root key is unlocked here; call makeStrict() without replaceRoot");
+    // Read fresh, checked against the vault with R (#53).
+    backupState = await readBackupState(s.value.ctx, s.value.vault, s.value.r);
     const need = backupRequirement(backupState.methods.map((m) => m.method), backupState.phraseConfirmed);
     if (need === "required" && opts?.acceptDeviceLoss !== true) {
       return error("backupRequired", "Save the recovery phrase or add a second passkey first, or accept losing the data with this device");
@@ -1094,13 +1251,71 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const newS = random(DATA_SECRET_LENGTH);
     const next = makeStrictVault(s.value.ctx, s.value.vault, { r: s.value.r, newS, now: now() });
     if (!next.ok) return next;
+    return rotateTo(s.value, next.value, newS, s.value.r);
+  };
+
+  const rotateRoot: Evolustr["rotateRoot"] = async (opts) => {
+    const ready = requireReady();
+    if (!ready.ok) return ready;
+    let s = ready.value;
+    if (s.r === undefined) {
+      // The signer can open the vault, also through its previous key.
+      const viaSigner = capable === undefined ? null : await rootFromSigner(s.ctx, s.vault);
+      if (viaSigner === null || !viaSigner.ok) return error("rootLocked", "Unlock the root key on this device first (unlockRoot)");
+      if (!openRootData(s.ctx, s.vault, viaSigner.value).ok) return error("rootLocked", "Unlock the root key on this device first (unlockRoot)");
+      s = { ...s, r: viaSigner.value };
+    }
+    const oldR = s.r!;
+    const newR = random(ROOT_KEY_LENGTH);
+    const strong = await newStrongWrap(s.ctx, newR, opts?.acceptDeviceLoss === true);
+    if (!strong.ok) return strong;
+    const newS = random(DATA_SECRET_LENGTH);
+    let nip44Ct: string | undefined;
+    if (s.vault.mode === "compatible") {
+      try {
+        nip44Ct = await nip44SealSecret(deps.signer, s.ctx.pubkey, newS);
+      } catch (e) {
+        return error("signerRefused", e instanceof Error ? e.message : String(e));
+      }
+    }
+    const next = rotateRootVault(s.ctx, s.vault, {
+      r: oldR,
+      newR,
+      newS,
+      now: now(),
+      rootWraps: [strong.value.wrap],
+      ...(nip44Ct === undefined ? {} : { nip44Ct }),
+    });
+    if (!next.ok) return next;
+    // Backup facts start over: one method, phrase not confirmed (#53).
+    await writeMethodRecords(s.ctx, [strong.value.known]);
+    await localSet(backupKey("phrase", s.ctx), "");
+    return rotateTo(s, next.value, newS, newR);
+  };
+
+  /** Strict with a new root key and a new strong method (#49). */
+  const makeStrictNewRoot = async (s: Unlocked, acceptDeviceLoss: boolean): Promise<Result<Status>> => {
+    const newR = random(ROOT_KEY_LENGTH);
+    const strong = await newStrongWrap(s.ctx, newR, acceptDeviceLoss);
+    if (!strong.ok) return strong;
+    const newS = random(DATA_SECRET_LENGTH);
+    const next = makeStrictWithNewRoot(s.ctx, s.vault, { newR, newS, now: now(), rootWraps: [strong.value.wrap] });
+    if (!next.ok) return next;
+    // Backup facts start over: one method, phrase not confirmed (#53).
+    await writeMethodRecords(s.ctx, [strong.value.known]);
+    await localSet(backupKey("phrase", s.ctx), "");
+    return rotateTo(s, next.value, newS, newR);
+  };
+
+  /** Moves this device to a new strict vault and data secret S' (SPEC §3.4). */
+  const rotateTo = async (s: Unlocked, next: Vault, newS: Bytes, r: Bytes): Promise<Result<Status>> => {
     const db = await deps.openDatabase(newS);
-    await migrateRows(s.value.db, db, { kind: "all" });
-    for (const key of [META_APP_SETTINGS, META_SHARED_SETTINGS, META_STRONG_METHODS, META_PHRASE_CONFIRMED, META_SEEN_SECRETS]) {
-      const v = await s.value.db.getMeta(key);
+    await migrateRows(s.db, db, { kind: "all" });
+    for (const key of [META_APP_SETTINGS, META_SHARED_SETTINGS, META_SEEN_SECRETS]) {
+      const v = await s.db.getMeta(key);
       if (v !== null) await db.setMeta(key, v);
     }
-    const published = await publishVault(s.value.ctx, next.value, true);
+    const published = await publishVault(s.ctx, next, true, undefined, r);
     if (!published.ok && published.error.type !== "partialPublish") {
       await db.deleteLocal();
       return published;
@@ -1109,17 +1324,24 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       // Some relays have the strict vault: continue on S', but keep the old
       // local database until every relay agrees (#32). connect() re-sends it.
       // Local copy source (#38): (a) made by this device (makeStrict).
-      const ready = await becomeReady(s.value.ctx, next.value, newS, s.value.r, s.value.unlockedWith, db);
+      const ready = await becomeReady(s.ctx, next, newS, r, s.unlockedWith, db);
       return ready.ok ? published : ready;
     }
-    await s.value.db.deleteLocal();
+    await s.db.deleteLocal();
     // Local copy source (#38): (a) made by this device (makeStrict).
-    const ready = await becomeReady(s.value.ctx, published.value, newS, s.value.r, s.value.unlockedWith, db);
+    const ready = await becomeReady(s.ctx, published.value, newS, r, s.unlockedWith, db);
     return ready.ok ? ok(ready.value.status) : ready;
   };
 
-  /** First vault created strict for `requireStrong` (SPEC §8.2 step 4). */
-  const setupStrong = async (ctx: VaultContext, acceptDeviceLoss: boolean): Promise<Result<Ready>> => {
+  /**
+   * A new strong method sealing R: the capable signer, else a new passkey (from
+   * a click), with the backup check for a single method (SPEC §3.2 rule 3a, #42).
+   */
+  const newStrongWrap = async (
+    ctx: VaultContext,
+    r: Bytes,
+    acceptDeviceLoss: boolean,
+  ): Promise<Result<{ readonly wrap: RootWrap; readonly known: KnownMethod; readonly how: UnlockMethod }>> => {
     if (capable !== undefined) {
       let key: Bytes;
       try {
@@ -1129,21 +1351,11 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       }
       const c = await refreshCaps();
       if (c?.signerId != null) {
-        // The same backup check as for passkeys (SPEC §3.2 rule 3a, #42).
         const method: StrongMethod = { kind: "signer", recoverable: c.recoverable === true };
         if (backupRequirement([method], false) === "required" && !acceptDeviceLoss) {
           return error("backupRequired", "This signer's key can't be recovered on another device: accept losing the data with this device, or set up a backup first");
         }
-        const r = random(ROOT_KEY_LENGTH);
-        const s = random(DATA_SECRET_LENGTH);
-        const vault = createStrictVault(ctx, { s, r, now: now(), rootWraps: [signerRootWrap(ctx, key, c.signerId, r)] });
-        if (!vault.ok) return vault;
-        const published = await publishVault(ctx, vault.value);
-        if (!published.ok) return published;
-        const db = await deps.openDatabase(s);
-        await db.setMeta(META_STRONG_METHODS, JSON.stringify([{ id: `signer:${c.signerId}`, method }]));
-        // Local copy source (#38): (a) made by this device (requireStrong).
-        return becomeReady(ctx, published.value, s, r, "signer", db);
+        return ok({ wrap: signerRootWrap(ctx, key, c.signerId, r), known: { id: `signer:${c.signerId}`, method }, how: "signer" });
       }
     }
     const created = await createPasskey(ctx, undefined);
@@ -1161,17 +1373,24 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     if (backupRequirement([method], false) === "required" && !acceptDeviceLoss) {
       return error("backupRequired", "This passkey isn't synced: accept losing the data with this device, or use a synced passkey");
     }
-    const r = random(ROOT_KEY_LENGTH);
-    const s = random(DATA_SECRET_LENGTH);
     const wrap = passkeyRootWrap(ctx, passkeyWrapKey(prfOutput, ctx.appId), passkeys.rpId, created.value.credId, r);
-    const vault = createStrictVault(ctx, { s, r, now: now(), rootWraps: [wrap] });
+    return ok({ wrap, known: { id: `passkey:${created.value.credId}`, method }, how: "passkey" });
+  };
+
+  /** First vault created strict for `requireStrong` (SPEC §8.2 step 4). */
+  const setupStrong = async (ctx: VaultContext, acceptDeviceLoss: boolean): Promise<Result<Ready>> => {
+    const r = random(ROOT_KEY_LENGTH);
+    const strong = await newStrongWrap(ctx, r, acceptDeviceLoss);
+    if (!strong.ok) return strong;
+    const s = random(DATA_SECRET_LENGTH);
+    const vault = createStrictVault(ctx, { s, r, now: now(), rootWraps: [strong.value.wrap] });
     if (!vault.ok) return vault;
     const published = await publishVault(ctx, vault.value);
     if (!published.ok) return published;
     const db = await deps.openDatabase(s);
-    await db.setMeta(META_STRONG_METHODS, JSON.stringify([{ id: `passkey:${created.value.credId}`, method }]));
+    await rememberMethod(ctx, strong.value.known);
     // Local copy source (#38): (a) made by this device (requireStrong).
-    return becomeReady(ctx, published.value, s, r, "passkey", db);
+    return becomeReady(ctx, published.value, s, r, strong.value.how, db);
   };
 
   const exportEvoluMnemonic: Evolustr["exportEvoluMnemonic"] = () => {
@@ -1233,7 +1452,15 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     else await db.close();
   };
 
+  const discardOldDatabase: Evolustr["discardOldDatabase"] = async () => {
+    const old = leftBehind;
+    leftBehind = null;
+    if (old !== null) await old.deleteLocal();
+    return ok(undefined);
+  };
+
   return {
+    discardOldDatabase,
     connect,
     unlock,
     resolveVaultChange,
@@ -1246,6 +1473,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     confirmRecoveryPhrase,
     restoreFromPhrase,
     downgrade,
+    rotateRoot,
     status,
     settings,
     logout,
