@@ -172,7 +172,7 @@ The vault is what lets several independent keys (passkeys, signers, the phrase, 
 
 **Can the Evolu relay or the Nostr relays read my data?** No. Evolu's relay stores data encrypted with S; Nostr relays store sealed envelopes.
 
-**What if the user loses everything?** With the recovery phrase they get everything back. Without it, and without any passkey or signer that still works, a strict database is gone: nobody, including the app developer, can open it. Compatible databases only need the Nostr login.
+**What if the user loses everything?** With the recovery phrase they get everything back. Without it, and without any passkey or signer that still works, a strict database is gone: nobody, including the app developer, can open it. Compatible databases only need the Nostr login, and can start over strict with a new recovery phrase (`makeStrict({ replaceRoot: true })`); the old phrase and passkeys stop working.
 
 **Can a user leave Evolustr?** Yes: `exportEvoluMnemonic()` gives S as Evolu's 12 words, which open the data in any Evolu app. Anyone holding them can read and change the data.
 

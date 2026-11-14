@@ -14,6 +14,7 @@ import {
   hasRootKey,
   level,
   makeStrict,
+  makeStrictWithNewRoot,
   mergeVaults,
   migrationCutoff,
   nip44Wrap,
@@ -264,5 +265,33 @@ describe("canOpenOwnVault (#50)", () => {
     expect(canOpenOwnVault(ctx, v, r)).toBe(true);
     expect(canOpenOwnVault(ctx, { ...v, created: 1 }, r)).toBe(false);
     expect(canOpenOwnVault(ctx, v, randomBytes(16))).toBe(false);
+  });
+});
+
+describe("makeStrictWithNewRoot (#49)", () => {
+  it("opens with the new R only, drops old root wraps, and records the old S", () => {
+    const { s, r, key } = fresh();
+    const v0 = unwrap(addRootWrap(unwrap(addRootKey(ctx, compatible(s), r, s)), signerRootWrap(ctx, key, "old", r)));
+    const newR = randomBytes(16);
+    const newS = randomBytes(16);
+    const wrap = signerRootWrap(ctx, randomBytes(32), "new", newR);
+    const v = unwrap(makeStrictWithNewRoot(ctx, v0, { newR, newS, now: 200, rootWraps: [wrap] }));
+    expect(v.mode).toBe("strict");
+    expect(nip44Wrap(v)).toBeUndefined();
+    expect(v.rootWraps).toEqual([wrap]);
+    expect(v.history.at(-1)).toEqual({ sHash: v0.sHash, created: v0.created });
+    expect(unwrap(openRootData(ctx, v, newR))).toEqual(newS);
+    expect(openRootData(ctx, v, r).ok).toBe(false);
+  });
+
+  it("refuses a strict vault, no wraps, or wraps made with another key", () => {
+    const { s, r } = fresh();
+    const strict = unwrap(createStrictVault(ctx, { s, r, now: 1, rootWraps: [] }));
+    const newR = randomBytes(16);
+    const wrap = signerRootWrap(ctx, randomBytes(32), "new", newR);
+    expect(makeStrictWithNewRoot(ctx, strict, { newR, newS: randomBytes(16), now: 2, rootWraps: [wrap] })).toMatchObject({ ok: false, error: { type: "alreadyStrict" } });
+    expect(makeStrictWithNewRoot(ctx, compatible(), { newR, newS: randomBytes(16), now: 2, rootWraps: [] }).ok).toBe(false);
+    const foreign = signerRootWrap(ctx, randomBytes(32), "x", randomBytes(16));
+    expect(makeStrictWithNewRoot(ctx, compatible(), { newR, newS: randomBytes(16), now: 2, rootWraps: [foreign] }).ok).toBe(false);
   });
 });

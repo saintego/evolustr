@@ -132,6 +132,7 @@ The BS flag is what the authenticator reports at that moment; a user can still l
 6. **A `strict` vault ignores `nip44`.** A client reading a `strict` vault never tries a `nip44` wrap, even if one appears on a relay.
 7. **Turning strict off is also the user's choice, on a device that can unlock.** `downgrade()` adds a `nip44` wrap of the current `S` and sets `mode: "compatible"`, after an explicit confirmation that names the risk.
 8. **A device that can't unlock a strict vault has no access.** For example a new device with a standard signer and no synced passkey. The user then uses the recovery phrase, a capable signer, or downgrades from a device that can unlock.
+9. **Going strict with a new root key (#49).** A device that holds `S` of a **compatible** vault but can't open its root key (the user lost every strong method and the phrase, or someone who can decrypt the `nip44` wrap added a root key of their own) may replace the root key while it moves to strict: `makeStrict({ replaceRoot: true })`. It creates a new `R'`, a new strong method sealing it (the capable signer, else a new passkey, in the same call, with the rule 3a check for a single method), and a new `S'`; every old root wrap is dropped and the old `S` goes into `history`. This is safe without the old `R`: `S'` is unrelated to `S`, so whoever held only `S` learns nothing. The earlier passkeys, signer wraps and recovery phrase of that database stop working, and the client says so before the call. A **strict** vault's root can't be replaced this way: that needs `R`.
 
 ### 3.3 App identity (`appId`)
 
@@ -434,6 +435,7 @@ Any app the user lets sign can publish a replacement vault event. Capable signer
 | Different `sHash`, the device has no `R` (it only used `nip44`), fetched vault is `strict` | Can't verify and can't unlock (§3.2 rule 8). Ask for a strong method or the recovery phrase. **Never** republish the local copy: it could undo a legitimate `makeStrict()`. Keep the local database; once the user unlocks `R` here, migrate its rows into the current one (§3.4) before deleting it. |
 | Different `sHash`, the device has no `R`, fetched vault is `compatible` | Can't tell a user change from an attack. Keep the local database, show both options to the user, and republish only on the user's choice. An attacker who can do this can already read the `nip44` wrap, so this is about availability, not secrecy. |
 | Vault missing or unreadable | Offer to republish the copy from Evolu, if this device has one. |
+| Different `sHash`, the device has the **old** `R` cached, after a root replacement elsewhere (§3.2 rule 9) | **Replaced.** The old `R` doesn't open the new vault, and the device can't tell the user's reset from an attack. The user unlocks with the new passkey, the signer or the new phrase. |
 
 `signer`, `passkey` and `root` wraps can't be forged without the key, AAD stops wraps being moved between vaults, and the header binding stops edited headers. Two attacks remain that a client can only answer by asking the user:
 - **Replay of an older genuine vault.** It opens with `R`. A device that has a local copy recognises it from the history; a device without one sees "no history relation" and asks.
@@ -516,7 +518,9 @@ interface Evolustr<S> {
   unlockRoot(input?: { recoveryPhrase?: string }): Promise<Status>;
   enrollPasskey(): Promise<void>;     // from a click; doesn't change the level. Needs R:
                                       // call unlockRoot() first if canAddStrongMethod is false
-  makeStrict(opts?: { acceptDeviceLoss?: boolean }): Promise<void>; // user's choice; backup check (§3.2 rule 3a), replaces S (§3.4)
+  makeStrict(opts?: { acceptDeviceLoss?: boolean; replaceRoot?: boolean }): Promise<void>;
+                                      // user's choice; backup check (§3.2 rule 3a), replaces S (§3.4).
+                                      // replaceRoot: only when status.canReplaceRoot (§3.2 rule 9)
   downgrade(): Promise<void>;         // user's choice (§3.2 rule 7)
   showRecoveryPhrase(): Promise<string>; // R as 12 words; creates R if the vault has none
   exportEvoluMnemonic(): string;       // S as Evolu's own 12 words: the data without Nostr. Anyone

@@ -420,6 +420,35 @@ export const makeStrict = (
   return validateVault({ v: 1, ...header, rootWraps: vault.rootWraps, dataWraps: [sealRootData(ctx, input.r, input.newS, header)] });
 };
 
+export interface MakeStrictNewRootInput {
+  readonly newR: Bytes;
+  readonly newS: Bytes;
+  readonly now: number;
+  /** At least one, each made with `newR`. */
+  readonly rootWraps: ReadonlyArray<RootWrap>;
+}
+
+/**
+ * Strict with a brand-new root key (#49), for a compatible vault whose root key
+ * this device can't open. Every old root wrap is dropped. Safe without the old
+ * R: the new S' is unrelated to the old S, so whoever knew S learns nothing.
+ * A strict vault's root can only be replaced by someone who has R.
+ */
+export const makeStrictWithNewRoot = (
+  ctx: VaultContext,
+  vault: Vault,
+  input: MakeStrictNewRootInput,
+): Result<Vault, EvolustrError> => {
+  if (vault.mode === "strict") return error("alreadyStrict", "The vault is already strict");
+  if (input.rootWraps.length === 0) return error("noRootWraps", "A new root key needs at least one strong method");
+  if (!input.rootWraps.every((w) => verifyRootWrap(ctx, input.newR, w))) {
+    return error("invalidVault", "Every root wrap must be made with the new root key");
+  }
+  const history = [...vault.history, { sHash: vault.sHash, created: vault.created }].slice(-HISTORY_LIMIT);
+  const header: VaultHeader = { mode: "strict", created: input.now, sHash: sHash(input.newS), history };
+  return validateVault({ v: 1, ...header, rootWraps: input.rootWraps, dataWraps: [sealRootData(ctx, input.newR, input.newS, header)] });
+};
+
 export interface DowngradeInput {
   readonly r: Bytes;
   readonly s: Bytes;

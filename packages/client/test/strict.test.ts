@@ -1,4 +1,4 @@
-import { type Bytes, VAULT_KIND, appVaultDTag, createCompatibleVault, createStrictVault, memoryRelays, nip44SealSecret, randomBytes, secretKeySigner, unwrap, vaultEvent } from "@evolustr/core";
+import { type Bytes, VAULT_KIND, addRootKey, appVaultDTag, parseVault, createCompatibleVault, createStrictVault, memoryRelays, nip44SealSecret, randomBytes, secretKeySigner, unwrap, vaultEvent } from "@evolustr/core";
 import { generateSecretKey } from "nostr-tools/pure";
 import { describe, expect, it } from "vitest";
 import { memoryPasskeys } from "@evolustr/core";
@@ -543,6 +543,69 @@ describe("client passkeys and strict mode", () => {
     await connectReady(a);
     unwrap(await a.unlockRoot({ recoveryPhrase: phrase }));
     expect(unwrap(await a.makeStrict())).toMatchObject({ mode: "strict" });
+  });
+
+
+  /** The attacker decrypts S through NIP-44 and adds a root key of its own (#49). */
+  const plantRoot = async (w: ReturnType<typeof world>, d: ReturnType<ReturnType<typeof world>["device"]>, pubkey: string) => {
+    const ctx = { pubkey, appId: APP };
+    const current = (await w.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [appVaultDTag(pubkey, APP)] }, 100)).events[0]!;
+    const s = (await d.cache.get(pubkey, APP))!.s;
+    const planted = unwrap(addRootKey(ctx, unwrap(parseVault(current.content)), randomBytes(16), s));
+    w.tick(100);
+    await w.mem.relays.publish(URLS, await w.signer.signEvent(vaultEvent(ctx, planted, w.now())), 100);
+  };
+
+  it("a planted root key: the device can still go strict with a new one (#49)", async () => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await ra.db.upsertRows("notes", [{ id: "n1", isDeleted: false, changedAt: 0, values: { text: "mine" } }]);
+    await plantRoot(w, d, ra.pubkey);
+    const again = d.make();
+    expect((await connectReady(again)).status).toMatchObject({ canAddStrongMethod: false, canReplaceRoot: true });
+    expect(await again.makeStrict()).toMatchObject({ ok: false, error: { type: "rootLocked" } });
+    expect(unwrap(await again.makeStrict({ replaceRoot: true }))).toMatchObject({ mode: "strict", canReplaceRoot: false });
+    const phrase = unwrap(await again.showRecoveryPhrase());
+    const fresh = w.device({ passkeys: "none", dbs: d.dbs }).make();
+    const restored = unwrap(await fresh.restoreFromPhrase(phrase));
+    expect(restored.status.mode).toBe("strict");
+    expect((await restored.db.readRows("notes")).map((r) => r.values["text"])).toEqual(["mine"]);
+  });
+
+  it("after a root reset, another device opens it with the new passkey (#49)", async () => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await ra.db.upsertRows("notes", [{ id: "n1", isDeleted: false, changedAt: 0, values: { text: "mine" } }]);
+    await plantRoot(w, d, ra.pubkey);
+    const again = d.make();
+    await connectReady(again);
+    unwrap(await again.makeStrict({ replaceRoot: true }));
+    const b = w.device({ dbs: d.dbs }).make();
+    expect(unwrap(await b.connect())).toEqual({ state: "needsUserAction", action: "passkey" });
+    const rb = unwrap(await b.unlock());
+    expect(rb.status.mode).toBe("strict");
+    expect((await rb.db.readRows("notes")).map((r) => r.values["text"])).toEqual(["mine"]);
+  });
+
+  it("replaceRoot is refused on a strict vault or while R is known (#49)", async () => {
+    const w = world();
+    const a = w.device().make();
+    await connectReady(a);
+    await a.enrollPasskey();
+    expect(await a.makeStrict({ replaceRoot: true })).toMatchObject({ ok: false, error: { type: "rootKnown" } });
+    unwrap(await a.makeStrict());
+    // A reload has only S cached: strict, and R not known here.
+    const d = w.device();
+    const c = d.make();
+    const first = unwrap(await c.connect());
+    if (first.state === "needsUserAction") unwrap(await c.unlock());
+    const reloaded = d.make();
+    expect((await connectReady(reloaded)).status).toMatchObject({ mode: "strict", canReplaceRoot: false });
+    expect(await reloaded.makeStrict({ replaceRoot: true })).toMatchObject({ ok: false, error: { type: "rootLocked" } });
   });
 
 });

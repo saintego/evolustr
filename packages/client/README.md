@@ -14,7 +14,12 @@ Every method returns a `Result`: `{ ok: true, value }` or `{ ok: false, error: {
 | `unsafeFollow` | `resolveVaultChange("followRelay")` | This device's data is protected by a root key and the vault on the relays only opens through NIP-44. Restore with a strong method instead. |
 | `backupRequired` | `makeStrict`, `unlock` (setupStrong) | Ask the user to save the recovery phrase or add a second passkey, or pass `acceptDeviceLoss: true` after they agree. |
 | `partialPublish` | `makeStrict`, `downgrade` | Not every relay took the change; it completes on the next `connect()`. |
-| `rootLocked` | `enrollPasskey`, `showRecoveryPhrase`, `downgrade` | Call `unlockRoot()` first. |
+| `rootLocked` | `enrollPasskey`, `showRecoveryPhrase`, `downgrade`, `makeStrict` | Call `unlockRoot()` first. If `status.canReplaceRoot` is true (this device can't open the root key of a compatible database), offer `makeStrict({ replaceRoot: true })` instead. |
+| `rootKnown` | `makeStrict({ replaceRoot: true })` | The root key is unlocked here; call `makeStrict()` without `replaceRoot`. |
+
+## Going strict with a new recovery phrase
+
+`status.canReplaceRoot` is true when the database is compatible and this device can't open its root key: the user lost every passkey, signer and the phrase, or another app that can decrypt added a root key of its own. `makeStrict({ replaceRoot: true })`, from a click, then creates a new root key and a new strong method (the capable signer, else a new passkey), and moves the data to strict. Tell the user first: "Your earlier recovery phrase and passkeys for this app will stop working." Other devices then ask for a strong unlock and get in with the new passkey, the signer or the new phrase; a device that still has the old root key cached reports the vault as replaced.
 
 ## Optional dependencies
 
