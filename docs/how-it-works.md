@@ -141,9 +141,9 @@ The phrase **is** R, written as 12 words (the same word list Bitcoin wallets use
 2. Create a new random S'. Copy every row from the old database into a new Evolu database opened with S'.
 3. Write a new vault: `mode: "strict"`, S' sealed with R, **no** NIP-44 wrap, the old S's fingerprint added to `history`. Root wraps (R's envelopes) stay as they were.
 4. Publish it to every relay. The old local database is deleted.
-5. Other devices see a vault whose history names their current S: they know it's a forward step, open S' with R and move their unsynced rows over.
+5. Other devices see a vault whose history names their current S: they know it's a forward step, open S' with R and copy over rows the strict database doesn't have yet. They don't overwrite rows it already has: the old database could be written by any app that had the old S, so its edits aren't trusted. Edits made on such a device while it was away are reported (`ready.migration.skippedChanged`), and its old database is kept until the app calls `discardOldDatabase()`.
 
-Data written before the switch stays as readable as it was: anyone who already got the old S through NIP-44 can still read the old data on Evolu's relay. Strict protects what's written from then on.
+Data written before the switch stays as readable as it was: anyone who already got the old S through NIP-44 can still read the old data on Evolu's relay. Strict protects what's written from then on. Until every device has moved over, such an app can still *add* rows through a device that hasn't migrated yet, but it can't change rows that are already in the strict database.
 
 ## How a device spots a forged vault
 

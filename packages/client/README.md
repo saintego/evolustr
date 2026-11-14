@@ -26,6 +26,10 @@ Every method returns a `Result`: `{ ok: true, value }` or `{ ok: false, error: {
 - `hints`: a small non-secret store that survives logout (for example `localStorage`). It keeps the last mode and secret hash per user and app, so after a logout the device still notices a strict database swapped for a weak one. It also holds the facts for the backup check before strict: which of the user's passkeys and signers recover on their own, and whether the recovery phrase was confirmed. They're kept on the device because other apps with decrypt permission can write to a compatible database. Without `hints`, they last for the session only, and the user may be asked to confirm the phrase again after a reload. The mode hint is removed by `logout({ deleteLocalData: true })`.
 - `cache`: `webSecretCache()` on the web. Its entries are bound to their slot; entries written by earlier versions don't decrypt anymore and act as an empty cache (the user unlocks once).
 
+## After a switch to strict elsewhere
+
+When a device follows a database that was made strict elsewhere, it copies only the rows the strict database doesn't have yet. Rows it already has are never overwritten, because any app that could decrypt the old secret could have written to the old database. `ready.migration` says what happened: `{ copied, skippedChanged }`. When `skippedChanged > 0`, edits made on this device while it was away were left in the old database, which is kept: tell the user, then call `discardOldDatabase()`. Set `migrateChangedRows: true` to carry those edits over instead, accepting that such an app could then change strict data.
+
 ## States from `connect()`
 
 - `ready`: use the database.

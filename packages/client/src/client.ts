@@ -83,6 +83,7 @@ import { fetchSharedSettings, publishSharedSettings } from "./settings.ts";
 import {
   type AppDatabase,
   type MigrationMode,
+  type MigrationResult,
   type OpenDatabase,
   META_SHARED_SETTINGS,
   META_VAULT,
@@ -139,6 +140,13 @@ export interface ClientOptions {
    * signer click. Default false: R stays in memory for the session (#27).
    */
   readonly cacheRootKey?: boolean;
+  /**
+   * After the database became strict elsewhere, also copy rows this device
+   * changed in the old database, overwriting the strict one. Default false:
+   * the old database could be written by any app that could decrypt its secret,
+   * so only rows missing in the strict database are copied (#51).
+   */
+  readonly migrateChangedRows?: boolean;
   /** Called as connect and unlock move through their steps; relays can be slow. */
   readonly onProgress?: (step: ProgressStep) => void;
 }
@@ -193,6 +201,12 @@ export interface Ready {
   readonly pubkey: string;
   readonly db: AppDatabase;
   readonly status: Status;
+  /**
+   * Set when this unlock moved local rows to a new data secret. `skippedChanged`
+   * counts rows edited here that weren't carried over (#51); the old database
+   * is then kept until `discardOldDatabase()`.
+   */
+  readonly migration?: MigrationResult;
 }
 
 /**
@@ -264,6 +278,11 @@ export interface Evolustr {
     readonly setApp: (key: string, value: unknown) => Promise<Result<void>>;
   };
   readonly logout: (opts?: { readonly deleteLocalData?: boolean }) => Promise<void>;
+  /**
+   * Deletes the old local database kept after a migration that skipped edited
+   * rows (`ready.migration.skippedChanged > 0`), once the user decided (#51).
+   */
+  readonly discardOldDatabase: () => Promise<Result<void>>;
 }
 
 // ── Session state ───────────────────────────────────────────────────────────
@@ -625,8 +644,15 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     session = next;
     settingsState = { app: await readDoc(database, META_APP_SETTINGS), shared: await readDoc(database, META_SHARED_SETTINGS) };
     backupState = await readBackupState(ctx, vault, r);
-    return ok({ pubkey: ctx.pubkey, db: database, status: statusOf(next) });
+    const migration = lastMigration;
+    lastMigration = null;
+    return ok({ pubkey: ctx.pubkey, db: database, status: statusOf(next), ...(migration === null ? {} : { migration }) });
   };
+
+  /** The last migration, reported by the next becomeReady (#51). */
+  let lastMigration: MigrationResult | null = null;
+  /** An old local database kept because a migration skipped edited rows (#51). */
+  let leftBehind: AppDatabase | null = null;
 
   /** Moves to a new data secret, copying local rows (SPEC §3.4). */
   const switchDatabase = async (
@@ -635,16 +661,22 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     mode: MigrationMode,
   ): Promise<void> => {
     if (from === undefined || from.sHash === to.sHash) return;
-    await migrateRows(from, to, mode);
-    await from.deleteLocal();
+    const result = await migrateRows(from, to, mode);
+    lastMigration = result;
+    // Keep edits that weren't carried over until the app lets the user decide.
+    if (mode.kind === "missingOnly" && result.skippedChanged > 0) leftBehind = from;
+    else await from.deleteLocal();
   };
 
-  const migrationModeFor = (vault: Vault, localSHash: string): MigrationMode => {
+  /**
+   * How to copy local rows into the vault's database. Into a strict database
+   * from one any decrypting app could write to, only missing rows (#51).
+   */
+  const migrationModeFor = (vault: Vault, localSHash: string, localMode: Vault["mode"] | undefined): MigrationMode => {
+    if (vault.mode === "strict" && localMode !== "strict" && options.migrateChangedRows !== true) return { kind: "missingOnly" };
     const cutoff = migrationCutoff(vault, localSHash);
     // Not in history: copy only rows missing in the current database (never overwrites).
-    return cutoff === null
-      ? { kind: "since", cutoffMs: Number.POSITIVE_INFINITY, marginMs: 0 }
-      : { kind: "since", cutoffMs: cutoff * 1000, marginMs: clockMarginMs };
+    return cutoff === null ? { kind: "missingOnly" } : { kind: "since", cutoffMs: cutoff * 1000, marginMs: clockMarginMs };
   };
 
   const createVault = async (ctx: VaultContext): Promise<Result<ConnectResult>> => {
@@ -693,7 +725,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         const s = openRootData(ctx, vault, root.value);
         if (s.ok) {
           const db = await deps.openDatabase(s.value);
-          if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
+          if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash, local.copy?.mode));
           // Local copy source (#38): (b) opened with R from the signer.
           return withReady(becomeReady(ctx, vault, s.value, root.value, "signer", db));
         }
@@ -703,7 +735,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       const s = openRootData(ctx, vault, local.r);
       if (s.ok) {
         const db = await deps.openDatabase(s.value);
-        await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
+        await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash, local.copy?.mode));
         // Local copy source (#38): (b) opened with the cached R.
         return withReady(becomeReady(ctx, vault, s.value, local.r, "cache", db));
       }
@@ -716,7 +748,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       const s = await nip44OpenSecret(deps.signer, ctx.pubkey, vault);
       if (s.ok) {
         const db = await deps.openDatabase(s.value);
-        if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash));
+        if (local !== undefined) await switchDatabase(local.db, db, migrationModeFor(vault, local.db.sHash, local.copy?.mode));
         // Keep a cached R only if it really opens this vault (#33).
         const r = local?.r !== undefined && openRootData(ctx, vault, local.r).ok ? local.r : undefined;
         // Local copy source (#38): (c) opened through NIP-44: a compatible vault, after confirmWeak on a new device.
@@ -855,7 +887,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       }
       case "follow": {
         const db = await deps.openDatabase(decision.s);
-        await switchDatabase(local?.db, db, migrationModeFor(decision.vault, local!.db.sHash));
+        await switchDatabase(local?.db, db, migrationModeFor(decision.vault, local!.db.sHash, local!.copy?.mode));
         // Local copy source (#38): (b) opened with R (decideVault "follow").
         return withReady(becomeReady(ctx, decision.vault, decision.s, local!.r, "cache", db));
       }
@@ -899,7 +931,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       return error("wrongPhrase", "This recovery phrase doesn't open this app's data");
     }
     const db = await deps.openDatabase(s.value);
-    if (p.local !== undefined) await switchDatabase(p.local.db, db, migrationModeFor(vault, p.local.db.sHash));
+    if (p.local !== undefined) await switchDatabase(p.local.db, db, migrationModeFor(vault, p.local.db.sHash, p.local.copy?.mode));
     // Local copy source (#38): (b) opened with R from a passkey, signer or the phrase.
     return becomeReady(p.ctx, vault, s.value, r.value, how, db);
   };
@@ -934,9 +966,9 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       if (p.vault === undefined) return error("noVault", "No vault to open");
       const r = await unlockFetched(p.ctx, p.vault, p.local, false);
       if (!r.ok) return r;
-      return r.value.state === "ready"
-        ? ok({ pubkey: r.value.pubkey, db: r.value.db, status: r.value.status })
-        : error("needsUserAction", `Still needs: ${r.value.state === "needsUserAction" ? r.value.action : r.value.state}`);
+      if (r.value.state !== "ready") return error("needsUserAction", `Still needs: ${r.value.state === "needsUserAction" ? r.value.action : r.value.state}`);
+      const { state: _state, ...ready } = r.value;
+      return ok(ready);
     }
     return error("unsupported", `Unlocking with "${p.action}" isn't available in this build`);
   };
@@ -970,7 +1002,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
         // Not verifiable: copy only rows missing there, never overwrite, and keep
         // the previous local database (it isn't deleted).
         if (p.local !== undefined && p.local.db.sHash !== db.sHash) {
-          await migrateRows(p.local.db, db, { kind: "since", cutoffMs: Number.POSITIVE_INFINITY, marginMs: 0 });
+          lastMigration = await migrateRows(p.local.db, db, { kind: "missingOnly" });
         }
         // Local copy source (#38): (b) opened with R, or (c) through NIP-44 after the user chose to follow.
         return becomeReady(p.ctx, p.vault, s.value, viaRoot?.ok ? p.local?.r : undefined, viaRoot?.ok ? "cache" : "nip44", db);
@@ -1329,7 +1361,15 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     else await db.close();
   };
 
+  const discardOldDatabase: Evolustr["discardOldDatabase"] = async () => {
+    const old = leftBehind;
+    leftBehind = null;
+    if (old !== null) await old.deleteLocal();
+    return ok(undefined);
+  };
+
   return {
+    discardOldDatabase,
     connect,
     unlock,
     resolveVaultChange,

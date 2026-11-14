@@ -608,4 +608,43 @@ describe("client passkeys and strict mode", () => {
     expect(await reloaded.makeStrict({ replaceRoot: true })).toMatchObject({ ok: false, error: { type: "rootLocked" } });
   });
 
+
+  /** A and B share a compatible database; A makes it strict while B is away (#51). */
+  const laggingDevice = async (opts: Partial<ClientOptions> = {}) => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await ra.db.upsertRows("notes", [{ id: "x", isDeleted: false, changedAt: 0, values: { text: "good" } }]);
+    // B uses the same Evolu data (as sync would) and its own secret cache.
+    const bd = w.device({ dbs: d.dbs, options: opts });
+    await connectReady(bd.make());
+    const s0 = (await d.cache.get(ra.pubkey, APP))!.s;
+    await a.enrollPasskey();
+    unwrap(await a.makeStrict());
+    // An app with the old secret writes into the old database; it syncs to B.
+    w.tick(100);
+    await d.dbs.write(s0, "notes", "x", { text: "evil" });
+    await d.dbs.write(s0, "notes", "y", { text: "new" });
+    const b = bd.make();
+    expect(unwrap(await b.connect())).toEqual({ state: "needsUserAction", action: "passkey" });
+    const rb = unwrap(await b.unlock());
+    const texts = Object.fromEntries((await rb.db.readRows("notes")).map((r) => [r.id, r.values["text"]]));
+    return { w, d, b, rb, texts, s0 };
+  };
+
+  it("a lagging device doesn't copy edits from the old database into the strict one (#51)", async () => {
+    const { d, b, rb, texts, s0 } = await laggingDevice();
+    expect(texts).toEqual({ x: "good", y: "new" });
+    expect(rb.migration).toEqual({ copied: 1, skippedChanged: 1 });
+    expect(d.dbs.has(s0)).toBe(true); // kept until the app lets the user decide
+    unwrap(await b.discardOldDatabase());
+    expect(d.dbs.has(s0)).toBe(false);
+  });
+
+  it("migrateChangedRows keeps the old behaviour (#51)", async () => {
+    const { texts } = await laggingDevice({ migrateChangedRows: true });
+    expect(texts).toEqual({ x: "evil", y: "new" });
+  });
+
 });
