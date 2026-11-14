@@ -454,7 +454,8 @@ describe("client passkeys and strict mode", () => {
     const evil = unwrap(createCompatibleVault(ctx, { s: evilS, nip44Ct: await nip44SealSecret(w.signer, ra.pubkey, evilS), now: w.now() + 500 }));
     w.tick(1000);
     await w.mem.relays.publish(URLS, await w.signer.signEvent(vaultEvent(ctx, evil, w.now())), 100);
-    expect(unwrap(await make(true).connect())).toMatchObject({ state: "vaultChanged", reason: "replaced" });
+    // The real phrase can't open the forged vault, so it isn't offered (#54).
+    expect(unwrap(await make(true).connect())).toEqual({ state: "vaultChanged", reason: "replaced", options: ["startNew"], advice: "useAnotherDevice" });
     // Without hints it's a first use, behind the weak-vault confirmation.
     expect(unwrap(await make(false).connect())).toEqual({ state: "needsUserAction", action: "confirmWeak" });
   });
@@ -645,6 +646,18 @@ describe("client passkeys and strict mode", () => {
   it("migrateChangedRows keeps the old behaviour (#51)", async () => {
     const { texts } = await laggingDevice({ migrateChangedRows: true });
     expect(texts).toEqual({ x: "evil", y: "new" });
+  });
+
+
+  it("with cacheRootKey, a downgrade elsewhere shows as compatible here (#54)", async () => {
+    const w = world();
+    const { a } = await strictDevice(w);
+    const bd = w.device({ options: { cacheRootKey: true } });
+    const b = bd.make();
+    await b.connect();
+    unwrap(await b.unlock());
+    unwrap(await a.downgrade());
+    expect((await connectReady(bd.make())).status).toMatchObject({ mode: "compatible", level: "weak" });
   });
 
 });

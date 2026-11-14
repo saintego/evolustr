@@ -223,6 +223,12 @@ export type ConnectResult =
       readonly state: "vaultChanged";
       readonly reason: "replaced" | "ambiguous" | "missing";
       readonly options: ReadonlyArray<VaultChoice>;
+      /**
+       * "useAnotherDevice": nothing on this device can restore the real vault.
+       * Connect a device that is still signed in: it restores the vault
+       * (`republishCopy`); then sign in here again (#54).
+       */
+      readonly advice?: "useAnotherDevice";
     };
 
 export interface Evolustr {
@@ -851,7 +857,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       const hint = await readHint(ctx);
       if (hint?.mode === "strict") {
         session = { kind: "pending", ctx, action: "choose", vault: fetched.vault };
-        return ok({ state: "vaultChanged", reason: "replaced", options: ["restorePhrase", "startNew"] });
+        // The phrase can't open the fetched (forged) vault, so don't offer it (#54).
+        return ok({ state: "vaultChanged", reason: "replaced", options: ["startNew"], advice: "useAnotherDevice" });
       }
     }
 
@@ -876,8 +883,12 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       case "same": {
         // (d) merged from the checked copy: wraps from the copy are never dropped (#37, #38).
         const fetchedVault = fetched.kind === "found" ? fetched.vault : local!.copy!;
-        const merged = mergeVaults(local!.copy ?? fetchedVault, fetchedVault, { ctx, r: local!.r });
-        const vault = merged.ok ? merged.value : (local!.copy ?? fetchedVault);
+        const copy = local!.copy ?? fetchedVault;
+        const merged = mergeVaults(copy, fetchedVault, { ctx, r: local!.r });
+        // R verified the fetched vault: its header and data wraps win, e.g. after
+        // a downgrade elsewhere; the copy's wraps are still kept (#54).
+        const verified = local!.r !== undefined && fetched.kind === "found" && openRootData(ctx, fetchedVault, local!.r).ok;
+        const vault = !merged.ok ? copy : verified ? { ...fetchedVault, rootWraps: merged.value.rootWraps } : merged.value;
         // Self-heal (SPEC §6.2 rule 4): the relays lost or altered wraps this device still has.
         const onRelays = new Set(fetchedVault.rootWraps.map((w) => JSON.stringify(w)));
         if (vault.rootWraps.some((w) => !onRelays.has(JSON.stringify(w)))) healAfterConnect = vault;

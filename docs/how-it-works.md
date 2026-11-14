@@ -149,7 +149,7 @@ Data written before the switch stays as readable as it was: anyone who already g
 
 Anyone who can sign events for the user (any app with signing permission) can publish a fake vault. A device compares what it fetched with what it knows:
 
-- **Its local copy of the vault** (kept in Evolu). It's only ever updated from vaults the device could check, so a fake can't overwrite it.
+- **Its local copy of the vault** (kept in Evolu). It's only ever updated from vaults the device could check, so a fake can't overwrite it. In compatible mode this copy is only as protected as the database itself: anyone who can decrypt the `nip44` wrap can write there through Evolu sync. The checks matter for strict databases.
 - **R**, if the device has it: a fake can't contain envelopes that open with R, and can't carry valid tags.
 - **The history** and a local list of secrets it has moved past: an old, genuine vault re-published later is recognised as a step backwards.
 

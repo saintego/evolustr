@@ -34,4 +34,4 @@ When a device follows a database that was made strict elsewhere, it copies only 
 
 - `ready`: use the database.
 - `needsUserAction`: show a button that calls `unlock()`. The action is `passkey`, `signerUnlock`, `recoveryPhrase`, `setupStrong` or `confirmWeak` (first use of a weak vault on this device).
-- `vaultChanged`: show the offered `options` and call `resolveVaultChange(choice)`.
+- `vaultChanged`: show the offered `options` and call `resolveVaultChange(choice)`. When it also has `advice: "useAnotherDevice"`, nothing on this device can restore the real vault (it was logged out, and the vault on the relays was swapped for a weak one). Tell the user to open the app on a device that is still signed in, which restores the vault (`republishCopy`), and then to sign in here again. `restoreFromPhrase()` works once the real vault is back.

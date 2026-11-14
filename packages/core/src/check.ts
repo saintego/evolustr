@@ -64,7 +64,9 @@ const decideSameSecret = (
     // The relay version lost the root key the copy has: forged.
     return copy !== undefined && hasRootKey(copy) ? replaced : { type: "same" };
   }
-  if (copy === undefined || sameVaultCore(copy, vault)) return { type: "same" };
+  // No copy and no R: nothing to check a root key or strict header against (#54).
+  if (copy === undefined) return vault.mode === "strict" || hasRootKey(vault) ? { type: "needsStrongUnlock", vault } : { type: "same" };
+  if (sameVaultCore(copy, vault)) return { type: "same" };
   if (!hasRootKey(copy)) {
     // Another device added R: the header and the nip44 wrap are unchanged.
     const sameHeader = headerBinding(copy) === headerBinding(vault);

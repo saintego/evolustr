@@ -32,8 +32,9 @@ describe("decideVault (SPEC §6.3)", () => {
     expect(decideVault(ctx, { kind: "unreadable" }, null)).toMatchObject({ type: "choose", reason: "missing" });
   });
   it("same secret: nothing to do", () => {
-    const { s, compat } = world();
-    expect(decideVault(ctx, { kind: "found", vault: compat }, { sHash: sHash(s) })).toEqual({ type: "same" });
+    const s = randomBytes(16);
+    const plain = unwrap(createCompatibleVault(ctx, { s, nip44Ct: "x", now: 100 }));
+    expect(decideVault(ctx, { kind: "found", vault: plain }, { sHash: sHash(s) })).toEqual({ type: "same" });
   });
   it("rotation: device with R follows and migrates with the right cut-off", () => {
     const { s, r, s2, strict } = world();
@@ -114,9 +115,13 @@ describe("decideVault (SPEC §6.3)", () => {
       const v = unwrap(createCompatibleVault(ctx, { s, nip44Ct: "x", now: 1 }));
       expect(decideVault(ctx, { kind: "found", vault: v }, { sHash: sHash(s), r: randomBytes(16), copy: v })).toEqual({ type: "same" });
     });
-    it("no R, no copy: same", () => {
-      const { s2, strict } = world();
-      expect(decideVault(ctx, { kind: "found", vault: strict }, { sHash: sHash(s2) })).toEqual({ type: "same" });
+    it("no R, no copy: same only for a plain compatible vault (#54)", () => {
+      const { s, s2, compat, strict } = world();
+      const plainS = randomBytes(16);
+      const plain = unwrap(createCompatibleVault(ctx, { s: plainS, nip44Ct: "x", now: 1 }));
+      expect(decideVault(ctx, { kind: "found", vault: plain }, { sHash: sHash(plainS) })).toEqual({ type: "same" });
+      expect(decideVault(ctx, { kind: "found", vault: strict }, { sHash: sHash(s2) })).toEqual({ type: "needsStrongUnlock", vault: strict });
+      expect(decideVault(ctx, { kind: "found", vault: compat }, { sHash: sHash(s) })).toEqual({ type: "needsStrongUnlock", vault: compat });
     });
     it("no R, identical core: same", () => {
       const { s2, strict } = world();
