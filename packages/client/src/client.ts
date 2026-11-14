@@ -29,6 +29,7 @@ import {
   dataSecretToEvoluMnemonic,
   addRootWrap,
   backupRequirement,
+  canOpenOwnVault,
   clientPrfInput,
   createStrictVault,
   makeStrict as makeStrictVault,
@@ -466,14 +467,19 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   ): Promise<Result<Vault>> => {
     let toPublish = vault;
     progress("publishingVault");
+    const sessionR = rootKey ?? (session.kind === "ready" && session.ctx.appId === ctx.appId ? session.r : undefined);
     const current = known ?? (await fetchVault(ctx));
-    if (current.kind === "found" && current.vault.sHash === vault.sHash) {
+    // Only root wraps come from the relay version: `vault` is the one this
+    // device made or verified, and its header is part of the root data wrap's
+    // AAD (#50). Without a root key here, the relay's root wraps mean nothing.
+    if (current.kind === "found" && current.vault.sHash === vault.sHash && hasRootKey(vault)) {
       // The local version wins on the same wrap id; with R, forged wraps are dropped (#37).
-      const sessionR = rootKey ?? (session.kind === "ready" && session.ctx.appId === ctx.appId ? session.r : undefined);
       const merged = mergeVaults(vault, current.vault, { ctx, r: sessionR });
       if (!merged.ok) return merged;
-      // A local downgrade or upgrade decides the mode; merging only adds wraps.
-      toPublish = { ...merged.value, mode: vault.mode, dataWraps: vault.dataWraps };
+      toPublish = { ...vault, rootWraps: merged.value.rootWraps };
+    }
+    if (!canOpenOwnVault(ctx, toPublish, sessionR)) {
+      return error("invalidVault", "Refusing to publish a vault its own root key can't open");
     }
     const at = Math.max(now(), lastEventAt + 1);
     let failed: ReadonlyArray<string>;
@@ -884,7 +890,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     switch (choice) {
       case "republishCopy": {
         if (p.local?.copy === undefined) return error("noCopy", "This device has no copy of the vault");
-        const published = await publishVault(p.ctx, p.local.copy);
+        // With R known, wraps with a bad tag are dropped (#50).
+        const published = await publishVault(p.ctx, p.local.copy, false, undefined, p.local.r);
         if (!published.ok) return published;
         // Local copy source (#38): (a) this device's own copy, republished.
         return becomeReady(p.ctx, published.value, p.local.s, p.local.r, "cache", p.local.db);

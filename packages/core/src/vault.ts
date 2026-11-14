@@ -293,6 +293,13 @@ export const openRootData = (
   );
 };
 
+/**
+ * False when R is known, the vault has a root data wrap, and R doesn't open it:
+ * a vault this device must never publish or keep as its copy (#50).
+ */
+export const canOpenOwnVault = (ctx: VaultContext, vault: Vault, r: Bytes | undefined): boolean =>
+  r === undefined || rootDataWrap(vault) === undefined || openRootData(ctx, vault, r).ok;
+
 /** Same header and same data wraps (root: iv+ct, nip44: ct). Root wraps are not compared (#38). */
 export const sameVaultCore = (a: Vault, b: Vault): boolean =>
   headerBinding(a) === headerBinding(b) &&

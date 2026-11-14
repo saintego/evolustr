@@ -446,4 +446,42 @@ describe("client passkeys and strict mode", () => {
     // Without hints it's a first use, behind the weak-vault confirmation.
     expect(unwrap(await make(false).connect())).toEqual({ state: "needsUserAction", action: "confirmWeak" });
   });
+
+  /** A strict-looking forgery with the victim's sHash and a foreign header (#50). */
+  const foreignHeader = (w: ReturnType<typeof world>, pubkey: string) =>
+    tamper(w, pubkey, (v) => {
+      v["mode"] = "strict";
+      v["created"] = 1;
+      v["history"] = [{ sHash: "00", created: 1 }];
+      v["dataWraps"] = (v["dataWraps"] as Array<{ type: string }>).filter((x) => x.type === "root");
+    });
+
+  it("republishing the copy keeps this device's header, so R still opens it (#50)", async () => {
+    const w = world();
+    const d = w.device();
+    const a = d.make();
+    const ra = await connectReady(a);
+    await a.enrollPasskey();
+    const original = JSON.parse((await ra.db.getMeta("vault"))!) as { created: number; history: unknown[] };
+    await foreignHeader(w, ra.pubkey);
+    const c = d.make();
+    expect(unwrap(await c.connect())).toMatchObject({ state: "needsUserAction" });
+    expect(await c.unlock()).toMatchObject({ ok: false, error: { type: "vaultReplaced" } });
+    unwrap(await c.resolveVaultChange("republishCopy"));
+    expect(unwrap(await c.unlockRoot()).canMakeStrict).toBe(true);
+    const onRelay = (await relayVault(w, ra.pubkey)) as unknown as { mode: string; created: number; history: unknown[] };
+    expect(onRelay).toMatchObject({ mode: "compatible", created: original.created, history: original.history });
+  });
+
+  it("a forged header that appears mid-session isn't mixed into the next publish (#50)", async () => {
+    const w = world();
+    const a = w.device().make();
+    const ra = await connectReady(a);
+    const phrase = unwrap(await a.showRecoveryPhrase());
+    await foreignHeader(w, ra.pubkey);
+    expect(unwrap(await a.enrollPasskey())).toEqual({ done: true });
+    const fresh = w.device({ passkeys: "none" }).make();
+    expect(unwrap(await fresh.restoreFromPhrase(phrase)).status.mode).toBe("compatible");
+  });
+
 });

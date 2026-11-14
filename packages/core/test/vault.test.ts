@@ -7,6 +7,7 @@ import {
   verifyRootWrap,
   MAX_ROOT_WRAPS,
   backupRequirement,
+  canOpenOwnVault,
   createCompatibleVault,
   createStrictVault,
   downgrade,
@@ -251,5 +252,17 @@ describe("vault format v2 (#37)", () => {
     const json = JSON.parse(serializeVault(v));
     delete json.rootWraps[0].tag;
     expect(parseVault(JSON.stringify(json)).ok).toBe(false);
+  });
+});
+
+describe("canOpenOwnVault (#50)", () => {
+  it("is true without R or without a root key, and checks the header with R", () => {
+    const { s, r } = fresh();
+    const v = unwrap(addRootKey(ctx, compatible(s), r, s));
+    expect(canOpenOwnVault(ctx, compatible(), r)).toBe(true);
+    expect(canOpenOwnVault(ctx, v, undefined)).toBe(true);
+    expect(canOpenOwnVault(ctx, v, r)).toBe(true);
+    expect(canOpenOwnVault(ctx, { ...v, created: 1 }, r)).toBe(false);
+    expect(canOpenOwnVault(ctx, v, randomBytes(16))).toBe(false);
   });
 });
