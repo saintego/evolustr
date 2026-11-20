@@ -43,6 +43,19 @@ export const signerAppKey = (m: Bytes, appId: string): Bytes =>
   hkdf(m, `evolustr/v1|app|${appId}`);
 
 /**
+ * A secret the host signer derives from M for its own use (§5.6), e.g. the key
+ * of its synced settings. Namespaced apart from app keys (`evolustr/v1|app|…`),
+ * so a label can never yield an app's key. Labels are non-empty and contain no
+ * `|`; the host checks that with `isHostSecretLabel`.
+ */
+export const hostSecret = (m: Bytes, label: string): Bytes =>
+  hkdf(m, `evolustr/v1|host|${label}`);
+
+/** A valid label for `hostSecret`: 1–200 characters, no `|`. */
+export const isHostSecretLabel = (label: string): boolean =>
+  label.length > 0 && label.length <= 200 && !label.includes("|");
+
+/**
  * Label of a signer's wrap inside one app's vault (SPEC §5.3). Derived per app,
  * so apps can't use it to link the same user across apps (#29).
  */

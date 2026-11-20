@@ -27,6 +27,8 @@ import {
   sha256,
   utf8,
   signerAppKey,
+  hostSecret,
+  isHostSecretLabel,
   signerId as computeSignerId,
   signerPasskeyWrapKey,
   signerPrfInput,
@@ -130,6 +132,12 @@ export interface EvolustrSigner {
   /** 32-byte key for the caller's app vault (SPEC §5.3). */
   readonly getWrapKey: (caller: Caller) => Promise<Result<Bytes>>;
   readonly enrollPasskey: () => Promise<Result<void>>;
+  /**
+   * 32-byte secret from M for the host's own use (§5.6), e.g. its synced
+   * settings. Host-only: no `handle()` method reaches it, so apps can't ask for
+   * it. Unlocks M like `getWrapKey` (passkey if needed), without the app prompt.
+   */
+  readonly getHostSecret: (label: string) => Promise<Result<Bytes>>;
   /** For the host's auto-approve list (SPEC §5.5 rule 2). */
   readonly isProtectedEvent: (event: { readonly kind: number; readonly tags: ReadonlyArray<ReadonlyArray<string>> }) => boolean;
   readonly appIdFor: (caller: Caller) => Result<string>;
@@ -417,6 +425,13 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     return ok(signerAppKey(unlocked.value.m, appId.value));
   };
 
+  const getHostSecret: EvolustrSigner["getHostSecret"] = async (label) => {
+    if (!isHostSecretLabel(label)) return error("badRequest", "A host secret label is 1–200 characters without '|'");
+    const unlocked = await ensureM();
+    if (!unlocked.ok) return unlocked;
+    return ok(hostSecret(unlocked.value.m, label));
+  };
+
   const enrollPasskey: EvolustrSigner["enrollPasskey"] = async () => {
     const passkeys = host.passkeys;
     if (passkeys === undefined) return error("noPasskeys", "This signer has no passkey support");
@@ -495,5 +510,5 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     if (pubkey !== null) await host.cache?.remove(pubkey);
   };
 
-  return { handle, capabilities, getWrapKey, enrollPasskey, isProtectedEvent, appIdFor, lock };
+  return { handle, capabilities, getWrapKey, enrollPasskey, getHostSecret, isProtectedEvent, appIdFor, lock };
 };
