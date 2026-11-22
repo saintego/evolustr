@@ -12,7 +12,7 @@ describe("migrateRows (SPEC §3.4)", () => {
     const from = await mem.open(s1);
     await from.upsertRows("notes", [{ id: "b", isDeleted: true, changedAt: t, values: { text: "gone" } }]);
     const to = await mem.open(s2);
-    expect(await migrateRows(from, to, { kind: "all" })).toBe(2);
+    expect((await migrateRows(from, to, { kind: "all" })).copied).toBe(2);
     const rows = await to.readRows("notes");
     expect(rows.map((r) => [r.id, r.isDeleted, r.values["text"]])).toEqual([["a", false, "one"], ["b", true, "gone"]]);
   });
@@ -27,7 +27,7 @@ describe("migrateRows (SPEC §3.4)", () => {
     t = 5000;
     await mem.write(old, "notes", "offline", { text: "made offline" }); // changed after the cut-off
     const n = await migrateRows(await mem.open(old), await mem.open(current), { kind: "since", cutoffMs: 3000, marginMs: 0 });
-    expect(n).toBe(1);
+    expect(n).toEqual({ copied: 1, skippedChanged: 1 });
     const rows = await (await mem.open(current)).readRows("notes");
     expect(rows.find((r) => r.id === "synced")?.values["text"]).toBe("newer edit in S'");
     expect(rows.find((r) => r.id === "offline")?.values["text"]).toBe("made offline");
@@ -41,7 +41,25 @@ describe("migrateRows (SPEC §3.4)", () => {
     await mem.write(old, "notes", "x", { text: "edge" });
     await mem.write(current, "notes", "x", { text: "other" });
     t = 9000;
-    expect(await migrateRows(await mem.open(old), await mem.open(current), { kind: "since", cutoffMs: 3000, marginMs: 200 })).toBe(1);
+    expect((await migrateRows(await mem.open(old), await mem.open(current), { kind: "since", cutoffMs: 3000, marginMs: 200 })).copied).toBe(1);
+  });
+});
+
+describe("migrateRows missingOnly (#51)", () => {
+  it("never overwrites an existing id, and counts the changed ones it left", async () => {
+    let t = 1000;
+    const mem = memoryDatabases(["notes"], () => t);
+    const old = randomBytes(16);
+    const current = randomBytes(16);
+    await mem.write(current, "notes", "same", { text: "a" });
+    await mem.write(current, "notes", "x", { text: "good" });
+    t = 9000;
+    await mem.write(old, "notes", "same", { text: "a" });
+    await mem.write(old, "notes", "x", { text: "evil" });
+    await mem.write(old, "notes", "y", { text: "new" });
+    expect(await migrateRows(await mem.open(old), await mem.open(current), { kind: "missingOnly" })).toEqual({ copied: 1, skippedChanged: 1 });
+    const rows = await (await mem.open(current)).readRows("notes");
+    expect(Object.fromEntries(rows.map((r) => [r.id, r.values["text"]]))).toEqual({ same: "a", x: "good", y: "new" });
   });
 });
 

@@ -127,7 +127,7 @@ Another app's site can't ask your passkey for this secret. That's what makes str
 3. Your app seals R with that key as a `signer` root wrap.
 4. Another app gets a different key from the same signer and can't open your wrap.
 
-If the signer protects M with the nsec, anyone holding the nsec can rebuild M and every app key. `status.dependsOnNsec` tells you when that's the case.
+If the signer protects M with the nsec, anyone holding the nsec can rebuild M and every app key. `status.dependsOnNsec` tells you when that's the case. Moving the signer from the nsec to a passkey later doesn't change M, so it doesn't take that access away: older copies of the signer vault, opened with the nsec, still give M. For that the signer **replaces M** (`rotateMaster()`), keeping the old M sealed under the new one so apps can still open their old wrap. Each app then **replaces R and S** (`rotateRoot()`, offered when `status.rootExposed` is true): the user gets a new recovery phrase, and other passkeys for that app have to be added again. Data written before stays as readable as it was.
 
 **More than one signer.** Each signer product has its own M, kept in its own signer vault: a browser extension, Amber and nostr-shard-signer don't share one, and can't read each other's. You don't depend on one of them, because the app's vault holds **one root wrap per signer**, next to the passkeys. Each wrap opens the same R, so any one of them unlocks the database. The catch: each signer has to be added once, on a device where R is already unlocked (by another signer, a passkey or the phrase). The client does this by itself: when the database is unlocked and a capable signer without a wrap is connected, it asks that signer for its app key and adds the wrap. The exception is a signer that needs a passkey click first, which is added later. A signer that was never added can't open the database. Different installations of the *same* signer (say, the extension on two computers) share one M through its signer vault, so they count as one.
 
@@ -141,15 +141,15 @@ The phrase **is** R, written as 12 words (the same word list Bitcoin wallets use
 2. Create a new random S'. Copy every row from the old database into a new Evolu database opened with S'.
 3. Write a new vault: `mode: "strict"`, S' sealed with R, **no** NIP-44 wrap, the old S's fingerprint added to `history`. Root wraps (R's envelopes) stay as they were.
 4. Publish it to every relay. The old local database is deleted.
-5. Other devices see a vault whose history names their current S: they know it's a forward step, open S' with R and move their unsynced rows over.
+5. Other devices see a vault whose history names their current S: they know it's a forward step, open S' with R and copy over rows the strict database doesn't have yet. They don't overwrite rows it already has: the old database could be written by any app that had the old S, so its edits aren't trusted. Edits made on such a device while it was away are reported (`ready.migration.skippedChanged`), and its old database is kept until the app calls `discardOldDatabase()`.
 
-Data written before the switch stays as readable as it was: anyone who already got the old S through NIP-44 can still read the old data on Evolu's relay. Strict protects what's written from then on.
+Data written before the switch stays as readable as it was: anyone who already got the old S through NIP-44 can still read the old data on Evolu's relay. Strict protects what's written from then on. Until every device has moved over, such an app can still *add* rows through a device that hasn't migrated yet, but it can't change rows that are already in the strict database.
 
 ## How a device spots a forged vault
 
 Anyone who can sign events for the user (any app with signing permission) can publish a fake vault. A device compares what it fetched with what it knows:
 
-- **Its local copy of the vault** (kept in Evolu). It's only ever updated from vaults the device could check, so a fake can't overwrite it.
+- **Its local copy of the vault** (kept in Evolu). It's only ever updated from vaults the device could check, so a fake can't overwrite it. In compatible mode this copy is only as protected as the database itself: anyone who can decrypt the `nip44` wrap can write there through Evolu sync. The checks matter for strict databases.
 - **R**, if the device has it: a fake can't contain envelopes that open with R, and can't carry valid tags.
 - **The history** and a local list of secrets it has moved past: an old, genuine vault re-published later is recognised as a step backwards.
 
@@ -172,7 +172,9 @@ The vault is what lets several independent keys (passkeys, signers, the phrase, 
 
 **Can the Evolu relay or the Nostr relays read my data?** No. Evolu's relay stores data encrypted with S; Nostr relays store sealed envelopes.
 
-**What if the user loses everything?** With the recovery phrase they get everything back. Without it, and without any passkey or signer that still works, a strict database is gone: nobody, including the app developer, can open it. Compatible databases only need the Nostr login.
+**What if the user loses everything?** With the recovery phrase they get everything back. Without it, and without any passkey or signer that still works, a strict database is gone: nobody, including the app developer, can open it. Compatible databases only need the Nostr login, and can start over strict with a new recovery phrase (`makeStrict({ replaceRoot: true })`); the old phrase and passkeys stop working.
+
+**What if the recovery phrase leaked?** `rotateRoot()` replaces R and S, sealed with one strong method the user has now. The old phrase, and every other passkey and signer, stop working for that app; data written before stays as readable as it was. A device that still has the old R notices the rotation (the old R signed it) and asks for the new method instead of calling the vault forged.
 
 **Can a user leave Evolustr?** Yes: `exportEvoluMnemonic()` gives S as Evolu's 12 words, which open the data in any Evolu app. Anyone holding them can read and change the data.
 
