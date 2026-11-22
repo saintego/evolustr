@@ -44,6 +44,31 @@ describe("@evolustr/signer", () => {
     expect(viaHandle).not.toBe(viaHandleA);
   });
 
+  it("the host gets its own secrets from M; apps can't reach them through handle()", async () => {
+    const t = setup();
+    const s = createEvolustrSigner(t.host());
+    const settings = unwrap(await s.getHostSecret("nostr-shard-signer/v1/settings"));
+    expect(settings).toHaveLength(32);
+    expect(unwrap(await s.getHostSecret("nostr-shard-signer/v1/settings"))).toEqual(settings);
+    expect(unwrap(await s.getHostSecret("other"))).not.toEqual(settings);
+    // Not an app key, and no request method returns it.
+    expect(unwrap(await s.getWrapKey(web("https://a.example")))).not.toEqual(settings);
+    for (const method of ["evolustr_get_host_secret", "getHostSecret", "evolustr_host_secret"]) {
+      const r = await s.handle(method, ["nostr-shard-signer/v1/settings"], web("https://a.example"));
+      expect(r.ok).toBe(false);
+    }
+    const bad = await s.getHostSecret("x|app|https://a.example");
+    expect(bad.ok).toBe(false);
+  });
+
+  it("the host secret survives another device and the same M", async () => {
+    const t = setup();
+    const first = unwrap(await createEvolustrSigner(t.host()).getHostSecret("label"));
+    // A new device (no cache) finds M through the signer vault and derives the same secret.
+    const again = unwrap(await createEvolustrSigner(t.host()).getHostSecret("label"));
+    expect(again).toEqual(first);
+  });
+
   it("the same nsite on two known gateways gets the same key", async () => {
     const t = setup();
     const s = createEvolustrSigner(t.host());
@@ -435,6 +460,16 @@ describe("@evolustr/signer", () => {
         expect(onRelay.wraps.map((w) => w.type)).toEqual(["passkey"]);
         expect(onRelay.rotatedFrom).toBeDefined();
         expect(onRelay.skDroppedAt).toBeUndefined();
+      });
+
+      it("host secrets change with M; the previous one stays available to move the host's data", async () => {
+        const t = setup();
+        const { s } = await moved(t);
+        const before = unwrap(await s.getHostSecret("nostr-shard-signer/v1/settings"));
+        expect(await s.getPreviousHostSecret("nostr-shard-signer/v1/settings")).toMatchObject({ ok: false, error: { type: "noPreviousKey" } });
+        unwrap(await s.rotateMaster());
+        expect(unwrap(await s.getHostSecret("nostr-shard-signer/v1/settings"))).not.toEqual(before);
+        expect(unwrap(await s.getPreviousHostSecret("nostr-shard-signer/v1/settings"))).toEqual(before);
       });
 
       it("another device with the old M cached follows the rotation", async () => {

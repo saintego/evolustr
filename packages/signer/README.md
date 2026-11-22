@@ -19,3 +19,5 @@ The signer side of Evolustr: lets a Nostr signer (iframe signer, browser extensi
 ## Methods
 
 `handle(method, params, caller)` routes `evolustr_capabilities`, `evolustr_get_wrap_key` and `evolustr_enroll_passkey`. The caller always comes from the transport (`event.origin`, extension sender, Android package, NIP-46 client pubkey), never from params. `isProtectedEvent(event)` tells auto-approve rules which events need a prompt.
+
+`getHostSecret(label)` gives the host signer a 32-byte secret derived from M for its own use, such as the key of its synced settings: `HKDF(M, "evolustr/v1|host|" + label)`, namespaced apart from app keys. It unlocks M like `getWrapKey` (with the signer passkey if needed), shows no app prompt, and isn't reachable through `handle()`, so apps can't ask for it. Labels are 1–200 characters without `|`. After `rotateMaster()`, `getPreviousHostSecret(label)` gives the same secret under the previous M, so the host can move its data across, as apps do with `getPreviousWrapKey`.

@@ -17,6 +17,8 @@ import {
   seal,
   sha256Hex,
   signerAppKey,
+  hostSecret,
+  isHostSecretLabel,
   signerId,
   signerVaultDTag,
   signerWrapAad,
@@ -46,6 +48,16 @@ describe("hashes and HKDF match Node's implementation", () => {
     expect(toHex(hkdf(ikm, "evolustr/v1/data|app"))).toBe(toHex(nodeHkdf(ikm, "evolustr/v1/data|app")));
     expect(rootDataKey(ikm, "app")).toEqual(nodeHkdf(ikm, "evolustr/v1/data|app"));
     expect(signerAppKey(ikm, "https://a.example")).toEqual(nodeHkdf(ikm, "evolustr/v1|app|https://a.example"));
+    expect(hostSecret(ikm, "nostr-shard-signer/v1/settings")).toEqual(
+      nodeHkdf(ikm, "evolustr/v1|host|nostr-shard-signer/v1/settings"),
+    );
+  });
+  it("host secrets never collide with app keys, and labels are checked", () => {
+    expect(hostSecret(ikm, "https://a.example")).not.toEqual(signerAppKey(ikm, "https://a.example"));
+    expect(isHostSecretLabel("nostr-shard-signer/v1/settings")).toBe(true);
+    expect(isHostSecretLabel("")).toBe(false);
+    expect(isHostSecretLabel("a|app|https://b.example")).toBe(false);
+    expect(isHostSecretLabel("x".repeat(201))).toBe(false);
   });
   it("sha256 and sHash", () => {
     expect(sha256Hex("abc")).toBe(nodeSha("abc"));

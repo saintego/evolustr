@@ -325,6 +325,7 @@ The signer side of Evolustr is a package in this repo, so a signer adds the API 
 - request handling for `window.nostr.evolustr`, `evolustr_*` (NIP-46) and NIP-55
 - the auto-approve filter for vault events (§5.5 rule 2)
 - optionally, cross-app secrets ([SECRETS.md](SECRETS.md))
+- **host secrets:** `getHostSecret(label)` = `HKDF(M, "evolustr/v1|host|" + label)`, a secret from `M` for the host signer's own data (e.g. its synced settings), namespaced apart from app keys (`evolustr/v1|app|…`). Host-only: no request method returns it, so apps can't obtain it. It survives a change of the signer's address, unlike a key derived from the signer's own app id.
 
 The host signer supplies what only it knows: who is calling, how to sign, and how to ask the user.
 
