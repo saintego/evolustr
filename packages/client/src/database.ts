@@ -37,27 +37,45 @@ export const META_SHARED_SETTINGS = "sharedSettings";
 export type MigrationMode =
   | { readonly kind: "all" }
   /** Copy rows missing in the target, or changed after `cutoffMs - marginMs`. */
-  | { readonly kind: "since"; readonly cutoffMs: number; readonly marginMs: number };
+  | { readonly kind: "since"; readonly cutoffMs: number; readonly marginMs: number }
+  /** Copy only rows whose id isn't in the target; never overwrite (#51). */
+  | { readonly kind: "missingOnly" };
 
-/** Copies rows between databases with upsert, keeping ids (SPEC §3.4). Returns rows copied. */
+export interface MigrationResult {
+  /** Rows written to the target. */
+  readonly copied: number;
+  /** Rows the target already had, with different content in the source, that weren't copied. */
+  readonly skippedChanged: number;
+}
+
+const sameContent = (a: Row, b: Row): boolean =>
+  a.isDeleted === b.isDeleted && JSON.stringify(a.values) === JSON.stringify(b.values);
+
+/** Copies rows between databases with upsert, keeping ids (SPEC §3.4). */
 export const migrateRows = async (
   from: AppDatabase,
   to: AppDatabase,
   mode: MigrationMode,
-): Promise<number> => {
+): Promise<MigrationResult> => {
   let copied = 0;
+  let skippedChanged = 0;
   for (const table of from.tables) {
     const source = await from.readRows(table);
     let rows = source;
-    if (mode.kind === "since") {
-      const existing = new Set((await to.readRows(table)).map((r) => r.id));
-      const after = mode.cutoffMs - mode.marginMs;
+    if (mode.kind !== "all") {
+      const existing = new Map((await to.readRows(table)).map((r) => [r.id, r]));
+      const after = mode.kind === "since" ? mode.cutoffMs - mode.marginMs : Number.POSITIVE_INFINITY;
       rows = source.filter((r) => !existing.has(r.id) || r.changedAt > after);
+      const taken = new Set(rows.map((r) => r.id));
+      skippedChanged += source.filter((r) => {
+        const there = existing.get(r.id);
+        return there !== undefined && !taken.has(r.id) && !sameContent(r, there);
+      }).length;
     }
     if (rows.length > 0) await to.upsertRows(table, rows);
     copied += rows.length;
   }
-  return copied;
+  return { copied, skippedChanged };
 };
 
 /** In-memory databases for tests, one per data secret. */

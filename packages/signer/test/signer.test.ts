@@ -1,7 +1,7 @@
 import { type Bytes, VAULT_KIND, appVaultDTag, memoryPasskeys, memoryRelays, signerVaultDTag, unwrap } from "@evolustr/core";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { describe, expect, it } from "vitest";
-import { type SignerHost, createEvolustrSigner, mergeSignerVaults } from "../src/index.ts";
+import { type SignerHost, createEvolustrSigner, mergeSignerVaults, parseSignerVault, signerWrapTag } from "../src/index.ts";
 
 const URLS = ["wss://r1"];
 const SIGNER = "https://signer.example";
@@ -335,4 +335,158 @@ describe("@evolustr/signer", () => {
       expect(unwrap(await s.capabilities(web("https://a.example"))).nsecProtected).toBe(false);
     });
   });
+
+  describe("round 3 (#52, #54)", () => {
+    /** A device cache with M and the local signer-vault copy (#41). */
+    const deviceCache = () => {
+      const m = new Map<string, Bytes>();
+      const v = new Map<string, string>();
+      return {
+        get: async (k: string) => m.get(k) ?? null,
+        set: async (k: string, x: Bytes) => void m.set(k, x),
+        remove: async (k: string) => void m.delete(k),
+        getVault: async (k: string) => v.get(k) ?? null,
+        setVault: async (k: string, x: string) => void v.set(k, x),
+        m,
+      };
+    };
+    const latest = async (t: ReturnType<typeof setup>) => {
+      const events = (await t.mem.relays.query(URLS, { kinds: [VAULT_KIND], "#d": [signerVaultDTag(t.pubkey, SIGNER)] }, 100)).events;
+      return [...events].sort((a, b) => b.created_at - a.created_at)[0]!;
+    };
+    const republish = async (t: ReturnType<typeof setup>, content: unknown) => {
+      const at = (await latest(t)).created_at + 10;
+      await t.mem.relays.publish(URLS, finalizeEvent({ kind: VAULT_KIND, created_at: at, tags: [["d", signerVaultDTag(t.pubkey, SIGNER)]], content: JSON.stringify(content) }, t.sk), 100);
+    };
+    const passkeys = (t: ReturnType<typeof setup>) => memoryPasskeys({ rpId: "signer.example", store: t.passkeyStore });
+
+    it("after moving to a passkey, an old local copy doesn't bring the sk wrap back (#52)", async () => {
+      const t = setup();
+      const cacheX = deviceCache();
+      unwrap(await createEvolustrSigner(t.host({ cache: cacheX })).getWrapKey(web("https://a.example")));
+      unwrap(await createEvolustrSigner(t.host({ allowSkWrap: () => false, passkeys: passkeys(t) })).enrollPasskey());
+      // Device X still has the sk wrap in its copy; the user's choice is now "no sk".
+      const x = createEvolustrSigner(t.host({ cache: cacheX, allowSkWrap: false, passkeys: passkeys(t) }));
+      unwrap(await x.getWrapKey(web("https://a.example")));
+      const onRelay = JSON.parse((await latest(t)).content) as { wraps: Array<{ type: string }>; skDroppedAt?: number };
+      expect(onRelay.wraps.map((w) => w.type)).toEqual(["passkey"]);
+      expect(onRelay.skDroppedAt).toBeTypeOf("number");
+    });
+
+    it("capabilities say the nsec was exposed after the move (#52)", async () => {
+      const t = setup();
+      unwrap(await createEvolustrSigner(t.host()).getWrapKey(web("https://a.example")));
+      const s = createEvolustrSigner(t.host({ allowSkWrap: false, passkeys: passkeys(t) }));
+      unwrap(await s.enrollPasskey());
+      expect(unwrap(await s.capabilities(web("https://a.example")))).toMatchObject({ nsecProtected: false, nsecExposed: true });
+    });
+
+    it("skDroppedAt survives a merge and a round trip (#52)", () => {
+      const wrap = { type: "passkey" as const, rpId: "signer.example", credId: "c", iv: "i", ct: "c" };
+      const merged = mergeSignerVaults({ v: 1, wraps: [wrap], skDroppedAt: 5 }, { v: 1, wraps: [wrap], skDroppedAt: 9 });
+      expect(merged.skDroppedAt).toBe(9);
+      expect(unwrap(parseSignerVault(JSON.stringify(merged))).skDroppedAt).toBe(9);
+      expect(mergeSignerVaults({ v: 1, wraps: [{ type: "sk", iv: "i", ct: "c" }] }, { v: 1, wraps: [wrap] }, { dropSk: true }).wraps).toEqual([wrap]);
+    });
+
+    const junkWraps = (n: number, tagged: boolean) =>
+      Array.from({ length: n }, (_, i) => ({ type: "passkey", rpId: "signer.example", credId: `junk${tagged ? "t" : "u"}${i}`, iv: "AAAA", ct: "AAAA", ...(tagged ? { tag: "00".repeat(32) } : {}) }));
+    const afterUnlock = async (t: ReturnType<typeof setup>, junk: unknown[]) => {
+      const real = JSON.parse((await latest(t)).content) as { wraps: Array<Record<string, unknown>> };
+      await republish(t, { v: 1, wraps: [...real.wraps, ...junk] });
+      unwrap(await createEvolustrSigner(t.host()).getWrapKey(web("https://a.example")));
+      return (JSON.parse((await latest(t)).content) as { wraps: Array<{ type: string; credId?: string }> }).wraps;
+    };
+
+    it("wraps with a wrong tag are dropped once M is unlocked; a few untagged ones stay (#54)", async () => {
+      const t = setup();
+      unwrap(await createEvolustrSigner(t.host()).getWrapKey(web("https://a.example")));
+      expect((JSON.parse((await latest(t)).content) as { wraps: Array<{ tag?: string }> }).wraps[0]!.tag).toBeTypeOf("string");
+      const wraps = await afterUnlock(t, [...junkWraps(3, true), ...junkWraps(3, false)]);
+      expect(wraps.map((w) => w.credId ?? w.type)).toEqual(["sk", "junku0", "junku1", "junku2"]);
+    });
+
+    it("31 untagged junk wraps: only verified ones are published (#54)", async () => {
+      const t = setup();
+      unwrap(await createEvolustrSigner(t.host()).getWrapKey(web("https://a.example")));
+      expect((await afterUnlock(t, junkWraps(31, false))).map((w) => w.type)).toEqual(["sk"]);
+    });
+
+    describe("rotating M (#52 phase B)", () => {
+      /** Signer that moved from the nsec to a passkey; returns its old app key. */
+      const moved = async (t: ReturnType<typeof setup>, cache = deviceCache()) => {
+        const oldKey = unwrap(await createEvolustrSigner(t.host()).getWrapKey(web("https://a.example")));
+        const s = createEvolustrSigner(t.host({ cache, allowSkWrap: false, passkeys: passkeys(t) }));
+        unwrap(await s.enrollPasskey());
+        return { s, oldKey, cache };
+      };
+
+      it("gives a new key, keeps the old one available, and drops the nsec exposure", async () => {
+        const t = setup();
+        const { s, oldKey } = await moved(t);
+        const before = unwrap(await s.capabilities(web("https://a.example")));
+        expect(unwrap(await s.rotateMaster())).toEqual({ droppedWraps: 0 });
+        const after = unwrap(await s.capabilities(web("https://a.example")));
+        expect(after).toMatchObject({ nsecExposed: false, previousSignerId: before.signerId });
+        expect(after.signerId).not.toBe(before.signerId);
+        expect(unwrap(await s.getWrapKey(web("https://a.example")))).not.toEqual(oldKey);
+        expect(unwrap(await s.getPreviousWrapKey(web("https://a.example")))).toEqual(oldKey);
+        const onRelay = JSON.parse((await latest(t)).content) as { wraps: Array<{ type: string }>; rotatedFrom?: unknown; skDroppedAt?: number };
+        expect(onRelay.wraps.map((w) => w.type)).toEqual(["passkey"]);
+        expect(onRelay.rotatedFrom).toBeDefined();
+        expect(onRelay.skDroppedAt).toBeUndefined();
+      });
+
+      it("another device with the old M cached follows the rotation", async () => {
+        const t = setup();
+        const { s } = await moved(t);
+        const deviceB = deviceCache();
+        const b1 = createEvolustrSigner(t.host({ cache: deviceB, allowSkWrap: false, passkeys: passkeys(t) }));
+        unwrap(await b1.getWrapKey(web("https://a.example"))); // B now has the old M and a copy
+        unwrap(await s.rotateMaster());
+        const newKey = unwrap(await s.getWrapKey(web("https://a.example")));
+        const b2 = createEvolustrSigner(t.host({ cache: deviceB, allowSkWrap: false, passkeys: passkeys(t) }));
+        expect(unwrap(await b2.getWrapKey(web("https://a.example")))).toEqual(newKey);
+        expect(t.gestures.at(-1)).toBe("unlock"); // the new M needs the passkey once
+      });
+
+      it("a forged rotation isn't followed and doesn't change the key", async () => {
+        const t = setup();
+        const deviceB = deviceCache();
+        await moved(t);
+        const b1 = createEvolustrSigner(t.host({ cache: deviceB, allowSkWrap: false, passkeys: passkeys(t) }));
+        const key = unwrap(await b1.getWrapKey(web("https://a.example")));
+        const real = JSON.parse((await latest(t)).content) as Record<string, unknown>;
+        await republish(t, { ...real, mId: "ff".repeat(8), rotatedFrom: { mId: real["mId"], proof: "00".repeat(32) } });
+        const b2 = createEvolustrSigner(t.host({ cache: deviceB, allowSkWrap: false, passkeys: passkeys(t) }));
+        expect(unwrap(await b2.getWrapKey(web("https://a.example")))).toEqual(key);
+        expect(unwrap(await b2.capabilities(web("https://a.example"))).previousSignerId).toBeNull();
+      });
+
+      it("is refused while the nsec may still unlock the key", async () => {
+        const t = setup();
+        unwrap(await createEvolustrSigner(t.host()).getWrapKey(web("https://a.example")));
+        const s = createEvolustrSigner(t.host({ passkeys: passkeys(t) }));
+        unwrap(await s.enrollPasskey());
+        expect(await s.rotateMaster()).toMatchObject({ ok: false, error: { type: "nsecAllowed" } });
+      });
+    });
+
+    it("enrolling into a full signer vault is refused (#54)", async () => {
+      const t = setup();
+      const cache = deviceCache();
+      unwrap(await createEvolustrSigner(t.host({ cache })).getWrapKey(web("https://a.example")));
+      const m = cache.m.get(t.pubkey)!;
+      const real = JSON.parse((await latest(t)).content) as { wraps: unknown[] };
+      // 31 more wraps with valid tags (made with M), so pruning keeps them.
+      const more = Array.from({ length: 31 }, (_, i) => {
+        const w = { type: "passkey" as const, rpId: "signer.example", credId: `k${i}`, iv: "AAAA", ct: "AAAA" };
+        return { ...w, tag: signerWrapTag(t.pubkey, SIGNER, m, w) };
+      });
+      await republish(t, { v: 1, wraps: [...real.wraps, ...more] });
+      const s = createEvolustrSigner(t.host({ passkeys: passkeys(t) }));
+      expect(await s.enrollPasskey()).toMatchObject({ ok: false, error: { type: "signerVaultFull" } });
+    });
+  });
+
 });

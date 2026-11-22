@@ -42,6 +42,11 @@ export const nip55CapableSigner = async (bridge: Nip55Bridge): Promise<CapableSi
       if (key === null || key.length !== 32) throw new Error("The signer returned an invalid key");
       return key;
     },
+    getPreviousWrapKey: async () => {
+      const key = fromBase64Url(await request("evolustr_get_previous_wrap_key", []));
+      if (key === null || key.length !== 32) throw new Error("The signer returned an invalid key");
+      return key;
+    },
     enrollPasskey: async () => void (await request("evolustr_enroll_passkey", [])),
   };
 };
