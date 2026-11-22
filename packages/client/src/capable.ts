@@ -23,14 +23,31 @@ export interface SignerCapabilities {
    * previous key. Its wrap in the vault still opens R, which may be exposed.
    */
   readonly previousSignerId?: string | null;
+  /**
+   * Every earlier key's signer id for this app, newest first (#58), when the
+   * signer replaced its key more than once. Older signers send only
+   * `previousSignerId`.
+   */
+  readonly previousSignerIds?: ReadonlyArray<string>;
 }
+
+/** The signer ids of the signer's earlier keys, newest first: the list, or the single id older signers send (#58). */
+export const earlierSignerIds = (c: SignerCapabilities): ReadonlyArray<string> =>
+  c.previousSignerIds !== undefined && c.previousSignerIds.length > 0
+    ? c.previousSignerIds
+    : c.previousSignerId == null
+      ? []
+      : [c.previousSignerId];
 
 export interface CapableSigner {
   readonly capabilities: () => Promise<SignerCapabilities>;
   /** May wait for the user to click inside the signer; don't use short timeouts. */
   readonly getWrapKey: () => Promise<Bytes>;
-  /** The app key under the signer's previous key, after a key rotation (#52 phase B). */
-  readonly getPreviousWrapKey?: () => Promise<Bytes>;
+  /**
+   * The app key under the signer's earlier key whose signer id is `signerId`
+   * (#58), else its previous key, after a key rotation (#52 phase B).
+   */
+  readonly getPreviousWrapKey?: (signerId?: string) => Promise<Bytes>;
   readonly enrollPasskey?: () => Promise<void>;
 }
 
@@ -47,14 +64,14 @@ const toKey = (v: unknown): Bytes => {
 export interface Nip07Evolustr {
   readonly capabilities: () => Promise<SignerCapabilities>;
   readonly getWrapKey: () => Promise<string | Uint8Array>;
-  readonly getPreviousWrapKey?: () => Promise<string | Uint8Array>;
+  readonly getPreviousWrapKey?: (signerId?: string) => Promise<string | Uint8Array>;
   readonly enrollPasskey?: () => Promise<void>;
 }
 
 export const nip07CapableSigner = (ns: Nip07Evolustr): CapableSigner => ({
   capabilities: () => ns.capabilities(),
   getWrapKey: async () => toKey(await ns.getWrapKey()),
-  ...(ns.getPreviousWrapKey === undefined ? {} : { getPreviousWrapKey: async () => toKey(await ns.getPreviousWrapKey!()) }),
+  ...(ns.getPreviousWrapKey === undefined ? {} : { getPreviousWrapKey: async (signerId?: string) => toKey(await ns.getPreviousWrapKey!(signerId)) }),
   ...(ns.enrollPasskey === undefined ? {} : { enrollPasskey: () => ns.enrollPasskey!() }),
 });
 
@@ -92,7 +109,7 @@ export const iframeCapableSigner = (args: {
   return {
     capabilities: async () => (await call("evolustr_capabilities")) as SignerCapabilities,
     getWrapKey: async () => toKey(await call("evolustr_get_wrap_key")),
-    getPreviousWrapKey: async () => toKey(await call("evolustr_get_previous_wrap_key")),
+    getPreviousWrapKey: async (signerId) => toKey(await call("evolustr_get_previous_wrap_key", signerId === undefined ? [] : [signerId])),
     enrollPasskey: async () => void (await call("evolustr_enroll_passkey")),
   };
 };
@@ -102,7 +119,7 @@ export const exposeOnWindowNostr = (nostr: Record<string, unknown>, signer: Capa
   nostr["evolustr"] = {
     capabilities: () => signer.capabilities(),
     getWrapKey: async () => signer.getWrapKey(),
-    ...(signer.getPreviousWrapKey === undefined ? {} : { getPreviousWrapKey: () => signer.getPreviousWrapKey!() }),
+    ...(signer.getPreviousWrapKey === undefined ? {} : { getPreviousWrapKey: (signerId?: string) => signer.getPreviousWrapKey!(signerId) }),
     ...(signer.enrollPasskey === undefined ? {} : { enrollPasskey: () => signer.enrollPasskey!() }),
   };
 };
@@ -120,6 +137,7 @@ export interface Nip46RequestClient {
 export const nip46CapableSigner = (bunker: Nip46RequestClient): CapableSigner => ({
   capabilities: async () => JSON.parse(await bunker.sendRequest("evolustr_capabilities", [])) as SignerCapabilities,
   getWrapKey: async () => toKey(await bunker.sendRequest("evolustr_get_wrap_key", [])),
-  getPreviousWrapKey: async () => toKey(await bunker.sendRequest("evolustr_get_previous_wrap_key", [])),
+  getPreviousWrapKey: async (signerId) =>
+    toKey(await bunker.sendRequest("evolustr_get_previous_wrap_key", signerId === undefined ? [] : [signerId])),
   enrollPasskey: async () => void (await bunker.sendRequest("evolustr_enroll_passkey", [])),
 });

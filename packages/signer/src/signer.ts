@@ -84,8 +84,20 @@ export interface SignerVault {
   /** Set after {@link EvolustrSigner.rotateMaster}: the previous M authorises this one. */
   readonly rotatedFrom?: { readonly mId: string; readonly proof: string };
   /** The previous M, sealed with a key from this M, so apps can still open their old wrap. */
-  readonly previous?: { readonly mId: string } & Sealed;
+  readonly previous?: PreviousMaster;
+  /**
+   * The Ms before `previous`, newest first (#58): each sealed with a key from
+   * the one before it in this chain (`older[0]` with `previous`'s M). Carried
+   * over unchanged at each rotation, at most {@link MAX_PREVIOUS_MASTERS} in all.
+   */
+  readonly older?: ReadonlyArray<PreviousMaster>;
 }
+
+/** An earlier M, sealed with `HKDF(M_next, "evolustr/v1/signer-previous")` (#52 phase B, #58). */
+export type PreviousMaster = { readonly mId: string } & Sealed;
+
+/** How many earlier Ms a signer vault keeps (`previous` plus `older`, #58). */
+export const MAX_PREVIOUS_MASTERS = 16;
 
 export type ConfirmRequest =
   | { readonly kind: "appKey"; readonly appId: string; readonly identity: Caller["identity"] }
@@ -154,6 +166,12 @@ export interface Capabilities {
    * M, so the client can open its old wrap and then replace its root key.
    */
   readonly previousSignerId: string | null;
+  /**
+   * Every earlier M's signer id for this app, newest first (#58): an app that
+   * skipped rotations finds the one its wrap used and asks for that key.
+   * `previousSignerIds[0]` is `previousSignerId`.
+   */
+  readonly previousSignerIds: ReadonlyArray<string>;
 }
 
 export const METHODS = ["evolustr_capabilities", "evolustr_get_wrap_key", "evolustr_get_previous_wrap_key", "evolustr_enroll_passkey"] as const;
@@ -167,8 +185,12 @@ export interface EvolustrSigner {
   /** 32-byte key for the caller's app vault (SPEC §5.3). */
   readonly getWrapKey: (caller: Caller) => Promise<Result<Bytes>>;
   readonly enrollPasskey: () => Promise<Result<void>>;
-  /** The caller's key under the previous M, after {@link rotateMaster} (#52 phase B). */
-  readonly getPreviousWrapKey: (caller: Caller) => Promise<Result<Bytes>>;
+  /**
+   * The caller's key under an earlier M, after {@link rotateMaster} (#52 phase
+   * B): the one whose signer id for this app is `signerId` (#58), else the
+   * previous one.
+   */
+  readonly getPreviousWrapKey: (caller: Caller, signerId?: string) => Promise<Result<Bytes>>;
   /**
    * Replaces M with a new one, from a click in the signer's own UI (#52 phase
    * B). Needs a signer passkey and `allowSkWrap` false. Only the passkey used
@@ -186,6 +208,8 @@ export interface EvolustrSigner {
    * the host can move its own data across, like apps with getPreviousWrapKey.
    */
   readonly getPreviousHostSecret: (label: string) => Promise<Result<Bytes>>;
+  /** The host secret under every earlier M, newest first (#58); empty before any rotation. */
+  readonly getPreviousHostSecrets: (label: string) => Promise<Result<ReadonlyArray<Bytes>>>;
   /** For the host's auto-approve list (SPEC §5.5 rule 2). */
   readonly isProtectedEvent: (event: { readonly kind: number; readonly tags: ReadonlyArray<ReadonlyArray<string>> }) => boolean;
   readonly appIdFor: (caller: Caller) => Result<string>;
@@ -233,23 +257,30 @@ export const parseSignerVault = (json: string): Result<SignerVault, EvolustrErro
   const mId = data["mId"];
   const rotatedFrom = data["rotatedFrom"];
   const previous = data["previous"];
+  const older = data["older"];
   if (mId !== undefined && typeof mId !== "string") return error("invalidSignerVault", "Malformed mId");
   if (rotatedFrom !== undefined && !(isRecord(rotatedFrom) && typeof rotatedFrom["mId"] === "string" && typeof rotatedFrom["proof"] === "string")) {
     return error("invalidSignerVault", "Malformed rotatedFrom");
   }
-  if (previous !== undefined && !(isRecord(previous) && typeof previous["mId"] === "string" && typeof previous["iv"] === "string" && typeof previous["ct"] === "string")) {
-    return error("invalidSignerVault", "Malformed previous");
+  if (previous !== undefined && !isPreviousMaster(previous)) return error("invalidSignerVault", "Malformed previous");
+  if (older !== undefined && !(Array.isArray(older) && older.length < MAX_PREVIOUS_MASTERS && older.every(isPreviousMaster))) {
+    return error("invalidSignerVault", "Malformed older");
   }
   const extra = {
     ...(typeof mId === "string" ? { mId } : {}),
     ...(isRecord(rotatedFrom) ? { rotatedFrom: { mId: rotatedFrom["mId"] as string, proof: rotatedFrom["proof"] as string } } : {}),
-    ...(isRecord(previous) ? { previous: { mId: previous["mId"] as string, iv: previous["iv"] as string, ct: previous["ct"] as string } } : {}),
+    ...(isPreviousMaster(previous) ? { previous: previousMaster(previous) } : {}),
+    ...(isPreviousMaster(previous) && Array.isArray(older) && older.length > 0 ? { older: older.map(previousMaster) } : {}),
   };
   // A vault that exists but has no wraps isn't "first use" (#28).
   if (wraps.length === 0) return error("invalidSignerVault", "The signer vault has no wraps");
   if (wraps.length > MAX_SIGNER_WRAPS) return error("invalidSignerVault", "Too many wraps");
   return ok({ v: 1, wraps, ...(typeof dropped === "number" ? { skDroppedAt: dropped } : {}), ...extra });
 };
+
+const isPreviousMaster = (x: unknown): x is PreviousMaster =>
+  isRecord(x) && typeof x["mId"] === "string" && typeof x["iv"] === "string" && typeof x["ct"] === "string";
+const previousMaster = (x: PreviousMaster): PreviousMaster => ({ mId: x.mId, iv: x.iv, ct: x.ct });
 
 const wrapId = (w: SignerWrap): string => (w.type === "sk" ? "sk" : w.credId);
 
@@ -278,6 +309,10 @@ export const mergeSignerVaults = (
   const mId = local.mId ?? fetched.mId;
   const rotatedFrom = local.rotatedFrom ?? fetched.rotatedFrom;
   const previous = local.previous ?? fetched.previous;
+  // The chain behind that previous M: the longer of the two sides that have it (#58).
+  const olderOf = (v: SignerVault) => (v.previous?.mId === previous?.mId ? (v.older ?? []) : []);
+  const [a, b] = [olderOf(local), olderOf(fetched)];
+  const older = b.length > a.length ? b : a;
   return {
     v: 1,
     wraps: [...byId.values()],
@@ -285,6 +320,7 @@ export const mergeSignerVaults = (
     ...(mId === undefined ? {} : { mId }),
     ...(rotatedFrom === undefined ? {} : { rotatedFrom }),
     ...(previous === undefined ? {} : { previous }),
+    ...(previous === undefined || older.length === 0 ? {} : { older }),
   };
 };
 
@@ -384,6 +420,8 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   let candidate: SignerVault | null = null;
   /** The previous M after a rotation, for old app keys. */
   let previousM: Bytes | null = null;
+  /** Every earlier M opened from the vault, newest first (#58); null until read. */
+  let earlierMs: ReadonlyArray<Bytes> | null = null;
 
   const appIdFor = (caller: Caller) => appIdForCaller(caller, host.knownNsiteGateways);
 
@@ -504,6 +542,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     candidate = null;
     if (!rotationValid(other, m)) return "foreign";
     previousM = m;
+    earlierMs = null;
     vault = other;
     m = null;
     needsHeal = false;
@@ -526,14 +565,26 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     if (vault !== null) await host.cache?.setVault?.(pubkey, JSON.stringify(vault));
   };
 
-  /** The previous M, opened from the vault with the current one. */
-  const previousOf = (pubkey: string): Bytes | null => {
-    if (previousM !== null) return previousM;
-    const p = vault?.previous;
-    if (m === null || p === undefined || vault?.mId !== signerMId(m)) return null;
-    const opened = open(signerPreviousKey(m), p, signerWrapAad(pubkey, host.signerKey, "previous", p.mId));
-    if (opened.ok && opened.value.length === MASTER_SECRET_LENGTH && signerMId(opened.value) === p.mId) previousM = opened.value;
-    return previousM;
+  /**
+   * The earlier Ms, newest first, opened from the vault with the current one:
+   * `previous` with M, each `older` entry with the one before it (#58). Stops
+   * at the first entry that doesn't open.
+   */
+  const earlierOf = (pubkey: string): ReadonlyArray<Bytes> => {
+    if (earlierMs !== null) return earlierMs;
+    const first = vault?.previous;
+    if (m === null || first === undefined || vault?.mId !== signerMId(m)) return previousM === null ? [] : [previousM];
+    const found: Bytes[] = [];
+    let key = m;
+    for (const p of [first, ...(vault?.older ?? [])]) {
+      const opened = open(signerPreviousKey(key), p, signerWrapAad(pubkey, host.signerKey, "previous", p.mId));
+      if (!opened.ok || opened.value.length !== MASTER_SECRET_LENGTH || signerMId(opened.value) !== p.mId) break;
+      found.push(opened.value);
+      key = opened.value;
+    }
+    if (found.length === 0 && previousM !== null) found.push(previousM);
+    earlierMs = found;
+    return found;
   };
 
   /**
@@ -630,9 +681,9 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
       recoverable: (vault?.wraps ?? []).some((w) => w.type === "sk" || (w.type === "passkey" && w.synced === true)),
       nsecProtected: (vault?.wraps ?? []).some((w) => w.type === "sk"),
       nsecExposed: (vault?.wraps ?? []).some((w) => w.type === "sk") || vault?.skDroppedAt !== undefined,
-      previousSignerId: (() => {
-        const prev = previousOf(pubkey);
-        return prev === null ? null : computeSignerId(prev, appId.value);
+      ...(() => {
+        const ids = earlierOf(pubkey).map((x) => computeSignerId(x, appId.value));
+        return { previousSignerId: ids[0] ?? null, previousSignerIds: ids };
       })(),
     });
   };
@@ -718,23 +769,32 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     return ok(undefined);
   };
 
-  const getPreviousWrapKey: EvolustrSigner["getPreviousWrapKey"] = async (caller) => {
+  const getPreviousWrapKey: EvolustrSigner["getPreviousWrapKey"] = async (caller, signerId) => {
     const appId = appIdFor(caller);
     if (!appId.ok) return appId;
     const allowed = await host.ui.confirm({ kind: "appKey", appId: appId.value, identity: caller.identity });
     if (!allowed) return error("userRefused", "The user didn't allow this app");
     const unlocked = await ensureM();
     if (!unlocked.ok) return unlocked;
-    const prev = previousOf(unlocked.value.pubkey);
-    return prev === null ? error("noPreviousKey", "This signer hasn't replaced its key") : ok(signerAppKey(prev, appId.value));
+    const earlier = earlierOf(unlocked.value.pubkey);
+    if (earlier.length === 0) return error("noPreviousKey", "This signer hasn't replaced its key");
+    const prev = signerId === undefined ? earlier[0] : earlier.find((x) => computeSignerId(x, appId.value) === signerId);
+    return prev === undefined ? error("noPreviousKey", "This signer has no earlier key with that id") : ok(signerAppKey(prev, appId.value));
   };
 
   const getPreviousHostSecret: EvolustrSigner["getPreviousHostSecret"] = async (label) => {
     if (!isHostSecretLabel(label)) return error("badRequest", "A host secret label is 1–200 characters without '|'");
     const unlocked = await ensureM();
     if (!unlocked.ok) return unlocked;
-    const prev = previousOf(unlocked.value.pubkey);
-    return prev === null ? error("noPreviousKey", "This signer hasn't replaced its key") : ok(hostSecret(prev, label));
+    const prev = earlierOf(unlocked.value.pubkey)[0];
+    return prev === undefined ? error("noPreviousKey", "This signer hasn't replaced its key") : ok(hostSecret(prev, label));
+  };
+
+  const getPreviousHostSecrets: EvolustrSigner["getPreviousHostSecrets"] = async (label) => {
+    if (!isHostSecretLabel(label)) return error("badRequest", "A host secret label is 1–200 characters without '|'");
+    const unlocked = await ensureM();
+    if (!unlocked.ok) return unlocked;
+    return ok(earlierOf(unlocked.value.pubkey).map((x) => hostSecret(x, label)));
   };
 
   const rotateMaster: EvolustrSigner["rotateMaster"] = async () => {
@@ -767,24 +827,28 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     const newM = random(MASTER_SECRET_LENGTH);
     const oldMId = signerMId(oldM.value);
     const newMId = signerMId(newM);
+    // The chain so far moves down one place, unchanged: each entry still opens with the one before it (#58).
+    const older = vault.previous === undefined ? [] : [vault.previous, ...(vault.older ?? [])].slice(0, MAX_PREVIOUS_MASTERS - 1);
     const next: SignerVault = {
       v: 1,
       wraps: [sealM(pubkey, key, { type: "passkey", rpId: wrap.rpId, credId: wrap.credId, ...(wrap.synced === undefined ? {} : { synced: wrap.synced }) }, newM)],
       mId: newMId,
       rotatedFrom: { mId: oldMId, proof: masterRotationProof(oldM.value, newMId) },
       previous: { mId: oldMId, ...seal(signerPreviousKey(newM), oldM.value, signerWrapAad(pubkey, host.signerKey, "previous", oldMId)) },
+      ...(older.length > 0 ? { older } : {}),
     };
     const droppedWraps = vault.wraps.length - 1;
     const published = await publish(pubkey, next);
     if (!published.ok) return published;
     candidate = null;
     previousM = oldM.value;
+    earlierMs = null;
     m = newM;
     await host.cache?.set(pubkey, newM);
     return ok({ droppedWraps });
   };
 
-  const handle: EvolustrSigner["handle"] = async (method, _params, caller) => {
+  const handle: EvolustrSigner["handle"] = async (method, params, caller) => {
     switch (method) {
       case "evolustr_capabilities":
         return capabilities(caller);
@@ -793,7 +857,12 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
         return key.ok ? ok(toBase64Url(key.value)) : key;
       }
       case "evolustr_get_previous_wrap_key": {
-        const key = await getPreviousWrapKey(caller);
+        // Optional: the signer id the app's wrap was made with (#58).
+        const signerId = params[0];
+        if (signerId !== undefined && signerId !== null && (typeof signerId !== "string" || !/^[0-9a-f]{16}$/.test(signerId))) {
+          return error("badRequest", "signerId must be 16 hex characters");
+        }
+        const key = await getPreviousWrapKey(caller, typeof signerId === "string" ? signerId : undefined);
         return key.ok ? ok(toBase64Url(key.value)) : key;
       }
       case "evolustr_enroll_passkey":
@@ -811,6 +880,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     needsHeal = false;
     candidate = null;
     previousM = null;
+    earlierMs = null;
     if (pubkey !== null) await host.cache?.remove(pubkey);
   };
 
@@ -823,6 +893,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     rotateMaster,
     getHostSecret,
     getPreviousHostSecret,
+    getPreviousHostSecrets,
     isProtectedEvent,
     appIdFor,
     lock,

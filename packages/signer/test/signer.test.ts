@@ -1,7 +1,7 @@
 import { type Bytes, VAULT_KIND, appVaultDTag, memoryPasskeys, memoryRelays, signerVaultDTag, unwrap } from "@evolustr/core";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { describe, expect, it } from "vitest";
-import { type SignerHost, createEvolustrSigner, mergeSignerVaults, parseSignerVault, signerWrapTag } from "../src/index.ts";
+import { type SignerHost, MAX_PREVIOUS_MASTERS, createEvolustrSigner, mergeSignerVaults, parseSignerVault, signerWrapTag } from "../src/index.ts";
 
 const URLS = ["wss://r1"];
 const SIGNER = "https://signer.example";
@@ -496,6 +496,46 @@ describe("@evolustr/signer", () => {
         const b2 = createEvolustrSigner(t.host({ cache: deviceB, allowSkWrap: false, passkeys: passkeys(t) }));
         expect(unwrap(await b2.getWrapKey(web("https://a.example")))).toEqual(key);
         expect(unwrap(await b2.capabilities(web("https://a.example"))).previousSignerId).toBeNull();
+      });
+
+      it("keeps every earlier M: an app that skipped rotations still gets its old key (#58)", async () => {
+        const t = setup();
+        const { s, oldKey } = await moved(t);
+        const app = web("https://a.example");
+        const first = unwrap(await s.capabilities(app)).signerId!;
+        const settings0 = unwrap(await s.getHostSecret("nostr-shard-signer/v1/settings"));
+        unwrap(await s.rotateMaster());
+        const second = unwrap(await s.capabilities(app)).signerId!;
+        const key1 = unwrap(await s.getWrapKey(app));
+        unwrap(await s.rotateMaster());
+        unwrap(await s.rotateMaster());
+        const caps = unwrap(await s.capabilities(app));
+        expect(caps.previousSignerIds).toHaveLength(3);
+        expect(caps.previousSignerIds.slice(1)).toEqual([second, first]);
+        expect(caps.previousSignerId).toBe(caps.previousSignerIds[0]);
+        expect(unwrap(await s.getPreviousWrapKey(app, first))).toEqual(oldKey);
+        expect(unwrap(await s.getPreviousWrapKey(app, second))).toEqual(key1);
+        expect(await s.getPreviousWrapKey(app, "00".repeat(8))).toMatchObject({ ok: false, error: { type: "noPreviousKey" } });
+        expect(unwrap(await s.handle("evolustr_get_previous_wrap_key", [first], app))).toBeTypeOf("string");
+        expect(await s.handle("evolustr_get_previous_wrap_key", ["nope"], app)).toMatchObject({ ok: false, error: { type: "badRequest" } });
+        const hostSecrets = unwrap(await s.getPreviousHostSecrets("nostr-shard-signer/v1/settings"));
+        expect(hostSecrets).toHaveLength(3);
+        expect(hostSecrets[2]).toEqual(settings0);
+        // A fresh session (another device with the same passkey) reads the chain from the relays.
+        const other = createEvolustrSigner(t.host({ cache: deviceCache(), allowSkWrap: false, passkeys: passkeys(t) }));
+        expect(unwrap(await other.getPreviousWrapKey(app, first))).toEqual(oldKey);
+        const onRelay = unwrap(parseSignerVault((await latest(t)).content));
+        expect(onRelay.older).toHaveLength(2);
+      });
+
+      it("a vault with only `previous` (before #58) still reads, and the chain is capped", async () => {
+        const entry = { mId: "aa".repeat(8), iv: "AAAA", ct: "AAAA" };
+        const wrap = { type: "passkey" as const, rpId: "signer.example", credId: "c", iv: "i", ct: "c" };
+        expect(unwrap(parseSignerVault(JSON.stringify({ v: 1, wraps: [wrap], previous: entry }))).older).toBeUndefined();
+        const tooMany = Array.from({ length: MAX_PREVIOUS_MASTERS }, () => entry);
+        expect(parseSignerVault(JSON.stringify({ v: 1, wraps: [wrap], previous: entry, older: tooMany }))).toMatchObject({ ok: false });
+        const longer = mergeSignerVaults({ v: 1, wraps: [wrap], previous: entry, older: [entry] }, { v: 1, wraps: [wrap], previous: entry, older: [entry, entry] });
+        expect(longer.older).toHaveLength(2);
       });
 
       it("is refused while the nsec may still unlock the key", async () => {

@@ -296,6 +296,8 @@ interface EvolustrSignerApi {
     recoverable: boolean;          // M survives losing this device: sk wrap or a synced signer passkey
     nsecProtected: boolean;        // M has an sk wrap now
     nsecExposed: boolean;          // an sk wrap exists or existed for this M (§5.7)
+    previousSignerId: string | null;      // after a rotation: the previous M's signer id (§5.7)
+    previousSignerIds: string[];          // every earlier M's, newest first (#58)
   }>;
   /** Wrap key for the caller's app vault. The signer computes appId itself.
    *  If M is locked (ready === false), the signer first shows its own Unlock UI
@@ -325,7 +327,7 @@ The signer side of Evolustr is a package in this repo, so a signer adds the API 
 - request handling for `window.nostr.evolustr`, `evolustr_*` (NIP-46) and NIP-55
 - the auto-approve filter for vault events (§5.5 rule 2)
 - optionally, cross-app secrets ([SECRETS.md](SECRETS.md))
-- **host secrets:** `getHostSecret(label)` = `HKDF(M, "evolustr/v1|host|" + label)`, a secret from `M` for the host signer's own data (e.g. its synced settings), namespaced apart from app keys (`evolustr/v1|app|…`). Host-only: no request method returns it, so apps can't obtain it. It survives a change of the signer's address, unlike a key derived from the signer's own app id.
+- **host secrets:** `getHostSecret(label)` = `HKDF(M, "evolustr/v1|host|" + label)`, a secret from `M` for the host signer's own data (e.g. its synced settings), namespaced apart from app keys (`evolustr/v1|app|…`). Host-only: no request method returns it, so apps can't obtain it. It survives a change of the signer's address, unlike a key derived from the signer's own app id. After a rotation (§5.7), `getPreviousHostSecret(label)` gives it under the previous `M`, and `getPreviousHostSecrets(label)` under every earlier one, newest first, so the host can move its data across.
 
 The host signer supplies what only it knows: who is calling, how to sign, and how to ask the user.
 
@@ -375,9 +377,10 @@ Thin adapters cover the common hosts: `adapters/iframe` (postMessage signers), `
 - **Replacing `M` (#52 phase B)** removes that access for what is written afterwards. `rotateMaster()`, from a click in the signer with a signer passkey and `allowSkWrap` false, creates `M'` sealed only with that passkey; other signer passkeys must be enrolled again. The signer vault then has:
   - `mId = hex(HKDF(M', "evolustr/v1/signer-mid", 8))` (every vault gets its `mId` once a wrap opens);
   - `rotatedFrom = { mId, proof: hex(HMAC-SHA256(HKDF(M, "evolustr/v1/signer-rotate"), mId')) }`;
-  - `previous`: `M` sealed with `HKDF(M', "evolustr/v1/signer-previous")`, AAD `"evolustr/v1|signer|" + pubkey + "|" + signerKey + "|previous|" + mId`, so apps can still get their old key (`evolustr_get_previous_wrap_key`) and open their old wrap. Only one previous `M` is kept.
+  - `previous`: `M` sealed with `HKDF(M', "evolustr/v1/signer-previous")`, AAD `"evolustr/v1|signer|" + pubkey + "|" + signerKey + "|previous|" + mId`, so apps can still get their old key (`evolustr_get_previous_wrap_key`) and open their old wrap.
+  - `older` (#58): the Ms before that, newest first, each sealed the same way under the `M` before it in the chain (`older[0]` under the `M` in `previous`). A rotation moves `previous` and `older` down one place unchanged, so nothing is re-sealed, and keeps at most 16 earlier Ms in all. An app that skipped several rotations still finds its old key. Signers from before #58 read `previous` and ignore `older`.
 
-  Versions with different `mId` are never merged. A device holding the old `M` follows the new vault only when its `M` verifies `rotatedFrom`, then forgets the old `M` and unlocks `M'` with a passkey; otherwise it keeps its copy and its key. Someone who has the old `M` can forge a rotation too: that only locks the user's devices out of the signer (they can't open the forger's `M'`), it gives the forger nothing, and a device that still allows the `sk` wrap trusts the nsec anyway. Capabilities report `previousSignerId`; each app then replaces its `R` and `S` with `rotateRoot()` (§3.2 rule 10), because whoever had the old `M` could open its old wrap.
+  Versions with different `mId` are never merged. A device holding the old `M` follows the new vault only when its `M` verifies `rotatedFrom`, then forgets the old `M` and unlocks `M'` with a passkey; otherwise it keeps its copy and its key. Someone who has the old `M` can forge a rotation too: that only locks the user's devices out of the signer (they can't open the forger's `M'`), it gives the forger nothing, and a device that still allows the `sk` wrap trusts the nsec anyway. Capabilities report `previousSignerId` (the previous `M`'s signer id for the app) and `previousSignerIds` (every earlier `M`'s, newest first); `evolustr_get_previous_wrap_key` takes an optional signer id from that list, else gives the previous `M`'s key. Each app then replaces its `R` and `S` with `rotateRoot()` (§3.2 rule 10), because whoever had the old `M` could open its old wrap.
 - **Passthrough mode** (extension or bunker through the bridge) has no nsec, so the API is available only after the user enrolls a signer passkey. The signer's own vault event is then signed by the extension or bunker, through the bridge. The parent page sees only the AES-encrypted vault: it could block the publish, but not read or forge `M`.
 - Per-app separation relies on `event.origin`, not on the `clientId` allowlist, so it holds in the looser version too.
 
@@ -671,7 +674,7 @@ interface SharedSettings {
 5. **Known nsite gateways:** who maintains the list, and how it is distributed (config or a Nostr list event).
 6. **NIP-46 method names:** agree on them with bunker developers, ideally as a NIP.
 7. **Adding a device without the phrase:** a way for a device that has `R` to hand it to a new device the user is holding (for example a QR code shown on one and scanned by the other), so users in `compatible` mode don't need the recovery phrase to add a strong method on a second device.
-8. ~~**Rotating `M`**~~ Done (§5.7): apps open their old wrap through `previous`, then `rotateRoot()`. Open: only one previous `M` is kept, so an app that skipped a rotation needs another method or the phrase after the second one.
+8. ~~**Rotating `M`**~~ Done (§5.7): apps open their old wrap through `previous` (or `older`, for an app that skipped rotations, #58), then `rotateRoot()`.
 
 ---
 

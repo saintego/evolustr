@@ -79,7 +79,7 @@ import {
   vaultEvent,
 } from "@evolustr/core";
 import type { SecretCache } from "./cache.ts";
-import type { CapableSigner, SignerCapabilities } from "./capable.ts";
+import { type CapableSigner, earlierSignerIds, type SignerCapabilities } from "./capable.ts";
 import type { CreatedPasskey, Passkeys } from "@evolustr/core";
 import { fetchSharedSettings, publishSharedSettings } from "./settings.ts";
 import {
@@ -392,21 +392,25 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       const opened = openRootWrap(ctx, wrap, key);
       if (opened.ok) return opened;
     }
-    // After the signer replaced its key, the wrap made with the old one (#52 phase B).
-    const previous = c.previousSignerId == null ? [] : wrapsFor(c.previousSignerId);
-    if (previous.length > 0 && capable.getPreviousWrapKey !== undefined) {
-      let oldKey: Bytes;
-      try {
-        oldKey = await capable.getPreviousWrapKey();
-      } catch (e) {
-        return error("signerRefused", e instanceof Error ? e.message : String(e));
-      }
-      for (const wrap of previous) {
-        const opened = openRootWrap(ctx, wrap, oldKey);
-        if (opened.ok) return opened;
+    // After the signer replaced its key, the wrap made with an earlier one (#52
+    // phase B), however many replacements ago (#58).
+    const earlier = earlierSignerIds(c).map((id, n) => ({ id, n, wraps: wrapsFor(id) })).filter((x) => x.wraps.length > 0);
+    if (capable.getPreviousWrapKey !== undefined) {
+      for (const { id, n, wraps: old } of earlier) {
+        let oldKey: Bytes;
+        try {
+          // The newest needs no id, so signers from before #58 still answer.
+          oldKey = await capable.getPreviousWrapKey(n === 0 ? undefined : id);
+        } catch (e) {
+          return error("signerRefused", e instanceof Error ? e.message : String(e));
+        }
+        for (const wrap of old) {
+          const opened = openRootWrap(ctx, wrap, oldKey);
+          if (opened.ok) return opened;
+        }
       }
     }
-    if (wraps.length === 0 && previous.length === 0) return error("noSignerWrap", "This signer has no wrap in the vault yet");
+    if (wraps.length === 0 && earlier.length === 0) return error("noSignerWrap", "This signer has no wrap in the vault yet");
     return error("signerRefused", "The signer's key didn't open its wrap");
   };
 
@@ -633,7 +637,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       (caps?.nsecProtected === true || caps?.nsecExposed === true) &&
       caps.signerId !== null &&
       signerWrapFor(s.vault, caps.signerId) !== undefined,
-    rootExposed: caps?.previousSignerId != null && signerWrapFor(s.vault, caps.previousSignerId) !== undefined,
+    rootExposed: caps != null && earlierSignerIds(caps).some((id) => signerWrapFor(s.vault, id) !== undefined),
     backupRecommended:
       s.vault.mode === "strict" &&
       backupRequirement(backupState.methods.map((m) => m.method), backupState.phraseConfirmed) !== "none",
@@ -761,7 +765,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     const signerHasWrap =
       caps !== null &&
       ((caps.signerId !== null && signerWrapFor(vault, caps.signerId) !== undefined) ||
-        (caps.previousSignerId != null && signerWrapFor(vault, caps.previousSignerId) !== undefined));
+        earlierSignerIds(caps).some((id) => signerWrapFor(vault, id) !== undefined));
     if (caps?.ready === true && signerHasWrap) {
       const root = await rootFromSigner(ctx, vault);
       if (root.ok) {

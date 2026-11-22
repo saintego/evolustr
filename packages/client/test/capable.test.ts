@@ -195,4 +195,22 @@ describe("backup check with a capable signer (#42)", () => {
     expect(unwrap(d.exportEvoluMnemonic())).toBe(unwrap(c.exportEvoluMnemonic()));
   });
 
+  it("an app the user didn't open across two key replacements still opens through the signer (#58)", async () => {
+    const w = world();
+    const app = "https://notes.example";
+    const a = w.device(app);
+    await ready(a);
+    unwrap(await a.makeStrict());
+    const mnemonic = unwrap(a.exportEvoluMnemonic());
+    const signerDevice = w.deviceWith(app, { nsecAllowed: false });
+    unwrap(await signerDevice.signer.enrollPasskey());
+    unwrap(await signerDevice.signer.rotateMaster());
+    unwrap(await signerDevice.signer.rotateMaster());
+    const c = w.deviceWith(app, { nsecAllowed: false }).client;
+    expect(unwrap(await c.connect())).toEqual({ state: "needsUserAction", action: "signerUnlock" });
+    expect(unwrap(await c.unlock()).status).toMatchObject({ mode: "strict", rootExposed: true });
+    expect(unwrap(c.exportEvoluMnemonic())).toBe(mnemonic);
+    expect(unwrap(await c.rotateRoot())).toMatchObject({ mode: "strict", rootExposed: false });
+  });
+
 });
