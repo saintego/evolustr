@@ -16,7 +16,7 @@ const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
 
 /** Relays over nostr-tools, tracking EOSE per relay (SPEC §6.2 rule 1). */
 export const poolRelays = (pool: SimplePool = new SimplePool()): Relays => ({
-  query: async (urls, filter, timeoutMs) => {
+  query: async (urls, filter, timeoutMs, opts) => {
     const events = new Map<string, NostrEvent>();
     const idsByRelay = new Map<string, Set<string>>();
     const one = async (url: string): Promise<boolean> => {
@@ -57,12 +57,27 @@ export const poolRelays = (pool: SimplePool = new SimplePool()): Relays => ({
         return false;
       }
     };
-    const results = await Promise.all(urls.map(async (url) => [url, await one(url)] as const));
+    // With a quorum, return as soon as that many relays answered; the rest count as failed.
+    const quorum = Math.min(opts?.quorum ?? urls.length, urls.length);
+    const answered: string[] = [];
+    await new Promise<void>((resolve) => {
+      let finished = 0;
+      if (urls.length === 0) return resolve();
+      for (const url of urls) {
+        void one(url).then((ok) => {
+          finished++;
+          if (ok) answered.push(url);
+          if (answered.length >= quorum || finished === urls.length) resolve();
+        });
+      }
+    });
+    const done = new Set(answered);
     return {
+      // Events from a relay still waiting are kept: the newest version wins either way.
       events: [...events.values()],
-      answered: results.filter(([, ok]) => ok).map(([u]) => u),
-      failed: results.filter(([, ok]) => !ok).map(([u]) => u),
-      idsByRelay,
+      answered: [...answered],
+      failed: urls.filter((u) => !done.has(u)),
+      idsByRelay: new Map([...idsByRelay].filter(([u]) => done.has(u))),
     };
   },
   publish: async (urls, event, timeoutMs) => {

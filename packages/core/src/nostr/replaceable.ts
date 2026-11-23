@@ -9,9 +9,9 @@ export type FetchedEvent =
       /** Relays that answered without this newest version; send it to them (#32). */
       readonly missingOn: ReadonlyArray<string>;
     }
-  /** Every relay answered and none has the event. */
+  /** Every relay (or the quorum) answered and none has the event. */
   | { readonly kind: "none" }
-  /** No event found, but not every relay answered: don't treat it as missing. */
+  /** No event found, but not enough relays answered: don't treat it as missing. */
   | { readonly kind: "incomplete" };
 
 export interface Address {
@@ -30,20 +30,26 @@ const matches = (e: NostrEvent, a: Address): boolean =>
 export const newest = (events: ReadonlyArray<NostrEvent>): NostrEvent | undefined =>
   [...events].sort((x, y) => y.created_at - x.created_at || (x.id < y.id ? -1 : 1))[0];
 
-/** Fetches the newest replaceable event at an address from all relays. */
+/**
+ * Fetches the newest replaceable event at an address. Waits for every relay,
+ * or with `quorum` until that many answered (#60); "none" needs them all, or
+ * the quorum.
+ */
 export const fetchReplaceable = async (
   relays: Relays,
   urls: ReadonlyArray<string>,
   address: Address,
   timeoutMs = 5000,
+  quorum?: number,
 ): Promise<FetchedEvent> => {
   const result = await relays.query(
     urls,
     { kinds: [address.kind], authors: [address.author], "#d": [address.d] },
     timeoutMs,
+    quorum === undefined ? undefined : { quorum },
   );
   const event = newest(result.events.filter((e) => matches(e, address)));
-  const complete = result.failed.length === 0;
+  const complete = result.failed.length === 0 || (quorum !== undefined && result.answered.length >= Math.min(quorum, urls.length));
   if (event !== undefined) {
     const missingOn = result.idsByRelay === undefined ? [] : result.answered.filter((u) => !result.idsByRelay!.get(u)?.has(event.id));
     return { kind: "found", event, complete, missingOn };

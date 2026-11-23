@@ -5,10 +5,12 @@ import { VAULT_KIND, fetchReplaceable, poolRelays, publishReplaceable, secretKey
 import { startTestRelay } from "./support/relay.ts";
 
 const relay = startTestRelay(7790);
+const silent = startTestRelay(7791, { silent: true });
 const pool = new SimplePool();
 afterAll(async () => {
   pool.destroy();
   await relay.close();
+  await silent.close();
 });
 
 // Unreachable relays are covered with memoryRelays: in Node, nostr-tools closes a
@@ -18,6 +20,17 @@ describe("poolRelays against a real WebSocket relay", () => {
     const relays = poolRelays(pool);
     const r = await relays.query(["ws://localhost:7790"], { kinds: [VAULT_KIND], "#d": ["nothing"] }, 3000);
     expect(r).toMatchObject({ answered: ["ws://localhost:7790"], failed: [] });
+  });
+
+  it("with a quorum, doesn't wait for a relay that never answers (#60)", async () => {
+    const relays = poolRelays(pool);
+    const urls = ["ws://localhost:7790", "ws://localhost:7791"];
+    const start = Date.now();
+    const r = await relays.query(urls, { kinds: [VAULT_KIND], "#d": ["nothing"] }, 3000, { quorum: 1 });
+    expect(Date.now() - start).toBeLessThan(2000);
+    expect(r).toMatchObject({ answered: ["ws://localhost:7790"], failed: ["ws://localhost:7791"] });
+    const f = await fetchReplaceable(relays, urls, { author: "00".repeat(32), kind: VAULT_KIND, d: "nothing" }, 3000, 1);
+    expect(f).toEqual({ kind: "none" });
   });
 
   it("publishes and fetches a replaceable event", async () => {

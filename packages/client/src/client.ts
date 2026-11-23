@@ -123,6 +123,12 @@ export interface ClientDeps {
 export interface ClientOptions {
   readonly appId: string;
   readonly relayUrls: ReadonlyArray<string>;
+  /**
+   * Enough relays to trust a read, e.g. that no vault exists (#60): reads stop
+   * waiting once this many answered, so one slow relay doesn't hold them up.
+   * Default: every relay in `relayUrls`.
+   */
+  readonly relayQuorum?: number;
   /** Only strict databases (SPEC §3.2 rule 1). Needs passkeys or a capable signer. */
   readonly requireStrong?: boolean;
   readonly timeoutMs?: number;
@@ -357,7 +363,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
   let lastEventAt = 0;
   let settingsState: { readonly app: SettingsDoc; readonly shared: SettingsDoc } = { app: emptySettings, shared: emptySettings };
   const settingsDefaults = options.settingsDefaults ?? defaultSettings();
-  const settingsIo = { signer: deps.signer, relays: deps.relays, relayUrls: options.relayUrls, timeoutMs };
+  const settingsIo = { signer: deps.signer, relays: deps.relays, relayUrls: options.relayUrls, timeoutMs, ...(options.relayQuorum === undefined ? {} : { relayQuorum: options.relayQuorum }) };
   let passkeySupported = false;
   let backupState: { readonly methods: ReadonlyArray<KnownMethod>; readonly phraseConfirmed: boolean } = {
     methods: [],
@@ -469,6 +475,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
       urls,
       { author: ctx.pubkey, kind: VAULT_KIND, d: appVaultDTag(ctx.pubkey, ctx.appId) },
       timeoutMs,
+      options.relayQuorum,
     );
     if (f.kind === "none") return { kind: "none" };
     if (f.kind === "incomplete") return { kind: "unreadable" };

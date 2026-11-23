@@ -109,6 +109,23 @@ describe("@evolustr/signer", () => {
     expect(unwrap(await b.capabilities(web("https://a.example"))).signerPasskey).toBe(true);
   });
 
+  it("with a relay quorum, one relay down doesn't block enrolling a passkey (#60)", async () => {
+    const t = setup();
+    const urls = ["wss://r1", "wss://r2", "wss://r3"];
+    const downRelays = {
+      ...t.mem.relays,
+      query: async (u: ReadonlyArray<string>, f: Parameters<typeof t.mem.relays.query>[1], ms: number) => {
+        const r = await t.mem.relays.query(u.filter((x) => x !== "wss://r3"), f, ms);
+        return { ...r, failed: [...r.failed, "wss://r3"] };
+      },
+    };
+    const passkeys = () => memoryPasskeys({ rpId: "signer.example", store: t.passkeyStore });
+    const strict = createEvolustrSigner(t.host({ holdsNsec: false, relays: downRelays, relayUrls: urls, passkeys: passkeys() }));
+    expect(await strict.enrollPasskey()).toMatchObject({ ok: false, error: { type: "relaysUnavailable" } });
+    const quorum = createEvolustrSigner(t.host({ holdsNsec: false, relays: downRelays, relayUrls: urls, relayQuorum: 2, passkeys: passkeys() }));
+    unwrap(await quorum.enrollPasskey());
+  });
+
   it("with allowSkWrap false the nsec isn't used and no sk wrap is stored", async () => {
     const t = setup();
     const s = createEvolustrSigner(t.host({ allowSkWrap: false, passkeys: memoryPasskeys({ rpId: "signer.example" }) }));

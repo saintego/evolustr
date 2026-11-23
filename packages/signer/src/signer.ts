@@ -144,6 +144,12 @@ export interface SignerHost {
   readonly now?: () => number;
   readonly randomBytes?: (length: number) => Bytes;
   readonly timeoutMs?: number;
+  /**
+   * Enough relays to trust a read, e.g. that no vault exists (#60): reads stop
+   * waiting once this many answered, so one slow relay doesn't hold them up.
+   * Default: every relay in `relayUrls`.
+   */
+  readonly relayQuorum?: number;
 }
 
 export interface Capabilities {
@@ -431,6 +437,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
       host.relayUrls,
       { author: pubkey, kind: VAULT_KIND, d: signerVaultDTag(pubkey, host.signerKey) },
       timeoutMs,
+      host.relayQuorum,
     );
     if (f.kind === "none") return ok(null);
     if (f.kind === "incomplete") return error("relaysUnavailable", "Not every relay answered");

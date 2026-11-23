@@ -51,6 +51,14 @@ describe("vault events over relays", () => {
     expect(await fetchReplaceable(relays, URLS, addr)).toEqual({ kind: "none" });
   });
 
+  it("with a quorum, none once that many relays answered (#60)", async () => {
+    const { pubkey } = user();
+    const { relays } = memoryRelays({ down: new Set(["wss://r3"]) });
+    const addr = { author: pubkey, kind: VAULT_KIND, d: "evolustr:v1:x" };
+    expect(await fetchReplaceable(relays, URLS, addr, 5000, 2)).toEqual({ kind: "none" });
+    expect(await fetchReplaceable(relays, URLS, addr, 5000, 3)).toEqual({ kind: "incomplete" });
+  });
+
   it("picks the newest version when relays disagree", async () => {
     const { signer, pubkey } = user();
     const mem = memoryRelays();

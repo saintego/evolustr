@@ -20,11 +20,13 @@ export interface SettingsIo {
   readonly relays: Relays;
   readonly relayUrls: ReadonlyArray<string>;
   readonly timeoutMs: number;
+  /** See ClientOptions.relayQuorum. */
+  readonly relayQuorum?: number;
 }
 
 /** Fetches and decrypts the shared settings; an absent event is an empty document. */
 export const fetchSharedSettings = async (io: SettingsIo, pubkey: string): Promise<Result<SettingsDoc, EvolustrError>> => {
-  const f = await fetchReplaceable(io.relays, io.relayUrls, { author: pubkey, kind: VAULT_KIND, d: SETTINGS_DTAG }, io.timeoutMs);
+  const f = await fetchReplaceable(io.relays, io.relayUrls, { author: pubkey, kind: VAULT_KIND, d: SETTINGS_DTAG }, io.timeoutMs, io.relayQuorum);
   if (f.kind === "none") return ok(emptySettings);
   if (f.kind === "incomplete") return error("relaysUnavailable", "Not every relay answered");
   try {
