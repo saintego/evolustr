@@ -3,7 +3,8 @@ import { matchFilter, type Filter } from "nostr-tools/filter";
 import { type Event, verifyEvent } from "nostr-tools/pure";
 import { WebSocketServer } from "ws";
 
-export const startTestRelay = (port: number) => {
+/** `silent`: accepts subscriptions but never answers them (a laggy relay, #60). */
+export const startTestRelay = (port: number, opts: { readonly silent?: boolean } = {}) => {
   const events: Event[] = [];
   const wss = new WebSocketServer({ port });
   const dTag = (e: Event) => e.tags.find((t) => t[0] === "d")?.[1] ?? "";
@@ -20,6 +21,8 @@ export const startTestRelay = (port: number) => {
         }
         events.push(e);
         ws.send(JSON.stringify(["OK", e.id, true, ""]));
+      } else if (msg[0] === "REQ" && opts.silent === true) {
+        return;
       } else if (msg[0] === "REQ") {
         const [, sub, ...filters] = msg as [string, string, ...Filter[]];
         for (const e of events) if (filters.some((f) => matchFilter(f, e))) ws.send(JSON.stringify(["EVENT", sub, e]));
