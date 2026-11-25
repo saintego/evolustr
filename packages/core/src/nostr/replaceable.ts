@@ -1,5 +1,5 @@
 import { isValidEvent } from "./verify.ts";
-import type { NostrEvent, Relays, Signer, UnsignedEvent } from "./types.ts";
+import type { NostrEvent, QueryResult, Relays, Signer, UnsignedEvent } from "./types.ts";
 
 export type FetchedEvent =
   | {
@@ -9,7 +9,10 @@ export type FetchedEvent =
       /** Relays that answered without this newest version; send it to them (#32). */
       readonly missingOn: ReadonlyArray<string>;
     }
-  /** Every relay (or the quorum) answered and none has the event. */
+  /**
+   * No relay has the event, and every relay answered or failed hard (refused
+   * the connection): none may still hold it (#62). A quorum never decides this.
+   */
   | { readonly kind: "none" }
   /** No event found, but not enough relays answered: don't treat it as missing. */
   | { readonly kind: "incomplete" };
@@ -32,8 +35,12 @@ export const newest = (events: ReadonlyArray<NostrEvent>): NostrEvent | undefine
 
 /**
  * Fetches the newest replaceable event at an address. Waits for every relay,
- * or with `quorum` until that many answered (#60); "none" needs them all, or
- * the quorum.
+ * or with `quorum` until that many answered (#60), which is for reads that
+ * only unlock: "found" may come from the quorum, "none" never does (#62). With
+ * nothing found at the quorum, it waits for the other relays.
+ *
+ * Before publishing a new version, read without `quorum`: a version found at
+ * the quorum may be stale, and a write based on it would replace a newer one.
  */
 export const fetchReplaceable = async (
   relays: Relays,
@@ -42,19 +49,24 @@ export const fetchReplaceable = async (
   timeoutMs = 5000,
   quorum?: number,
 ): Promise<FetchedEvent> => {
-  const result = await relays.query(
+  const first = await relays.query(
     urls,
     { kinds: [address.kind], authors: [address.author], "#d": [address.d] },
     timeoutMs,
     quorum === undefined ? undefined : { quorum },
   );
-  const event = newest(result.events.filter((e) => matches(e, address)));
-  const complete = result.failed.length === 0 || (quorum !== undefined && result.answered.length >= Math.min(quorum, urls.length));
+  const found = (r: QueryResult) => newest(r.events.filter((e) => matches(e, address)));
+  // Nothing at the quorum: the fastest relays may be the ones that lack it, so wait for the others.
+  const result = found(first) === undefined && first.rest !== undefined ? await first.rest : first;
+  const event = found(result);
   if (event !== undefined) {
+    const complete = result.failed.length === 0 || (quorum !== undefined && result.answered.length >= Math.min(quorum, urls.length));
     const missingOn = result.idsByRelay === undefined ? [] : result.answered.filter((u) => !result.idsByRelay!.get(u)?.has(event.id));
     return { kind: "found", event, complete, missingOn };
   }
-  return complete ? { kind: "none" } : { kind: "incomplete" };
+  // "None" only when no relay may still have it: answered, or failed hard.
+  const pending = result.pending ?? result.failed;
+  return pending.length === 0 && result.answered.length > 0 ? { kind: "none" } : { kind: "incomplete" };
 };
 
 /**

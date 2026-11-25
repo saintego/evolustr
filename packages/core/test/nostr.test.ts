@@ -51,12 +51,23 @@ describe("vault events over relays", () => {
     expect(await fetchReplaceable(relays, URLS, addr)).toEqual({ kind: "none" });
   });
 
-  it("with a quorum, none once that many relays answered (#60)", async () => {
+  it("a quorum never decides none: an unreachable relay may hold it (#62)", async () => {
     const { pubkey } = user();
     const { relays } = memoryRelays({ down: new Set(["wss://r3"]) });
     const addr = { author: pubkey, kind: VAULT_KIND, d: "evolustr:v1:x" };
-    expect(await fetchReplaceable(relays, URLS, addr, 5000, 2)).toEqual({ kind: "none" });
+    expect(await fetchReplaceable(relays, URLS, addr, 5000, 2)).toEqual({ kind: "incomplete" });
     expect(await fetchReplaceable(relays, URLS, addr, 5000, 3)).toEqual({ kind: "incomplete" });
+  });
+
+  it("a relay that refuses the connection doesn't block none for good (#62)", async () => {
+    const { pubkey } = user();
+    const addr = { author: pubkey, kind: VAULT_KIND, d: "evolustr:v1:x" };
+    const { relays } = memoryRelays({ refused: new Set(["wss://r3"]) });
+    expect(await fetchReplaceable(relays, URLS, addr)).toEqual({ kind: "none" });
+    expect(await fetchReplaceable(relays, URLS, addr, 5000, 2)).toEqual({ kind: "none" });
+    // Every relay refusing says nothing.
+    const allRefused = memoryRelays({ refused: new Set(URLS) });
+    expect(await fetchReplaceable(allRefused.relays, URLS, addr)).toEqual({ kind: "incomplete" });
   });
 
   it("picks the newest version when relays disagree", async () => {

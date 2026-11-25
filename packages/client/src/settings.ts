@@ -24,9 +24,12 @@ export interface SettingsIo {
   readonly relayQuorum?: number;
 }
 
-/** Fetches and decrypts the shared settings; an absent event is an empty document. */
-export const fetchSharedSettings = async (io: SettingsIo, pubkey: string): Promise<Result<SettingsDoc, EvolustrError>> => {
-  const f = await fetchReplaceable(io.relays, io.relayUrls, { author: pubkey, kind: VAULT_KIND, d: SETTINGS_DTAG }, io.timeoutMs, io.relayQuorum);
+/**
+ * Fetches and decrypts the shared settings; an absent event is an empty
+ * document. `full` waits for every relay, before a write (#62).
+ */
+export const fetchSharedSettings = async (io: SettingsIo, pubkey: string, full = false): Promise<Result<SettingsDoc, EvolustrError>> => {
+  const f = await fetchReplaceable(io.relays, io.relayUrls, { author: pubkey, kind: VAULT_KIND, d: SETTINGS_DTAG }, io.timeoutMs, full ? undefined : io.relayQuorum);
   if (f.kind === "none") return ok(emptySettings);
   if (f.kind === "incomplete") return error("relaysUnavailable", "Not every relay answered");
   try {

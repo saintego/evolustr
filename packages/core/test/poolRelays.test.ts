@@ -22,16 +22,30 @@ describe("poolRelays against a real WebSocket relay", () => {
     expect(r).toMatchObject({ answered: ["ws://localhost:7790"], failed: [] });
   });
 
-  it("with a quorum, doesn't wait for a relay that never answers (#60)", async () => {
+  it("with a quorum, doesn't wait for a relay that never answers (#60), but keeps it pending (#62)", async () => {
     const relays = poolRelays(pool);
     const urls = ["ws://localhost:7790", "ws://localhost:7791"];
     const start = Date.now();
     const r = await relays.query(urls, { kinds: [VAULT_KIND], "#d": ["nothing"] }, 3000, { quorum: 1 });
     expect(Date.now() - start).toBeLessThan(2000);
-    expect(r).toMatchObject({ answered: ["ws://localhost:7790"], failed: ["ws://localhost:7791"] });
+    expect(r).toMatchObject({ answered: ["ws://localhost:7790"], failed: ["ws://localhost:7791"], pending: ["ws://localhost:7791"] });
+    // The rest: the silent relay times out, still pending (it may hold the event).
+    expect(await r.rest).toMatchObject({ answered: ["ws://localhost:7790"], pending: ["ws://localhost:7791"] });
+    // Nothing found at the quorum: the silent relay might have it, so not "none".
     const f = await fetchReplaceable(relays, urls, { author: "00".repeat(32), kind: VAULT_KIND, d: "nothing" }, 3000, 1);
-    expect(f).toEqual({ kind: "none" });
-  });
+    expect(f).toEqual({ kind: "incomplete" });
+  }, 15000);
+
+  it("with a quorum, a found event returns without waiting (#60)", async () => {
+    const sk = generateSecretKey();
+    const relays = poolRelays(pool);
+    const event = { kind: VAULT_KIND, created_at: 11, tags: [["d", "evolustr:quorum"]], content: "here" };
+    await publishReplaceable(relays, ["ws://localhost:7790"], secretKeySigner(sk), event, 3000);
+    const start = Date.now();
+    const f = await fetchReplaceable(relays, ["ws://localhost:7790", "ws://localhost:7791"], { author: getPublicKey(sk), kind: VAULT_KIND, d: "evolustr:quorum" }, 3000, 1);
+    expect(Date.now() - start).toBeLessThan(2000);
+    expect(f.kind === "found" && f.event.content).toBe("here");
+  }, 10000);
 
   it("publishes and fetches a replaceable event", async () => {
     const sk = generateSecretKey();

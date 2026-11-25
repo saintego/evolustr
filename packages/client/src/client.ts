@@ -124,9 +124,10 @@ export interface ClientOptions {
   readonly appId: string;
   readonly relayUrls: ReadonlyArray<string>;
   /**
-   * Enough relays to trust a read, e.g. that no vault exists (#60): reads stop
+   * Enough relays to trust a vault an unlock found (#60): such reads stop
    * waiting once this many answered, so one slow relay doesn't hold them up.
-   * Default: every relay in `relayUrls`.
+   * "No vault" and reads before a write still wait for every relay (#62).
+   * Default: every relay.
    */
   readonly relayQuorum?: number;
   /** Only strict databases (SPEC §3.2 rule 1). Needs passkeys or a capable signer. */
@@ -469,13 +470,14 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
 
   // ── Relay helpers ──
 
-  const fetchVault = async (ctx: VaultContext, urls: ReadonlyArray<string> = options.relayUrls): Promise<Fetched> => {
+  /** `full`: wait for every relay, for a read a publish builds on (#62). */
+  const fetchVault = async (ctx: VaultContext, urls: ReadonlyArray<string> = options.relayUrls, full = false): Promise<Fetched> => {
     const f = await fetchReplaceable(
       deps.relays,
       urls,
       { author: ctx.pubkey, kind: VAULT_KIND, d: appVaultDTag(ctx.pubkey, ctx.appId) },
       timeoutMs,
-      options.relayQuorum,
+      full ? undefined : options.relayQuorum,
     );
     if (f.kind === "none") return { kind: "none" };
     if (f.kind === "incomplete") return { kind: "unreadable" };
@@ -597,7 +599,8 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     let toPublish = vault;
     progress("publishingVault");
     const sessionR = rootKey ?? (session.kind === "ready" && session.ctx.appId === ctx.appId ? session.r : undefined);
-    const current = known ?? (await fetchVault(ctx));
+    // With a quorum, what the caller fetched may be stale: read every relay before writing (#62).
+    const current = known !== undefined && options.relayQuorum === undefined ? known : await fetchVault(ctx, options.relayUrls, true);
     // Only root wraps come from the relay version: `vault` is the one this
     // device made or verified, and its header is part of the root data wrap's
     // AAD (#50). Without a root key here, the relay's root wraps mean nothing.
@@ -1426,7 +1429,7 @@ export const createEvolustr = (deps: ClientDeps, options: ClientOptions): Evolus
     setShared: async (key, value) => {
       const s = requireReady();
       if (!s.ok) return s;
-      const fetched = await fetchSharedSettings(settingsIo, s.value.ctx.pubkey);
+      const fetched = await fetchSharedSettings(settingsIo, s.value.ctx.pubkey, true); // a write: every relay (#62)
       if (!fetched.ok) return fetched;
       const at = Math.max(now(), lastEventAt + 1);
       const next = setSetting(mergeSettings(settingsState.shared, fetched.value), key, value, at);

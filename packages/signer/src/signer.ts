@@ -145,9 +145,10 @@ export interface SignerHost {
   readonly randomBytes?: (length: number) => Bytes;
   readonly timeoutMs?: number;
   /**
-   * Enough relays to trust a read, e.g. that no vault exists (#60): reads stop
+   * Enough relays to trust a vault an unlock found (#60): such reads stop
    * waiting once this many answered, so one slow relay doesn't hold them up.
-   * Default: every relay in `relayUrls`.
+   * "No vault" and reads before a write still wait for every relay (#62).
+   * Default: every relay.
    */
   readonly relayQuorum?: number;
 }
@@ -419,6 +420,8 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   let vault: SignerVault | null = null;
   /** True once the signer vault was read from the relays this session (#40). */
   let vaultLoaded = false;
+  /** That read waited for every relay, not a quorum (#62): safe to write on top of. */
+  let vaultFull = false;
   /** The relays lack wraps the local copy has (#41); fixed after an approved key request. */
   let needsHeal = false;
   let lastEventAt = 0;
@@ -431,13 +434,14 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
 
   const appIdFor = (caller: Caller) => appIdForCaller(caller, host.knownNsiteGateways);
 
-  const fetchVault = async (pubkey: string): Promise<Result<SignerVault | null>> => {
+  /** `full`: wait for every relay, for a read a write builds on (#62). */
+  const fetchVault = async (pubkey: string, full: boolean): Promise<Result<SignerVault | null>> => {
     const f = await fetchReplaceable(
       host.relays,
       host.relayUrls,
       { author: pubkey, kind: VAULT_KIND, d: signerVaultDTag(pubkey, host.signerKey) },
       timeoutMs,
-      host.relayQuorum,
+      full ? undefined : host.relayQuorum,
     );
     if (f.kind === "none") return ok(null);
     if (f.kind === "incomplete") return error("relaysUnavailable", "Not every relay answered");
@@ -448,11 +452,14 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
   /**
    * Loads the signer vault once per session; null when none exists (#40). With a
    * local copy (#41), it's merged with the relay version, or used instead of a
-   * missing or invalid one; `needsHeal` marks wraps the relays lack.
+   * missing or invalid one; `needsHeal` marks wraps the relays lack. With
+   * `forWrite`, a version read at the quorum is read again from every relay
+   * (#62): it may be stale, and a write on it would undo a newer one.
    */
-  const loadVault = async (pubkey: string): Promise<Result<SignerVault | null>> => {
-    if (vaultLoaded) return ok(vault);
-    const fetched = await fetchVault(pubkey);
+  const loadVault = async (pubkey: string, forWrite = false): Promise<Result<SignerVault | null>> => {
+    if (vaultLoaded && (vaultFull || !forWrite)) return ok(vault);
+    const full = forWrite || host.relayQuorum === undefined;
+    const fetched = await fetchVault(pubkey, full);
     if (!fetched.ok && fetched.error.type !== "invalidSignerVault") return fetched;
     const copyText = (await host.cache?.getVault?.(pubkey)) ?? null;
     const copy = copyText === null ? null : parseSignerVault(copyText);
@@ -477,12 +484,20 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
       needsHeal = vault.wraps.some((w) => !onRelays.has(JSON.stringify(w)));
     }
     vaultLoaded = true;
+    vaultFull = full;
     return ok(vault);
   };
 
   const publish = async (pubkey: string, next: SignerVault): Promise<Result<SignerVault>> => {
     // Never publish from an unknown state: it would drop wraps added elsewhere (#40).
     if (!vaultLoaded) return error("signerVaultUnknown", "Load the signer vault before changing it");
+    // Read at the quorum: check every relay first, and don't write over a newer version (#62).
+    if (!vaultFull) {
+      const before = JSON.stringify(vault);
+      const reread = await loadVault(pubkey, true);
+      if (!reread.ok) return reread;
+      if (JSON.stringify(vault) !== before) return error("signerVaultChanged", "The signer vault changed on another device; try again");
+    }
     const at = Math.max(now(), lastEventAt + 1);
     const signer: Signer = {
       getPublicKey: host.getPublicKey,
@@ -721,8 +736,8 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     const passkeys = host.passkeys;
     if (passkeys === undefined) return error("noPasskeys", "This signer has no passkey support");
     const pubkey = await host.getPublicKey();
-    // The current wrap list must be known before adding to it (#40).
-    const loaded = await loadVault(pubkey);
+    // The current wrap list must be known before adding to it (#40), from every relay (#62).
+    const loaded = await loadVault(pubkey, true);
     if (!loaded.ok) return loaded;
     const quiet = await unlockQuiet(pubkey, false);
     if (!quiet.ok) return quiet;
@@ -810,7 +825,7 @@ export const createEvolustrSigner = (host: SignerHost): EvolustrSigner => {
     // The point is to cut off whoever can recover the nsec: an sk wrap would bring it back.
     if (allowSk()) return error("nsecAllowed", "Turn off the nsec protection (allowSkWrap) before replacing the key");
     const pubkey = await host.getPublicKey();
-    const loaded = await loadVault(pubkey);
+    const loaded = await loadVault(pubkey, true); // a write: from every relay (#62)
     if (!loaded.ok) return loaded;
     if (vault === null) return error("noSignerVault", "This signer has no key to replace yet");
     const wraps = vault.wraps.filter(
