@@ -31,6 +31,31 @@ const setup = () => {
 
 const web = (origin: string) => ({ identity: "verified" as const, origin });
 
+/**
+ * Relays where `slow` answer only after `ms` (#62), with the quorum behaviour
+ * of poolRelays: a quorum read returns once enough fast relays answered, the
+ * slow ones pending, and `rest` gives everyone's answer.
+ */
+const timedRelays = (mem: ReturnType<typeof memoryRelays>, slow: ReadonlyArray<string>, ms = 300) => {
+  const published: string[][] = [];
+  const relays: typeof mem.relays = {
+    publish: (urls, event, timeoutMs) => {
+      published.push([...urls]);
+      return mem.relays.publish(urls, event, timeoutMs);
+    },
+    query: async (urls, filter, timeoutMs, opts) => {
+      const waiting = urls.filter((u) => slow.includes(u));
+      const full = () => new Promise((r) => setTimeout(r, ms)).then(() => mem.relays.query(urls, filter, timeoutMs));
+      const quorum = opts?.quorum ?? urls.length;
+      if (waiting.length === 0 || urls.length - waiting.length < quorum) return full();
+      const r = await mem.relays.query(urls.filter((u) => !slow.includes(u)), filter, timeoutMs);
+      return { ...r, failed: [...r.failed, ...waiting], pending: [...(r.pending ?? []), ...waiting], rest: full() };
+    },
+  };
+  return { relays, published };
+};
+const FOUR = ["wss://r1", "wss://r2", "wss://r3", "wss://r4"];
+
 describe("@evolustr/signer", () => {
   it("gives each app its own key, derived only from the caller", async () => {
     const t = setup();
@@ -109,21 +134,68 @@ describe("@evolustr/signer", () => {
     expect(unwrap(await b.capabilities(web("https://a.example"))).signerPasskey).toBe(true);
   });
 
-  it("with a relay quorum, one relay down doesn't block enrolling a passkey (#60)", async () => {
+  it("first use: an unreachable relay blocks it, also with a quorum; a refusing one doesn't (#60, #62)", async () => {
     const t = setup();
     const urls = ["wss://r1", "wss://r2", "wss://r3"];
-    const downRelays = {
-      ...t.mem.relays,
-      query: async (u: ReadonlyArray<string>, f: Parameters<typeof t.mem.relays.query>[1], ms: number) => {
-        const r = await t.mem.relays.query(u.filter((x) => x !== "wss://r3"), f, ms);
-        return { ...r, failed: [...r.failed, "wss://r3"] };
-      },
-    };
     const passkeys = () => memoryPasskeys({ rpId: "signer.example", store: t.passkeyStore });
-    const strict = createEvolustrSigner(t.host({ holdsNsec: false, relays: downRelays, relayUrls: urls, passkeys: passkeys() }));
-    expect(await strict.enrollPasskey()).toMatchObject({ ok: false, error: { type: "relaysUnavailable" } });
-    const quorum = createEvolustrSigner(t.host({ holdsNsec: false, relays: downRelays, relayUrls: urls, relayQuorum: 2, passkeys: passkeys() }));
-    unwrap(await quorum.enrollPasskey());
+    // Unreachable: it may hold the vault, so no new one is made.
+    const unreachable = memoryRelays({ down: new Set(["wss://r3"]) }).relays;
+    for (const relayQuorum of [undefined, 2]) {
+      const s = createEvolustrSigner(t.host({ holdsNsec: false, relays: unreachable, relayUrls: urls, passkeys: passkeys(), ...(relayQuorum ? { relayQuorum } : {}) }));
+      expect(await s.enrollPasskey()).toMatchObject({ ok: false, error: { type: "relaysUnavailable" } });
+    }
+    // Refusing the connection: it won't answer, and mustn't block first use for good.
+    const refusing = memoryRelays({ refused: new Set(["wss://r3"]) }).relays;
+    unwrap(await createEvolustrSigner(t.host({ holdsNsec: false, relays: refusing, relayUrls: urls, relayQuorum: 2, passkeys: passkeys() })).enrollPasskey());
+  });
+
+  describe("relay quorum: absence and writes wait for every relay (#62)", () => {
+    it("the fastest relays lack the vault and a slow one has it: no first use, the slow one's vault is used", async () => {
+      const t = setup();
+      // An existing vault, only on the slow relay.
+      const original = unwrap(await createEvolustrSigner(t.host({ relayUrls: ["wss://r4"] })).getWrapKey(web("https://a.example")));
+      const timed = timedRelays(t.mem, ["wss://r4"]);
+      const s = createEvolustrSigner(t.host({ relays: timed.relays, relayUrls: FOUR, relayQuorum: 3 }));
+      expect(unwrap(await s.getWrapKey(web("https://a.example")))).toEqual(original);
+      // Nothing new on the slow relay: the real vault stays.
+      const onR4 = await t.mem.relays.query(["wss://r4"], { kinds: [VAULT_KIND], "#d": [signerVaultDTag(t.pubkey, SIGNER)] }, 100);
+      expect(onR4.events).toHaveLength(1);
+    });
+
+    it("three relays answer empty and one refuses the connection: first use goes ahead", async () => {
+      const t = setup();
+      const mem = memoryRelays({ refused: new Set(["wss://r4"]) });
+      const s = createEvolustrSigner(t.host({ relays: mem.relays, relayUrls: FOUR, relayQuorum: 3 }));
+      unwrap(await s.getWrapKey(web("https://a.example")));
+    });
+
+    it("a fast relay has an older vault, a slow one a newer: enrolling a passkey builds on the newer", async () => {
+      const t = setup();
+      // Each device has its own authenticator.
+      const passkeys = () => memoryPasskeys({ rpId: "signer.example", store: new Map() });
+      unwrap(await createEvolustrSigner(t.host({ relayUrls: FOUR })).getWrapKey(web("https://a.example")));
+      // Another device adds a passkey; only the slow relay took the newer version.
+      unwrap(await createEvolustrSigner(t.host({ relayUrls: ["wss://r4"], passkeys: passkeys() })).enrollPasskey());
+      const timed = timedRelays(t.mem, ["wss://r4"]);
+      const s = createEvolustrSigner(t.host({ relays: timed.relays, relayUrls: FOUR, relayQuorum: 3, passkeys: passkeys() }));
+      unwrap(await s.enrollPasskey());
+      const latest = await t.mem.relays.query(FOUR, { kinds: [VAULT_KIND], "#d": [signerVaultDTag(t.pubkey, SIGNER)] }, 100);
+      const newest = [...latest.events].sort((x, y) => y.created_at - x.created_at)[0]!;
+      const types = JSON.parse(newest.content).wraps.map((w: { type: string }) => w.type);
+      expect(types.filter((x: string) => x === "passkey")).toHaveLength(2);
+      expect(types).toContain("sk");
+    });
+
+    it("with a vault on the fast relays, unlocking still returns at the quorum", async () => {
+      const t = setup();
+      const original = unwrap(await createEvolustrSigner(t.host({ relayUrls: FOUR })).getWrapKey(web("https://a.example")));
+      const timed = timedRelays(t.mem, ["wss://r4"], 1500);
+      const s = createEvolustrSigner(t.host({ relays: timed.relays, relayUrls: FOUR, relayQuorum: 3 }));
+      const start = Date.now();
+      expect(unwrap(await s.getWrapKey(web("https://a.example")))).toEqual(original);
+      expect(Date.now() - start).toBeLessThan(1000);
+      expect(timed.published).toHaveLength(0);
+    });
   });
 
   it("with allowSkWrap false the nsec isn't used and no sk wrap is stored", async () => {
